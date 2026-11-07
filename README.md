@@ -66,8 +66,10 @@ every pixel.
 tour on this host, drawn by zui-sokol's renderer, which draws into a
 `win32` window through sokol_gfx with D3D11 and without sokol_app. The
 tour's application is zui-sokol's own (its `zui_sokol_tour` module),
-unchanged: `examples/tour.zig` is only the loop of zui's SPEC.md §6.1
-around it.
+unchanged, and `zui_app.run` runs it: `examples/tour.zig` names this
+host, zui-sokol's renderer and the tour's text contract
+(`pub const Text = zui_sokol.Text`, since that renderer does not measure),
+and passes each step to the tour.
 
 ```sh
 zig build tour                               # interactive window
@@ -121,7 +123,9 @@ const App = struct {
 ```
 
 The host must not move between `init` and `deinit`, since its window
-thread holds a pointer to it.
+thread holds a pointer to it. `forced_scale` and
+`system_material_unavailable` may be set before `init`, which keeps them;
+`zui_app` starts each field at its default.
 
 ## License
 
