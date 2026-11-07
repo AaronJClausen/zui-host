@@ -6,6 +6,7 @@ const std = @import("std");
 const zui_host = @import("zui_host");
 const zui = zui_host.zui;
 const zui_testing = @import("zui_testing");
+const zui_async = @import("zui_async");
 const Host = zui_host.Host;
 const win32 = zui_host.windows.win32;
 const keys = zui_host.windows.keys;
@@ -273,4 +274,62 @@ test "the system material is reported only where the window asked for it and the
         for (polled.builder.events()) |event| if (event == .environment) environment.apply(event.environment);
         try testing.expect(!environment.system_material);
     }
+}
+
+const FileChanges = zui_async.Stream(zui.FileChange, .{ .capacity = 64, .producers = .many });
+
+/// Waits, a wake at a time and for at most two seconds, until a change of
+/// `kind` to `path` has been published, and returns how many changes came
+/// in until it did.
+fn awaitChange(host: *Host, changes: *FileChanges, kind: zui.FileChange.Kind, path: []const u8) !usize {
+    const deadline = host.now().addNanoseconds(2 * std.time.ns_per_s);
+    var seen: usize = 0;
+    while (host.now().isBefore(deadline)) {
+        host.zuiWait(.{ .at = deadline });
+        changes.zuiSwap();
+        var items = changes.zuiView().items();
+        while (items.next()) |change| {
+            seen += 1;
+            if (change.kind == kind and std.mem.eql(u8, change.pathBytes(), path)) return seen;
+        }
+    }
+    return error.ChangeNotReported;
+}
+
+test "a watched directory reports files added, written, renamed and removed, in its subdirectories too" {
+    var window: HiddenWindow = .{};
+    try window.open(1);
+    defer window.close();
+    const host = &window.window_host;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = testing.io;
+    var directory_buffer: [128]u8 = undefined;
+    const directory = try std.fmt.bufPrint(&directory_buffer, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
+
+    var changes: FileChanges = .{};
+    try Host.zuiFileWatch.watch(host, directory, .of(&changes));
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "theme.zon", .data = ".{ .background = 0x202020 }" });
+    _ = try awaitChange(host, &changes, .added, "theme.zon");
+    try tmp.dir.writeFile(io, .{ .sub_path = "theme.zon", .data = ".{ .background = 0xf3f3f3 }" });
+    _ = try awaitChange(host, &changes, .modified, "theme.zon");
+    try tmp.dir.rename("theme.zon", tmp.dir, "light.zon", io);
+    _ = try awaitChange(host, &changes, .renamed_to, "light.zon");
+    try tmp.dir.createDir(io, "icons", .default_dir);
+    try tmp.dir.writeFile(io, .{ .sub_path = "icons/save.svg", .data = "<svg/>" });
+    _ = try awaitChange(host, &changes, .added, "icons/save.svg");
+    try tmp.dir.deleteFile(io, "light.zon");
+    _ = try awaitChange(host, &changes, .removed, "light.zon");
+}
+
+test "watching a directory that does not exist fails, and so does watching more than the host can" {
+    var window: HiddenWindow = .{};
+    try window.open(1);
+    defer window.close();
+    const host = &window.window_host;
+    var changes: FileChanges = .{};
+    try testing.expectError(error.DirectoryUnavailable, Host.zuiFileWatch.watch(host, ".zig-cache/no such directory", .of(&changes)));
+    for (0..zui_host.windows.file_watch.Watches.capacity) |_| try Host.zuiFileWatch.watch(host, ".", .of(&changes));
+    try testing.expectError(error.TooManyWatches, Host.zuiFileWatch.watch(host, ".", .of(&changes)));
 }

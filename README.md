@@ -38,6 +38,11 @@ window keeps drawing while the user drags its edges or moves it. It:
   works from any thread;
 - offers the clipboard as text through `Host.zuiClipboard.read(host,
   buffer)` and `write(host, text)`;
+- watches up to four directories, each with its subdirectories, through
+  `Host.zuiFileWatch.watch(host, directory, sink)`: a thread per
+  directory waits on `ReadDirectoryChangesW` and publishes each change, a
+  `zui.FileChange`, into a source of the application's, waking the window
+  for the first since the last frame;
 - shows the system's material behind the window when it asks for one
   (`WindowOptions.material`: `.window` is Mica, `.transient` Acrylic),
   and reports whether it shows as `Environment.system_material`: false on
@@ -59,6 +64,32 @@ and must keep its alpha: zui-sokol's does, with D3D11, through a swapchain
 DirectComposition composes into the window; Windows ignores the alpha of
 an OpenGL window, so with `-Dgl=true` the backdrop would be added under
 every pixel.
+
+## A theme from a file
+
+`zig build theme` draws a window in the colors of `examples/theme.zon`
+and restyles it when the file changes. The host's file watch publishes
+into a `zui_async.Stream(zui.FileChange, ...)` among the application's
+sources; declaration sees the theme's file among the changes, and the
+loader, between frames, reads and parses it into a `zui_async.Latest`
+that the next frame draws with. Declaration does no I/O, so a recorded
+session restyles in replay as it did live.
+
+```zig
+try Host.zuiFileWatch.watch(host, "examples", .of(&app.sources.theme_files));
+```
+
+```sh
+zig build theme                          # edit examples/theme.zon while it runs
+zig build theme -- --theme my/theme.zon  # watch another file
+zig build theme -- --check               # rewrite a theme file, wait for the restyled frame, quit
+```
+
+`--check` writes a dark theme into `zig-out/theme-check/theme.zon`,
+opens the window, and once a frame draws it, writes a light one over it;
+it fails unless a frame draws the light background within 10 s. On the
+reference machine the restyled frame came 2 to 4 ms after the write, two
+frames after the first.
 
 ## The tour on it
 
@@ -113,6 +144,7 @@ under a second: the first frame arrives about 3 ms after connecting.
 | `zig build tour` | run the tour (Windows, Direct3D 11) |
 | `zig build material` | show the system material, or its fallback |
 | `zig build remote` | run the tour in another process and draw it here, over `zui_wire` |
+| `zig build theme` | a window styled by a theme file, restyled when it changes |
 | `zig build fmt` / `fmt-check` | format, or fail if a file is not formatted |
 
 CI checks the format, runs the tests on Windows in Debug and ReleaseSafe,

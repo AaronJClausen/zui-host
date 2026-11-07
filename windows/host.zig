@@ -2,6 +2,7 @@ const std = @import("std");
 const zui = @import("zui");
 pub const win32 = @import("win32.zig");
 pub const keys = @import("keys.zig");
+pub const file_watch = @import("file_watch.zig");
 
 const W = std.unicode.utf8ToUtf16LeStringLiteral;
 
@@ -12,8 +13,9 @@ const W = std.unicode.utf8ToUtf16LeStringLiteral;
 /// It reports per-monitor scale, input, the environment (dark mode, high
 /// contrast, animations, power), lifecycle events from console control
 /// events, the session ending and the system sleeping, and dropped files;
-/// it sets the cursor and places the IME window; and it waits for
-/// `nextFrame` on its wake, its input and a high-resolution timer.
+/// it sets the cursor and places the IME window; it watches directories
+/// for changes; and it waits for `nextFrame` on its wake, its input and a
+/// high-resolution timer.
 ///
 /// `init` opens the window and `deinit` closes it; the host must not move
 /// in between, since its window thread holds a pointer to it.
@@ -29,6 +31,14 @@ pub const Host = struct {
     pub const zui_surfaces: zui.SurfaceKinds = .initOne(.win32);
     pub const zui_capabilities: zui.HostCapabilities = .{ .windows = .one, .system_material = true };
     pub const zuiClipboard = Clipboard;
+
+    /// Watches up to `file_watch.Watches.capacity` directories, each with
+    /// its subdirectories, until `deinit`.
+    pub const zuiFileWatch = struct {
+        pub fn watch(host: *Host, directory: []const u8, sink: zui.FileChangeSink) zui.FileWatchError!void {
+            return host.file_watches.start(directory, sink, host.zuiWaker());
+        }
+    };
 
     /// Layout units scrolled per notch of the mouse wheel.
     pub const wheel_step = 40;
@@ -61,6 +71,8 @@ pub const Host = struct {
 
     /// Only the window thread reads and writes these.
     window: WindowThreadState,
+
+    file_watches: file_watch.Watches,
 
     const event_capacity = 512;
     const text_capacity = 1024;
@@ -157,6 +169,7 @@ pub const Host = struct {
             .inbox = .{},
             .requests = .{},
             .window = .{ .options = options },
+            .file_watches = .{},
         };
         _ = win32.SetProcessDpiAwarenessContext(win32.DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
         self.window_thread = try std.Thread.spawn(.{}, runWindowThread, .{self});
@@ -171,6 +184,7 @@ pub const Host = struct {
 
     pub fn deinit(self: *Host) void {
         if (console_host.cmpxchgStrong(self, null, .acq_rel, .monotonic) == null) _ = win32.SetConsoleCtrlHandler(onConsoleControl, 0);
+        self.file_watches.stopAll();
         _ = win32.PostMessageW(self.hwnd, wm_close_window, 0, 0);
         self.window_thread.join();
         for ([_]?win32.HANDLE{ self.window_created, self.woken, self.input_arrived, self.timer, self.low_memory }) |handle| {
@@ -808,4 +822,5 @@ pub const Clipboard = struct {
 
 test {
     _ = keys;
+    _ = file_watch;
 }

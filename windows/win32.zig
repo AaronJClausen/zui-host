@@ -260,6 +260,10 @@ pub extern "kernel32" fn AcquireSRWLockExclusive(lock: *SRWLOCK) callconv(.winap
 pub extern "kernel32" fn ReleaseSRWLockExclusive(lock: *SRWLOCK) callconv(.winapi) void;
 pub extern "kernel32" fn GetProcessTimes(process: HANDLE, creation: *u64, exit: *u64, kernel: *u64, user: *u64) callconv(.winapi) BOOL;
 pub extern "kernel32" fn GetCurrentProcess() callconv(.winapi) HANDLE;
+pub extern "kernel32" fn CreateFileW(name: [*:0]const u16, access: DWORD, share: DWORD, security: ?*anyopaque, disposition: DWORD, flags: DWORD, template: ?HANDLE) callconv(.winapi) HANDLE;
+pub extern "kernel32" fn ReadDirectoryChangesW(directory: HANDLE, buffer: *anyopaque, buffer_bytes: DWORD, watch_subtree: BOOL, filter: DWORD, bytes_returned: ?*DWORD, overlapped: ?*OVERLAPPED, completion: ?*anyopaque) callconv(.winapi) BOOL;
+pub extern "kernel32" fn GetOverlappedResult(file: HANDLE, overlapped: *OVERLAPPED, bytes: *DWORD, wait: BOOL) callconv(.winapi) BOOL;
+pub extern "kernel32" fn CancelIoEx(file: HANDLE, overlapped: ?*OVERLAPPED) callconv(.winapi) BOOL;
 
 pub extern "shell32" fn DragAcceptFiles(hwnd: HWND, accept: BOOL) callconv(.winapi) void;
 pub extern "shell32" fn DragQueryFileW(drop: HDROP, index: UINT, file: ?[*]u16, capacity: UINT) callconv(.winapi) UINT;
@@ -294,3 +298,39 @@ pub fn lparamFromPoint(x: i16, y: i16) LPARAM {
     const packed_point: u32 = @as(u32, @as(u16, @bitCast(y))) << 16 | @as(u16, @bitCast(x));
     return @bitCast(@as(usize, packed_point));
 }
+
+pub const OVERLAPPED = extern struct {
+    Internal: usize = 0,
+    InternalHigh: usize = 0,
+    Offset: DWORD = 0,
+    OffsetHigh: DWORD = 0,
+    hEvent: ?HANDLE = null,
+};
+
+/// One entry of what `ReadDirectoryChangesW` writes; `FileName` runs on
+/// for `FileNameLength` bytes.
+pub const FILE_NOTIFY_INFORMATION = extern struct {
+    NextEntryOffset: DWORD,
+    Action: DWORD,
+    FileNameLength: DWORD,
+    FileName: [1]u16,
+};
+
+pub const INVALID_HANDLE_VALUE: HANDLE = @ptrFromInt(~@as(usize, 0));
+pub const FILE_LIST_DIRECTORY = 0x0001;
+pub const FILE_SHARE_READ = 0x1;
+pub const FILE_SHARE_WRITE = 0x2;
+pub const FILE_SHARE_DELETE = 0x4;
+pub const OPEN_EXISTING = 3;
+pub const FILE_FLAG_BACKUP_SEMANTICS = 0x02000000;
+pub const FILE_FLAG_OVERLAPPED = 0x40000000;
+pub const FILE_NOTIFY_CHANGE_FILE_NAME = 0x01;
+pub const FILE_NOTIFY_CHANGE_DIR_NAME = 0x02;
+pub const FILE_NOTIFY_CHANGE_SIZE = 0x08;
+pub const FILE_NOTIFY_CHANGE_LAST_WRITE = 0x10;
+pub const FILE_NOTIFY_CHANGE_CREATION = 0x40;
+pub const FILE_ACTION_ADDED = 1;
+pub const FILE_ACTION_REMOVED = 2;
+pub const FILE_ACTION_MODIFIED = 3;
+pub const FILE_ACTION_RENAMED_OLD_NAME = 4;
+pub const FILE_ACTION_RENAMED_NEW_NAME = 5;

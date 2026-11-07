@@ -29,6 +29,7 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "zui_host", .module = host_module },
             .{ .name = "zui_testing", .module = zui_dependency.module("zui_testing") },
+            .{ .name = "zui_async", .module = zui_dependency.module("zui_async") },
         },
     }) });
     const conformance_step = b.step("conformance", "Run zui's host suite and the host's own tests against a hidden window");
@@ -46,7 +47,7 @@ pub fn build(b: *std.Build) void {
     b.step("fmt-check", "Fail if any Zig source is not formatted").dependOn(&b.addFmt(.{ .paths = formatted_paths, .check = true }).step);
 }
 
-/// zui-sokol's tour, and the material example, on this host, drawn by
+/// zui-sokol's tour, and the material and theme examples, on this host, drawn by
 /// zui-sokol's renderer into the window through a Direct3D 11 swapchain
 /// that DirectComposition composes over the window's backdrop.
 fn addTour(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, host_module: *std.Build.Module, zui_dependency: *std.Build.Dependency, check_step: *std.Build.Step) void {
@@ -110,4 +111,23 @@ fn addTour(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builti
     if (b.args) |arguments| run_material.addArgs(arguments);
     b.step("material", "Show the desktop through a window, or the solid fallback (`-- --no-system-material`)").dependOn(&run_material.step);
     check_step.dependOn(&material.step);
+
+    const theme = b.addExecutable(.{
+        .name = "zui-host-theme",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("examples/theme.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "zui_host", .module = host_module },
+                .{ .name = "zui_async", .module = zui_dependency.module("zui_async") },
+                .{ .name = "zui_sokol", .module = zui_sokol_dependency.module("zui_sokol") },
+            },
+        }),
+    });
+    b.installArtifact(theme);
+    const run_theme = b.addRunArtifact(theme);
+    if (b.args) |arguments| run_theme.addArgs(arguments);
+    b.step("theme", "Show a window styled by examples/theme.zon, restyled when the file changes (`-- --check` scripts it)").dependOn(&run_theme.step);
+    check_step.dependOn(&theme.step);
 }
