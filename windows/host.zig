@@ -27,7 +27,7 @@ const W = std.unicode.utf8ToUtf16LeStringLiteral;
 /// ```
 pub const Host = struct {
     pub const zui_surfaces: zui.SurfaceKinds = .initOne(.win32);
-    pub const zui_capabilities: zui.HostCapabilities = .{ .windows = .one };
+    pub const zui_capabilities: zui.HostCapabilities = .{ .windows = .one, .system_material = true };
     pub const zuiClipboard = Clipboard;
 
     /// Layout units scrolled per notch of the mouse wheel.
@@ -37,6 +37,9 @@ pub const Host = struct {
     /// Physical pixels per layout unit in place of the display's, for tests
     /// and captures that must not depend on the monitor.
     forced_scale: ?f32 = null,
+    /// Behaves as on Windows 10, which has no Mica or Acrylic for a window,
+    /// so the fallback can be seen on Windows 11.
+    system_material_unavailable: bool = false,
     hwnd: win32.HWND,
     window_thread: std.Thread,
     window_created: win32.HANDLE,
@@ -128,13 +131,17 @@ pub const Host = struct {
         path_utf16: [longest_path]u16 = undefined,
         init_error: ?anyerror = null,
         options: zui.WindowOptions = .{},
+        /// Windows took the backdrop the window asked for.
+        backdrop_applied: bool = false,
     };
 
     pub fn init(self: *Host, io: std.Io, options: zui.WindowOptions) !void {
         const forced_scale = self.forced_scale;
+        const system_material_unavailable = self.system_material_unavailable;
         self.* = .{
             .io = io,
             .forced_scale = forced_scale,
+            .system_material_unavailable = system_material_unavailable,
             .hwnd = undefined,
             .window_thread = undefined,
             .window_created = try manualResetEvent(),
@@ -372,6 +379,7 @@ pub const Host = struct {
         self.recordClientSize(hwnd, dpi);
 
         win32.DragAcceptFiles(hwnd, 1);
+        self.window.backdrop_applied = self.applyMaterial(hwnd, options.material);
         self.setImeEnabled(hwnd, false);
         self.reportEnvironment(hwnd, true);
         if (options.visible) _ = win32.ShowWindow(hwnd, win32.SW_SHOWNORMAL);
@@ -425,8 +433,14 @@ pub const Host = struct {
                 return 0;
             },
             win32.WM_PAINT => {
-                var paint: [72]u8 = undefined;
-                _ = win32.BeginPaint(hwnd, &paint);
+                var paint: win32.PAINTSTRUCT = undefined;
+                const hdc = win32.BeginPaint(hwnd, &paint);
+                // Black is fully transparent where the frame is extended, so
+                // a renderer's composed swapchain shows over the backdrop
+                // rather than over the white of a window never painted.
+                if (self.window.backdrop_applied) if (hdc) |painted| if (win32.GetStockObject(win32.BLACK_BRUSH)) |black| {
+                    _ = win32.FillRect(painted, &paint.rcPaint, black);
+                };
                 _ = win32.EndPaint(hwnd, &paint);
                 self.signalInput();
                 return 0;
@@ -624,6 +638,21 @@ pub const Host = struct {
         _ = win32.ImmAssociateContextEx(hwnd, null, if (enabled) win32.IACE_DEFAULT else 0);
     }
 
+    /// Asks DWM for the backdrop, which it draws wherever the client area is
+    /// transparent. Windows 10 and Windows 11 before 22H2 refuse the
+    /// attribute, and the window keeps its own background.
+    fn applyMaterial(self: *const Host, hwnd: win32.HWND, material: zui.SystemMaterial) bool {
+        if (material == .none or self.system_material_unavailable) return false;
+        const backdrop: win32.DWORD = switch (material) {
+            .none => unreachable,
+            .window => win32.DWMSBT_MAINWINDOW,
+            .transient => win32.DWMSBT_TRANSIENTWINDOW,
+        };
+        if (win32.DwmSetWindowAttribute(hwnd, win32.DWMWA_SYSTEMBACKDROP_TYPE, &backdrop, @sizeOf(win32.DWORD)) != 0) return false;
+        const whole_window: win32.MARGINS = .{ .left = -1, .right = -1, .top = -1, .bottom = -1 };
+        return win32.DwmExtendFrameIntoClientArea(hwnd, &whole_window) == 0;
+    }
+
     /// Reports each setting that differs from what was last reported, or
     /// every one on the first call.
     fn reportEnvironment(self: *Host, hwnd: win32.HWND, first: bool) void {
@@ -650,13 +679,32 @@ pub const Host = struct {
             reported.power = power;
             self.deliver(.{ .environment = .{ .power = power } });
         }
+        const reduced_transparency = !readTransparencyEnabled();
+        if (first or reduced_transparency != reported.reduced_transparency) {
+            reported.reduced_transparency = reduced_transparency;
+            self.deliver(.{ .environment = .{ .reduced_transparency = reduced_transparency } });
+        }
+        const system_material = self.window.backdrop_applied and !reduced_transparency;
+        if (first or system_material != reported.system_material) {
+            reported.system_material = system_material;
+            self.deliver(.{ .environment = .{ .system_material = system_material } });
+        }
+    }
+
+    /// Settings > Personalization > Colors > Transparency effects.
+    fn readTransparencyEnabled() bool {
+        return readPersonalization(W("EnableTransparency"), 1) != 0;
     }
 
     fn readTheme() zui.Environment.Theme {
-        var uses_light_theme: win32.DWORD = 1;
+        return if (readPersonalization(W("AppsUseLightTheme"), 1) == 0) .dark else .light;
+    }
+
+    fn readPersonalization(value: [*:0]const u16, default: win32.DWORD) win32.DWORD {
+        var data: win32.DWORD = default;
         var size: win32.DWORD = @sizeOf(win32.DWORD);
-        _ = win32.RegGetValueW(win32.HKEY_CURRENT_USER, W("Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize"), W("AppsUseLightTheme"), win32.RRF_RT_REG_DWORD, null, &uses_light_theme, &size);
-        return if (uses_light_theme == 0) .dark else .light;
+        if (win32.RegGetValueW(win32.HKEY_CURRENT_USER, W("Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize"), value, win32.RRF_RT_REG_DWORD, null, &data, &size) != 0) return default;
+        return data;
     }
 
     fn readContrast() zui.Environment.Contrast {

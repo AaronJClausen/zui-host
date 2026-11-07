@@ -37,16 +37,34 @@ window keeps drawing while the user drags its edges or moves it. It:
   high-resolution timer, or until input or a wake, which is sticky and
   works from any thread;
 - offers the clipboard as text through `Host.zuiClipboard.read(host,
-  buffer)` and `write(host, text)`.
+  buffer)` and `write(host, text)`;
+- shows the system's material behind the window when it asks for one
+  (`WindowOptions.material`: `.window` is Mica, `.transient` Acrylic),
+  and reports whether it shows as `Environment.system_material`: false on
+  Windows 10 and Windows 11 before 22H2, with transparency effects turned
+  off, or for `.none`.
 
 It passes zui's host suite (`zui_testing.expectHostConforms`) against a
 hidden window, whose harness sends the messages Windows would.
+
+## The desktop through the window
+
+`zig build material` shows a window whose root draws no background while
+`ui.environment().system_material` is true, and the theme's background
+otherwise: the same code shows Mica on Windows 11 and a solid background
+on Windows 10. `-- --no-system-material` makes the host behave as on
+Windows 10, `-- --transient` asks for Acrylic, and `-- --screenshot
+file.bmp` saves what the screen shows. The renderer clears to transparent
+and must keep its alpha: zui-sokol's does, with D3D11, through a swapchain
+DirectComposition composes into the window; Windows ignores the alpha of
+an OpenGL window, so with `-Dgl=true` the backdrop would be added under
+every pixel.
 
 ## The tour on it
 
 `zig build tour` runs [zui-sokol](https://github.com/AaronJClausen/zui-sokol)'s
 tour on this host, drawn by zui-sokol's renderer, which draws into a
-`win32` window through sokol_gfx with OpenGL and without sokol_app. The
+`win32` window through sokol_gfx with D3D11 and without sokol_app. The
 tour's application is zui-sokol's own (its `zui_sokol_tour` module),
 unchanged: `examples/tour.zig` is only the loop of zui's SPEC.md §6.1
 around it.
@@ -60,8 +78,8 @@ zig build tour -- --screenshot tour.bmp      # save the window after a few frame
 ```
 
 Idle, it uses no CPU: on an i9-10900K in ReleaseSafe, the Layout Lab
-screen used 15.6 to 62.5 ms of CPU over 10 s with no frames and no wakes
-(Windows counts CPU time in 15.6 ms ticks).
+screen used 0.0 ms of CPU over 10 s with no frames and no wakes in three
+runs of four (Windows counts CPU time in 15.6 ms ticks).
 
 ## Development
 
@@ -70,13 +88,13 @@ screen used 15.6 to 62.5 ms of CPU over 10 s with no frames and no wakes
 | `zig build test` | the unit tests, and on Windows zui's host suite and the host's own tests against a hidden window |
 | `zig build conformance` | only the host suite and the host's own tests |
 | `zig build check` | compile the host, its tests and the tour; add `-Dtarget=x86_64-windows` to cross-compile |
-| `zig build tour` | run the tour (Windows, OpenGL 4.3) |
+| `zig build tour` | run the tour (Windows, Direct3D 11) |
+| `zig build material` | show the system material, or its fallback |
 | `zig build fmt` / `fmt-check` | format, or fail if a file is not formatted |
 
 CI checks the format, runs the tests on Windows in Debug and ReleaseSafe,
-and cross-compiles from Linux for x86-64 and ARM64 Windows. Its Windows
-runner has no GPU for OpenGL 4.3, so the tour is compiled there and run
-on a desktop.
+and cross-compiles from Linux for x86-64 and ARM64 Windows. The examples
+are compiled there and run on a desktop.
 
 The repository uses LF line endings everywhere (see `.gitattributes`).
 

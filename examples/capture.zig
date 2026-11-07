@@ -1,5 +1,6 @@
-//! Saves what a window shows as a BMP, through the compositor, so it sees
-//! what OpenGL presented.
+//! Saves what a window shows as a BMP: drawn again by the compositor, which
+//! sees what OpenGL presented, or read off the screen, which also sees the
+//! backdrop the compositor draws behind it.
 
 const std = @import("std");
 
@@ -23,10 +24,18 @@ const BITMAPINFOHEADER = extern struct {
 };
 
 const PW_CLIENTONLY = 0x1;
+const SRCCOPY = 0x00CC0020;
+const CAPTUREBLT = 0x40000000;
+const POINT = extern struct { x: i32 = 0, y: i32 = 0 };
 const PW_RENDERFULLCONTENT = 0x2;
 
 extern "user32" fn GetClientRect(hwnd: HWND, rect: *RECT) callconv(.winapi) c_int;
 extern "user32" fn PrintWindow(hwnd: HWND, hdc: HDC, flags: u32) callconv(.winapi) c_int;
+extern "user32" fn ClientToScreen(hwnd: HWND, point: *POINT) callconv(.winapi) c_int;
+extern "user32" fn GetDC(hwnd: ?HWND) callconv(.winapi) ?HDC;
+extern "user32" fn ReleaseDC(hwnd: ?HWND, hdc: HDC) callconv(.winapi) c_int;
+extern "user32" fn SetForegroundWindow(hwnd: HWND) callconv(.winapi) c_int;
+extern "gdi32" fn BitBlt(destination: HDC, x: c_int, y: c_int, width: c_int, height: c_int, source: HDC, source_x: c_int, source_y: c_int, operation: u32) callconv(.winapi) c_int;
 extern "gdi32" fn CreateCompatibleDC(hdc: ?HDC) callconv(.winapi) ?HDC;
 extern "gdi32" fn DeleteDC(hdc: HDC) callconv(.winapi) c_int;
 extern "gdi32" fn CreateDIBSection(hdc: ?HDC, info: *const BITMAPINFOHEADER, usage: u32, bits: *?[*]u8, section: ?*anyopaque, offset: u32) callconv(.winapi) ?HGDIOBJ;
@@ -35,6 +44,29 @@ extern "gdi32" fn DeleteObject(object: HGDIOBJ) callconv(.winapi) c_int;
 
 pub fn saveClientArea(gpa: std.mem.Allocator, io: std.Io, window: *anyopaque, path: []const u8) !void {
     const hwnd: HWND = @ptrCast(window);
+    try save(gpa, io, hwnd, path, struct {
+        fn draw(source: HWND, memory_dc: HDC, _: [2]i32) !void {
+            if (PrintWindow(source, memory_dc, PW_CLIENTONLY | PW_RENDERFULLCONTENT) == 0) return error.CaptureFailed;
+        }
+    }.draw);
+}
+
+/// The window must be on top: whatever covers it is saved instead.
+pub fn saveScreenArea(gpa: std.mem.Allocator, io: std.Io, window: *anyopaque, path: []const u8) !void {
+    const hwnd: HWND = @ptrCast(window);
+    _ = SetForegroundWindow(hwnd);
+    try save(gpa, io, hwnd, path, struct {
+        fn draw(source: HWND, memory_dc: HDC, size: [2]i32) !void {
+            var origin: POINT = .{};
+            _ = ClientToScreen(source, &origin);
+            const screen = GetDC(null) orelse return error.NoDeviceContext;
+            defer _ = ReleaseDC(null, screen);
+            if (BitBlt(memory_dc, 0, 0, size[0], size[1], screen, origin.x, origin.y, SRCCOPY | CAPTUREBLT) == 0) return error.CaptureFailed;
+        }
+    }.draw);
+}
+
+fn save(gpa: std.mem.Allocator, io: std.Io, hwnd: HWND, path: []const u8, draw: fn (HWND, HDC, [2]i32) anyerror!void) !void {
     var client: RECT = .{};
     _ = GetClientRect(hwnd, &client);
     const width = client.right;
@@ -46,7 +78,7 @@ pub fn saveClientArea(gpa: std.mem.Allocator, io: std.Io, window: *anyopaque, pa
     const bitmap = CreateDIBSection(memory_dc, &header, 0, &bits, null, 0) orelse return error.NoBitmap;
     defer _ = DeleteObject(bitmap);
     _ = SelectObject(memory_dc, bitmap);
-    if (PrintWindow(hwnd, memory_dc, PW_CLIENTONLY | PW_RENDERFULLCONTENT) == 0) return error.CaptureFailed;
+    try draw(hwnd, memory_dc, .{ width, height });
 
     const pixel_bytes: usize = @intCast(width * height * 4);
     const file_header_size = 14;

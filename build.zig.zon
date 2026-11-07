@@ -5,12 +5,12 @@
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
         .zui = .{
-            .url = "git+https://github.com/AaronJClausen/zui#d9d279e9eaaf028d226d69ad8e3df0939c1b8165",
-            .hash = "zui-0.5.0-xfvfqkIyDQCYvEKbwhfIqo2lNyfUA28QCGs5DT6moKEN",
+            .url = "git+https://github.com/AaronJClausen/zui#50430d821acb9dba2f40f1732debcd59d4334369",
+            .hash = "zui-0.5.0-xfvfqkY9DQDQcNXtqkddh_d6toH2OsB1t2egrpXYW_hf",
         },
         .zui_sokol = .{
-            .url = "git+https://github.com/AaronJClausen/zui-sokol#78ba9ad5038faaf25f7f39d262e12d1753c24f85",
-            .hash = "zui_sokol-0.2.0-LHR9oSXJAwAy2_8hbgOEaywSPcyp_PlJT7eo2gN_hbbH",
+            .url = "git+https://github.com/AaronJClausen/zui-sokol#b13878468ef0833ae8fe8cbff473af17280c0b1c",
+            .hash = "zui_sokol-0.2.0-LHR9oZkABADRkVqe1Hej1KzBhfyRbKvoMGCU-THn9ypQ",
             .lazy = true,
         },
     },

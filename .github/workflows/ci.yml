@@ -37,8 +37,8 @@ jobs:
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
           version: ${{ env.ZIG_VERSION }}
-      # The runner has no GPU for the tour's OpenGL 4.3 context, so the
-      # tour is compiled here and run on a desktop.
+      # The examples need a desktop session to show, so they are compiled
+      # here and run on a desktop.
       - name: Run the unit tests and zui's host suite against a hidden window
         run: zig build test
       - run: zig build test -Doptimize=ReleaseSafe

@@ -255,3 +255,22 @@ test "Ctrl+C is a terminate request, as the console's handler reports it" {
     try testing.expectEqual(zui.Lifecycle.terminate_requested, polled.find(.lifecycle).?);
     try testing.expect(!polled.poll(&window.window_host));
 }
+
+test "the system material is reported only where the window asked for it and the system has it" {
+    for ([_]struct { material: zui.SystemMaterial, unavailable: bool }{
+        .{ .material = .none, .unavailable = false },
+        .{ .material = .window, .unavailable = true },
+    }) |case| {
+        var window: HiddenWindow = .{};
+        window.window_host.system_material_unavailable = case.unavailable;
+        window.window_host.forced_scale = 1;
+        try window.window_host.init(testing.io, .{ .title = "zui host suite", .size = .{ 320, 240 }, .visible = false, .material = case.material });
+        defer window.close();
+        var polled: Polled = .{};
+        polled.init();
+        _ = polled.poll(&window.window_host);
+        var environment: zui.Environment = .{ .system_material = true };
+        for (polled.builder.events()) |event| if (event == .environment) environment.apply(event.environment);
+        try testing.expect(!environment.system_material);
+    }
+}

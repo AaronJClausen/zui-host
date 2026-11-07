@@ -15,7 +15,7 @@ pub fn build(b: *std.Build) void {
         .imports = &.{.{ .name = "zui", .module = zui_module }},
     });
     if (windows) {
-        for ([_][]const u8{ "user32", "shell32", "imm32", "dwmapi", "advapi32" }) |library| host_module.linkSystemLibrary(library, .{});
+        for ([_][]const u8{ "user32", "gdi32", "shell32", "imm32", "dwmapi", "advapi32" }) |library| host_module.linkSystemLibrary(library, .{});
     }
 
     const unit_tests = b.addTest(.{ .root_module = host_module });
@@ -46,10 +46,11 @@ pub fn build(b: *std.Build) void {
     b.step("fmt-check", "Fail if any Zig source is not formatted").dependOn(&b.addFmt(.{ .paths = formatted_paths, .check = true }).step);
 }
 
-/// zui-sokol's tour on this host, drawn by zui-sokol's renderer with
-/// OpenGL, which is how it draws into a `win32` surface.
+/// zui-sokol's tour, and the material example, on this host, drawn by
+/// zui-sokol's renderer into the window through a Direct3D 11 swapchain
+/// that DirectComposition composes over the window's backdrop.
 fn addTour(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, host_module: *std.Build.Module, check_step: *std.Build.Step) void {
-    const zui_sokol_dependency = b.lazyDependency("zui_sokol", .{ .target = target, .optimize = optimize, .gl = true }) orelse return;
+    const zui_sokol_dependency = b.lazyDependency("zui_sokol", .{ .target = target, .optimize = optimize }) orelse return;
     const tour = b.addExecutable(.{
         .name = "zui-host-tour",
         .root_module = b.createModule(.{
@@ -68,4 +69,22 @@ fn addTour(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builti
     if (b.args) |arguments| run_tour.addArgs(arguments);
     b.step("tour", "Run zui-sokol's tour on the Windows host (`-- --measure-idle` reports its idle CPU time)").dependOn(&run_tour.step);
     check_step.dependOn(&tour.step);
+
+    const material = b.addExecutable(.{
+        .name = "zui-host-material",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("examples/material.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "zui_host", .module = host_module },
+                .{ .name = "zui_sokol", .module = zui_sokol_dependency.module("zui_sokol") },
+            },
+        }),
+    });
+    b.installArtifact(material);
+    const run_material = b.addRunArtifact(material);
+    if (b.args) |arguments| run_material.addArgs(arguments);
+    b.step("material", "Show the desktop through a window, or the solid fallback (`-- --no-system-material`)").dependOn(&run_material.step);
+    check_step.dependOn(&material.step);
 }

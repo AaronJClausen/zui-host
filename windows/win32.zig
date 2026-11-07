@@ -86,6 +86,18 @@ pub const HIGHCONTRASTW = extern struct {
     lpszDefaultScheme: ?[*:0]u16 = null,
 };
 
+pub const HDC = *opaque {};
+pub const BLACK_BRUSH = 4;
+
+pub const PAINTSTRUCT = extern struct {
+    hdc: ?HDC,
+    fErase: BOOL,
+    rcPaint: RECT,
+    fRestore: BOOL,
+    fIncUpdate: BOOL,
+    rgbReserved: [32]u8,
+};
+
 pub const SRWLOCK = extern struct { ptr: ?*anyopaque = null };
 
 pub const WM_DESTROY = 0x0002;
@@ -169,6 +181,11 @@ pub const HKEY_CURRENT_USER: HKEY = @ptrFromInt(0x80000001);
 pub const RRF_RT_REG_DWORD = 0x00000010;
 
 pub const DWMWA_USE_IMMERSIVE_DARK_MODE = 20;
+pub const DWMWA_SYSTEMBACKDROP_TYPE = 38;
+pub const DWMSBT_MAINWINDOW = 2;
+pub const DWMSBT_TRANSIENTWINDOW = 3;
+
+pub const MARGINS = extern struct { left: c_int, right: c_int, top: c_int, bottom: c_int };
 
 pub const IDC_ARROW = 32512;
 pub const IDC_IBEAM = 32513;
@@ -209,8 +226,10 @@ pub extern "user32" fn SetCapture(hwnd: HWND) callconv(.winapi) ?HWND;
 pub extern "user32" fn ReleaseCapture() callconv(.winapi) BOOL;
 pub extern "user32" fn GetKeyState(virtual_key: c_int) callconv(.winapi) i16;
 pub extern "user32" fn ScreenToClient(hwnd: HWND, point: *POINT) callconv(.winapi) BOOL;
-pub extern "user32" fn BeginPaint(hwnd: HWND, paint: *[72]u8) callconv(.winapi) ?*anyopaque;
-pub extern "user32" fn EndPaint(hwnd: HWND, paint: *const [72]u8) callconv(.winapi) BOOL;
+pub extern "user32" fn BeginPaint(hwnd: HWND, paint: *PAINTSTRUCT) callconv(.winapi) ?HDC;
+pub extern "user32" fn EndPaint(hwnd: HWND, paint: *const PAINTSTRUCT) callconv(.winapi) BOOL;
+pub extern "user32" fn FillRect(hdc: HDC, rect: *const RECT, brush: HBRUSH) callconv(.winapi) c_int;
+pub extern "gdi32" fn GetStockObject(object: c_int) callconv(.winapi) ?HBRUSH;
 pub extern "user32" fn OpenClipboard(owner: ?HWND) callconv(.winapi) BOOL;
 pub extern "user32" fn CloseClipboard() callconv(.winapi) BOOL;
 pub extern "user32" fn EmptyClipboard() callconv(.winapi) BOOL;
@@ -253,6 +272,7 @@ pub extern "imm32" fn ImmSetCompositionWindow(context: HIMC, form: *const COMPOS
 pub extern "imm32" fn ImmSetCandidateWindow(context: HIMC, form: *const CANDIDATEFORM) callconv(.winapi) BOOL;
 pub extern "imm32" fn ImmAssociateContextEx(hwnd: HWND, context: ?HIMC, flags: DWORD) callconv(.winapi) BOOL;
 
+pub extern "dwmapi" fn DwmExtendFrameIntoClientArea(hwnd: HWND, margins: *const MARGINS) callconv(.winapi) i32;
 pub extern "dwmapi" fn DwmSetWindowAttribute(hwnd: HWND, attribute: DWORD, value: *const anyopaque, size: DWORD) callconv(.winapi) i32;
 
 pub extern "advapi32" fn RegGetValueW(key: HKEY, sub_key: [*:0]const u16, value: [*:0]const u16, flags: DWORD, kind: ?*DWORD, data: ?*anyopaque, size: ?*DWORD) callconv(.winapi) LONG;
