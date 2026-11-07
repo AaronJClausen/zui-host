@@ -83,6 +83,26 @@ Idle, it uses no CPU: on an i9-10900K in ReleaseSafe, the Layout Lab
 screen used 0.0 ms of CPU over 10 s with no frames and no wakes in three
 runs of four (Windows counts CPU time in 15.6 ms ticks).
 
+## The tour in another process
+
+`zig build remote` runs the same tour in a second process, on
+[zui_wire](https://github.com/AaronJClausen/zui)'s host and renderer,
+and draws it here: a `zui_wire.Client` joins this host and zui-sokol's
+renderer to it over a loopback TCP connection, sending this window's
+input and drawing the frames that come back, each written as the changes
+from the one before. Closing the window ends the tour's process.
+
+```sh
+zig build remote                         # the tour runs in a second process; this one draws it
+zig build remote -- --check tour.bmp     # press Ctrl+2, Ctrl+4, Ctrl+9, wait for each screen, save, quit
+zig build remote -- --serve 7420         # only the tour, waiting for a viewer on port 7420
+zig build remote -- --connect 7420       # only the viewer, joining a tour served on port 7420
+```
+
+`--check` fails if a screen does not come back within 20 s, and when the
+tour's process does not exit with 0. On the reference machine it takes
+under a second: the first frame arrives about 3 ms after connecting.
+
 ## Development
 
 | Command | What it does |
@@ -92,6 +112,7 @@ runs of four (Windows counts CPU time in 15.6 ms ticks).
 | `zig build check` | compile the host, its tests and the tour; add `-Dtarget=x86_64-windows` to cross-compile |
 | `zig build tour` | run the tour (Windows, Direct3D 11) |
 | `zig build material` | show the system material, or its fallback |
+| `zig build remote` | run the tour in another process and draw it here, over `zui_wire` |
 | `zig build fmt` / `fmt-check` | format, or fail if a file is not formatted |
 
 CI checks the format, runs the tests on Windows in Debug and ReleaseSafe,

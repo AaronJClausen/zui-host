@@ -39,7 +39,7 @@ pub fn build(b: *std.Build) void {
     check_step.dependOn(&unit_tests.step);
     if (windows) check_step.dependOn(&conformance_tests.step);
 
-    if (windows) addTour(b, target, optimize, host_module, zui_dependency.module("zui_app"), check_step);
+    if (windows) addTour(b, target, optimize, host_module, zui_dependency, check_step);
 
     const formatted_paths: []const []const u8 = &.{ "build.zig", "build.zig.zon", "zui_host.zig", "windows", "examples" };
     b.step("fmt", "Format all Zig sources").dependOn(&b.addFmt(.{ .paths = formatted_paths }).step);
@@ -49,7 +49,8 @@ pub fn build(b: *std.Build) void {
 /// zui-sokol's tour, and the material example, on this host, drawn by
 /// zui-sokol's renderer into the window through a Direct3D 11 swapchain
 /// that DirectComposition composes over the window's backdrop.
-fn addTour(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, host_module: *std.Build.Module, app_module: *std.Build.Module, check_step: *std.Build.Step) void {
+fn addTour(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, host_module: *std.Build.Module, zui_dependency: *std.Build.Dependency, check_step: *std.Build.Step) void {
+    const app_module = zui_dependency.module("zui_app");
     const zui_sokol_dependency = b.lazyDependency("zui_sokol", .{ .target = target, .optimize = optimize }) orelse return;
     const tour = b.addExecutable(.{
         .name = "zui-host-tour",
@@ -70,6 +71,27 @@ fn addTour(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builti
     if (b.args) |arguments| run_tour.addArgs(arguments);
     b.step("tour", "Run zui-sokol's tour on the Windows host (`-- --measure-idle` reports its idle CPU time)").dependOn(&run_tour.step);
     check_step.dependOn(&tour.step);
+
+    const remote = b.addExecutable(.{
+        .name = "zui-host-remote",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("examples/remote.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "zui_host", .module = host_module },
+                .{ .name = "zui_app", .module = app_module },
+                .{ .name = "zui_wire", .module = zui_dependency.module("zui_wire") },
+                .{ .name = "zui_sokol", .module = zui_sokol_dependency.module("zui_sokol") },
+                .{ .name = "zui_sokol_tour", .module = zui_sokol_dependency.module("zui_sokol_tour") },
+            },
+        }),
+    });
+    b.installArtifact(remote);
+    const run_remote = b.addRunArtifact(remote);
+    if (b.args) |arguments| run_remote.addArgs(arguments);
+    b.step("remote", "Run the tour in one process and draw it in this one, over zui_wire (`-- --check tour.bmp` scripts it)").dependOn(&run_remote.step);
+    check_step.dependOn(&remote.step);
 
     const material = b.addExecutable(.{
         .name = "zui-host-material",
