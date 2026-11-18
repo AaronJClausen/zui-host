@@ -48,7 +48,13 @@ window keeps drawing while the user drags its edges or moves it. It:
   (`WindowOptions.material`: `.window` is Mica, `.transient` Acrylic),
   and reports whether it shows as `Environment.system_material`: false on
   Windows 10 and Windows 11 before 22H2, with transparency effects turned
-  off, or for `.none`.
+  off, or for `.none`;
+- opens the surface in `.scrgb_fp16` while the window's monitor runs in
+  HDR, if the window was opened with it (`zui_app` passes it when the
+  renderer declares it too), and in `.sdr` otherwise, and reports
+  `Environment.hdr_headroom`: the monitor's peak over the SDR white that
+  its SDR content brightness slider sets, or 1 in `.sdr`. Moving to
+  another monitor and turning HDR on or off change both.
 
 It passes zui's host suite (`zui_testing.expectHostConforms`) against a
 hidden window, whose harness sends the messages Windows would.

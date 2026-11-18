@@ -276,6 +276,70 @@ test "the system material is reported only where the window asked for it and the
     }
 }
 
+const hdr_display: zui_host.windows.display.DisplayColor = .{ .hdr = true, .peak_nits = 1000, .sdr_white_nits = 200 };
+
+fn openOnDisplay(window: *HiddenWindow, color: zui_host.windows.display.DisplayColor, output_formats: zui.OutputFormats) !void {
+    window.window_host.forced_display_color = color;
+    window.window_host.forced_scale = 1;
+    try window.window_host.init(testing.io, .{ .title = "zui host suite", .size = .{ 320, 240 }, .visible = false, .output_formats = output_formats });
+}
+
+fn reportedHeadroom(polled: *const Polled) ?f32 {
+    var headroom: ?f32 = null;
+    for (polled.builder.events()) |event| if (event == .environment and event.environment == .hdr_headroom) {
+        headroom = event.environment.hdr_headroom;
+    };
+    return headroom;
+}
+
+test "on an HDR display a window opened with scRGB gets an scRGB surface and the display's headroom" {
+    var window: HiddenWindow = .{};
+    try openOnDisplay(&window, hdr_display, Host.zui_output_formats);
+    defer window.close();
+    var polled: Polled = .{};
+    polled.init();
+    _ = polled.poll(&window.window_host);
+    try testing.expectEqual(zui.OutputFormat.scrgb_fp16, window.window_host.zuiSurface(.main).outputFormat());
+    try testing.expectEqual(@as(?f32, 5), reportedHeadroom(&polled));
+}
+
+test "a window opened only in SDR stays SDR on an HDR display, with no headroom" {
+    var window: HiddenWindow = .{};
+    try openOnDisplay(&window, hdr_display, .initOne(.sdr));
+    defer window.close();
+    var polled: Polled = .{};
+    polled.init();
+    _ = polled.poll(&window.window_host);
+    try testing.expectEqual(zui.OutputFormat.sdr, window.window_host.zuiSurface(.main).outputFormat());
+    try testing.expectEqual(@as(?f32, 1), reportedHeadroom(&polled));
+}
+
+test "turning HDR off returns the surface to SDR and the headroom to 1" {
+    var window: HiddenWindow = .{};
+    try openOnDisplay(&window, hdr_display, Host.zui_output_formats);
+    defer window.close();
+    var polled: Polled = .{};
+    polled.init();
+    _ = polled.poll(&window.window_host);
+
+    window.window_host.forced_display_color = .sdr;
+    window.send(win32.WM_DISPLAYCHANGE, 32, 0);
+    _ = polled.poll(&window.window_host);
+    try testing.expectEqual(zui.OutputFormat.sdr, window.window_host.zuiSurface(.main).outputFormat());
+    try testing.expectEqual(@as(?f32, 1), reportedHeadroom(&polled));
+}
+
+test "the monitor a window is on reads as HDR with headroom, or as SDR" {
+    var window: HiddenWindow = .{};
+    try window.open(1);
+    defer window.close();
+    const monitor = win32.MonitorFromWindow(window.window_host.hwnd, win32.MONITOR_DEFAULTTONEAREST) orelse return error.NoMonitor;
+    const color: zui_host.windows.display.DisplayColor = .read(monitor);
+    try testing.expect(color.headroom() >= 1);
+    if (!color.hdr) try testing.expectEqual(@as(f32, 1), color.headroom());
+    if (color.hdr) try testing.expect(color.sdr_white_nits >= 80);
+}
+
 const FileChanges = zui_async.Stream(zui.FileChange, .{ .capacity = 64, .producers = .many });
 
 /// Waits, a wake at a time and for at most two seconds, until a change of

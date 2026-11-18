@@ -19,6 +19,8 @@ pub const HMENU = *opaque {};
 pub const HDROP = *opaque {};
 pub const HIMC = *opaque {};
 pub const HKEY = *opaque {};
+pub const HMONITOR = *opaque {};
+pub const HRESULT = i32;
 
 pub const WNDPROC = *const fn (HWND, UINT, WPARAM, LPARAM) callconv(.winapi) LRESULT;
 pub const HANDLER_ROUTINE = *const fn (DWORD) callconv(.winapi) BOOL;
@@ -101,6 +103,7 @@ pub const PAINTSTRUCT = extern struct {
 pub const SRWLOCK = extern struct { ptr: ?*anyopaque = null };
 
 pub const WM_DESTROY = 0x0002;
+pub const WM_MOVE = 0x0003;
 pub const WM_SIZE = 0x0005;
 pub const WM_SETFOCUS = 0x0007;
 pub const WM_KILLFOCUS = 0x0008;
@@ -111,6 +114,7 @@ pub const WM_ERASEBKGND = 0x0014;
 pub const WM_ENDSESSION = 0x0016;
 pub const WM_SETTINGCHANGE = 0x001A;
 pub const WM_SETCURSOR = 0x0020;
+pub const WM_DISPLAYCHANGE = 0x007E;
 pub const WM_THEMECHANGED = 0x031A;
 pub const WM_KEYDOWN = 0x0100;
 pub const WM_KEYUP = 0x0101;
@@ -186,6 +190,58 @@ pub const DWMSBT_MAINWINDOW = 2;
 pub const DWMSBT_TRANSIENTWINDOW = 3;
 
 pub const MARGINS = extern struct { left: c_int, right: c_int, top: c_int, bottom: c_int };
+
+pub const GUID = extern struct { data1: u32, data2: u16, data3: u16, data4: [8]u8 };
+pub const LUID = extern struct { low_part: u32 = 0, high_part: i32 = 0 };
+
+pub const MONITOR_DEFAULTTONEAREST = 2;
+
+pub const QDC_ONLY_ACTIVE_PATHS = 2;
+pub const DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME = 1;
+pub const DISPLAYCONFIG_DEVICE_INFO_GET_SDR_WHITE_LEVEL = 11;
+
+pub const DISPLAYCONFIG_PATH_INFO = extern struct {
+    source_adapter_id: LUID,
+    source_id: u32,
+    source_mode_index: u32,
+    source_status_flags: u32,
+    target_adapter_id: LUID,
+    target_id: u32,
+    target_mode_index: u32,
+    output_technology: u32,
+    rotation: u32,
+    scaling: u32,
+    refresh_rate: [2]u32,
+    scan_line_ordering: u32,
+    target_available: BOOL,
+    target_status_flags: u32,
+    flags: u32,
+};
+
+pub const DISPLAYCONFIG_MODE_INFO = extern struct {
+    info_type: u32,
+    id: u32,
+    adapter_id: LUID,
+    mode: [6]u64,
+};
+
+pub const DISPLAYCONFIG_DEVICE_INFO_HEADER = extern struct {
+    type: u32,
+    size: u32,
+    adapter_id: LUID,
+    id: u32,
+};
+
+pub const DISPLAYCONFIG_SOURCE_DEVICE_NAME = extern struct {
+    header: DISPLAYCONFIG_DEVICE_INFO_HEADER,
+    view_gdi_device_name: [32]u16 = @splat(0),
+};
+
+pub const DISPLAYCONFIG_SDR_WHITE_LEVEL = extern struct {
+    header: DISPLAYCONFIG_DEVICE_INFO_HEADER,
+    /// Thousandths of 80 nits.
+    sdr_white_level: u32 = 0,
+};
 
 pub const IDC_ARROW = 32512;
 pub const IDC_IBEAM = 32513;
@@ -275,6 +331,10 @@ pub extern "imm32" fn ImmReleaseContext(hwnd: HWND, context: HIMC) callconv(.win
 pub extern "imm32" fn ImmSetCompositionWindow(context: HIMC, form: *const COMPOSITIONFORM) callconv(.winapi) BOOL;
 pub extern "imm32" fn ImmSetCandidateWindow(context: HIMC, form: *const CANDIDATEFORM) callconv(.winapi) BOOL;
 pub extern "imm32" fn ImmAssociateContextEx(hwnd: HWND, context: ?HIMC, flags: DWORD) callconv(.winapi) BOOL;
+
+pub extern "user32" fn MonitorFromWindow(hwnd: HWND, flags: DWORD) callconv(.winapi) ?HMONITOR;
+pub extern "user32" fn QueryDisplayConfig(flags: u32, path_count: *u32, paths: [*]DISPLAYCONFIG_PATH_INFO, mode_count: *u32, modes: [*]DISPLAYCONFIG_MODE_INFO, topology: ?*u32) callconv(.winapi) LONG;
+pub extern "user32" fn DisplayConfigGetDeviceInfo(packet: *DISPLAYCONFIG_DEVICE_INFO_HEADER) callconv(.winapi) LONG;
 
 pub extern "dwmapi" fn DwmExtendFrameIntoClientArea(hwnd: HWND, margins: *const MARGINS) callconv(.winapi) i32;
 pub extern "dwmapi" fn DwmSetWindowAttribute(hwnd: HWND, attribute: DWORD, value: *const anyopaque, size: DWORD) callconv(.winapi) i32;

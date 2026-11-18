@@ -3,6 +3,7 @@ const zui = @import("zui");
 pub const win32 = @import("win32.zig");
 pub const keys = @import("keys.zig");
 pub const file_watch = @import("file_watch.zig");
+pub const display = @import("display.zig");
 
 const W = std.unicode.utf8ToUtf16LeStringLiteral;
 
@@ -11,7 +12,7 @@ const W = std.unicode.utf8ToUtf16LeStringLiteral;
 /// or moves it: Windows runs those drags in a loop of its own.
 ///
 /// It reports per-monitor scale, input, the environment (dark mode, high
-/// contrast, animations, power), lifecycle events from console control
+/// contrast, animations, power, HDR headroom), lifecycle events from console control
 /// events, the session ending and the system sleeping, and dropped files;
 /// it sets the cursor and places the IME window; it watches directories
 /// for changes; and it waits for `nextFrame` on its wake, its input and a
@@ -30,6 +31,9 @@ const W = std.unicode.utf8ToUtf16LeStringLiteral;
 pub const Host = struct {
     pub const zui_surfaces: zui.SurfaceKinds = .initOne(.win32);
     pub const zui_capabilities: zui.HostCapabilities = .{ .windows = .one, .system_material = true };
+    /// `.scrgb_fp16` while the window's monitor runs in HDR, when the
+    /// window was opened with it.
+    pub const zui_output_formats: zui.OutputFormats = .initMany(&.{ .sdr, .scrgb_fp16 });
     pub const zuiClipboard = Clipboard;
 
     /// Watches up to `file_watch.Watches.capacity` directories, each with
@@ -50,6 +54,9 @@ pub const Host = struct {
     /// Behaves as on Windows 10, which has no Mica or Acrylic for a window,
     /// so the fallback can be seen on Windows 11.
     system_material_unavailable: bool = false,
+    /// Every monitor shows color this way, for tests that must not depend
+    /// on the display.
+    forced_display_color: ?display.DisplayColor = null,
     hwnd: win32.HWND,
     window_thread: std.Thread,
     window_created: win32.HANDLE,
@@ -94,6 +101,7 @@ pub const Host = struct {
         closed: bool = false,
         client_size: [2]u32 = .{ 0, 0 },
         dpi: u32 = win32.USER_DEFAULT_SCREEN_DPI,
+        output_format: zui.OutputFormat = .sdr,
 
         fn push(self: *Inbox, event: zui.Event) void {
             if (self.event_count == event_capacity) {
@@ -145,15 +153,18 @@ pub const Host = struct {
         options: zui.WindowOptions = .{},
         /// Windows took the backdrop the window asked for.
         backdrop_applied: bool = false,
+        monitor: ?win32.HMONITOR = null,
     };
 
     pub fn init(self: *Host, io: std.Io, options: zui.WindowOptions) !void {
         const forced_scale = self.forced_scale;
         const system_material_unavailable = self.system_material_unavailable;
+        const forced_display_color = self.forced_display_color;
         self.* = .{
             .io = io,
             .forced_scale = forced_scale,
             .system_material_unavailable = system_material_unavailable,
+            .forced_display_color = forced_display_color,
             .hwnd = undefined,
             .window_thread = undefined,
             .window_created = try manualResetEvent(),
@@ -292,9 +303,13 @@ pub const Host = struct {
         }
     }
 
+    /// In `.scrgb_fp16` while the window's monitor runs in HDR, if the
+    /// window was opened with it, and in `.sdr` otherwise.
     pub fn zuiSurface(self: *Host, window: zui.WindowId) zui.Surface {
         std.debug.assert(window == .main);
-        return .{ .win32 = .{ .hwnd = self.hwnd } };
+        win32.AcquireSRWLockExclusive(&self.lock);
+        defer win32.ReleaseSRWLockExclusive(&self.lock);
+        return .{ .win32 = .{ .hwnd = self.hwnd, .format = self.inbox.output_format } };
     }
 
     pub fn zuiApply(self: *Host, window: zui.WindowId, requests: zui.HostRequests) void {
@@ -440,6 +455,8 @@ pub const Host = struct {
                 return 0;
             },
             win32.WM_SIZE => self.recordClientSize(hwnd, win32.GetDpiForWindow(hwnd)),
+            win32.WM_MOVE => if (win32.MonitorFromWindow(hwnd, win32.MONITOR_DEFAULTTONEAREST) != self.window.monitor) self.reportDisplayColor(hwnd, false),
+            win32.WM_DISPLAYCHANGE => self.reportDisplayColor(hwnd, false),
             win32.WM_DPICHANGED => {
                 const suggested: *const win32.RECT = @ptrFromInt(@as(usize, @bitCast(lparam)));
                 _ = win32.SetWindowPos(hwnd, null, suggested.left, suggested.top, suggested.right - suggested.left, suggested.bottom - suggested.top, win32.SWP_NOZORDER | win32.SWP_NOACTIVATE);
@@ -703,6 +720,31 @@ pub const Host = struct {
             reported.system_material = system_material;
             self.deliver(.{ .environment = .{ .system_material = system_material } });
         }
+        self.reportDisplayColor(hwnd, first);
+    }
+
+    /// Picks the surface's format for the monitor the window is on, and
+    /// reports the headroom the window can show: 1 in `.sdr`. Read again
+    /// when the window moves to another monitor, the displays change, or a
+    /// setting does.
+    fn reportDisplayColor(self: *Host, hwnd: win32.HWND, first: bool) void {
+        const monitor = win32.MonitorFromWindow(hwnd, win32.MONITOR_DEFAULTTONEAREST);
+        self.window.monitor = monitor;
+        const color: display.DisplayColor = self.forced_display_color orelse if (monitor) |shown_on| .read(shown_on) else .sdr;
+        const format: zui.OutputFormat = if (color.hdr and self.window.options.output_formats.contains(.scrgb_fp16)) .scrgb_fp16 else .sdr;
+        win32.AcquireSRWLockExclusive(&self.lock);
+        const format_changed = format != self.inbox.output_format;
+        self.inbox.output_format = format;
+        win32.ReleaseSRWLockExclusive(&self.lock);
+
+        const reported = &self.window.environment;
+        const headroom = if (format == .scrgb_fp16) color.headroom() else 1;
+        if (first or headroom != reported.hdr_headroom) {
+            reported.hdr_headroom = headroom;
+            self.deliver(.{ .environment = .{ .hdr_headroom = headroom } });
+        } else if (format_changed) {
+            self.signalInput();
+        }
     }
 
     /// Settings > Personalization > Colors > Transparency effects.
@@ -823,4 +865,5 @@ pub const Clipboard = struct {
 test {
     _ = keys;
     _ = file_watch;
+    _ = display;
 }
