@@ -82,6 +82,7 @@ pub fn main(init: std.process.Init) !void {
     const host = try gpa.create(Host);
     defer gpa.destroy(host);
     host.forced_scale = null;
+    host.forced_display_color = null;
     host.system_material_unavailable = no_system_material;
     try host.init(io, .{ .title = "zui: the desktop through the window", .size = .{ 720, 360 }, .material = material });
     defer host.deinit();

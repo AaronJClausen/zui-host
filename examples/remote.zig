@@ -99,6 +99,7 @@ fn view(gpa: std.mem.Allocator, io: std.Io, port: u16, check_path: ?[]const u8) 
     const host = try gpa.create(zui_host.Host);
     defer gpa.destroy(host);
     host.forced_scale = null;
+    host.forced_display_color = null;
     host.system_material_unavailable = false;
     try host.init(io, .{ .title = "zui tour, drawn here, running elsewhere", .size = .{ 1440, 900 } });
     defer host.deinit();

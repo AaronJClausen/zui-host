@@ -136,6 +136,24 @@ DirectComposition composes into the window; Windows ignores the alpha of
 an OpenGL window, so with `-Dgl=true` the backdrop would be added under
 every pixel.
 
+## HDR white
+
+`zig build hdr` shows boxes of SDR white and of two and four times it, in
+`zui.ExtendedColor`, with the output format and `hdr_headroom` the window
+got. On a monitor in HDR the host opens it in `.scrgb_fp16` and
+zui-sokol's renderer draws into a half-float scRGB swapchain, so the
+brighter boxes show brighter; elsewhere all three show as SDR white.
+`-- --measure` reads the boxes back off the desktop in scRGB, where 1.0 is
+80 nits, through DXGI's desktop duplication, and fails if twice SDR white
+does not show brighter than SDR white:
+
+```
+output scrgb_fp16, headroom 3.81; the desktop shows, in scRGB (1.0 is 80 nits):
+  SDR white  3.500 3.500 3.500, 1.00x SDR white
+  2x         7.000 7.000 7.000, 2.00x SDR white
+  4x         14.000 14.000 14.000, 4.00x SDR white
+```
+
 ## A theme from a file
 
 `zig build theme` draws a window in the colors of `examples/theme.zon`

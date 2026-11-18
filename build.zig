@@ -17,7 +17,7 @@ pub fn build(b: *std.Build) void {
         .imports = &.{.{ .name = "zui", .module = zui_module }},
     });
     if (windows) {
-        for ([_][]const u8{ "user32", "gdi32", "shell32", "imm32", "dwmapi", "advapi32" }) |library| host_module.linkSystemLibrary(library, .{});
+        for ([_][]const u8{ "user32", "gdi32", "shell32", "imm32", "dwmapi", "advapi32", "dxgi" }) |library| host_module.linkSystemLibrary(library, .{});
     }
     if (linux) {
         host_module.link_libc = true;
@@ -93,7 +93,7 @@ fn addTour(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builti
     check_step.dependOn(&tour.step);
 }
 
-/// The remote, material and theme examples, which run only on the
+/// The remote, material, HDR and theme examples, which run only on the
 /// Windows host so far.
 fn addWindowsExamples(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, host_module: *std.Build.Module, zui_dependency: *std.Build.Dependency, check_step: *std.Build.Step) void {
     const app_module = zui_dependency.module("zui_app");
@@ -137,6 +137,24 @@ fn addWindowsExamples(b: *std.Build, target: std.Build.ResolvedTarget, optimize:
     if (b.args) |arguments| run_material.addArgs(arguments);
     b.step("material", "Show the desktop through a window, or the solid fallback (`-- --no-system-material`)").dependOn(&run_material.step);
     check_step.dependOn(&material.step);
+
+    const hdr = b.addExecutable(.{
+        .name = "zui-host-hdr",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("examples/hdr.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "zui_host", .module = host_module },
+                .{ .name = "zui_sokol", .module = zui_sokol_dependency.module("zui_sokol") },
+            },
+        }),
+    });
+    b.installArtifact(hdr);
+    const run_hdr = b.addRunArtifact(hdr);
+    if (b.args) |arguments| run_hdr.addArgs(arguments);
+    b.step("hdr", "Show HDR white beside SDR white (`-- --measure` reads them back off the desktop in scRGB)").dependOn(&run_hdr.step);
+    check_step.dependOn(&hdr.step);
 
     const theme = b.addExecutable(.{
         .name = "zui-host-theme",

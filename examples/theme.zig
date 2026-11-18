@@ -142,6 +142,7 @@ pub fn main(init: std.process.Init) !void {
     const host = try gpa.create(Host);
     defer gpa.destroy(host);
     host.forced_scale = null;
+    host.forced_display_color = null;
     host.system_material_unavailable = false;
     try host.init(io, .{ .title = "zui: a theme from a file", .size = .{ 720, 360 } });
     defer host.deinit();
