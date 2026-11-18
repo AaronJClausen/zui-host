@@ -44,6 +44,30 @@ jobs:
       - run: zig build test -Doptimize=ReleaseSafe
       - run: zig build check
 
+  linux:
+    name: Test and build (Linux, Wayland under a headless Weston)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      - name: Install Wayland, xkbcommon, EGL, sokol's X11, OpenGL and PulseAudio dependencies, and Weston
+        run: sudo apt-get update && sudo apt-get install -y libwayland-dev libxkbcommon-dev libegl-dev libx11-dev libxi-dev libxcursor-dev libgl1-mesa-dev libpulse-dev weston
+      - name: Start a headless Weston for the host suite
+        run: |
+          export XDG_RUNTIME_DIR="$RUNNER_TEMP/xdg"
+          mkdir -p "$XDG_RUNTIME_DIR" && chmod 700 "$XDG_RUNTIME_DIR"
+          echo "XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR" >> "$GITHUB_ENV"
+          echo "WAYLAND_DISPLAY=wayland-ci" >> "$GITHUB_ENV"
+          weston --backend=headless --socket=wayland-ci --idle-time=0 &
+          timeout 10 sh -c 'until [ -S "$XDG_RUNTIME_DIR/wayland-ci" ]; do sleep 0.1; done'
+      - name: Run the unit tests and zui's host suite against a window Weston never shows
+        run: zig build test --summary all
+      - run: zig build test -Doptimize=ReleaseSafe
+      - run: zig build check
+
   cross:
     name: Cross-compile for Windows (Linux)
     runs-on: ubuntu-latest

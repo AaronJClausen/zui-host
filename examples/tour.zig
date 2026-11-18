@@ -13,6 +13,7 @@ const zui_app = @import("zui_app");
 const tour = @import("zui_sokol_tour");
 const capture = @import("capture.zig");
 const zui = zui_host.zui;
+const builtin = @import("builtin");
 const win32 = zui_host.windows.win32;
 const Ui = tour.kit.Ui;
 
@@ -111,7 +112,11 @@ const TourOnHost = struct {
 
         app.frames += 1;
         if (app.options.screenshot_path) |path| if (app.frames == screenshot_after_frames) {
-            capture.saveClientArea(app.gpa, io, app.host.hwnd, path) catch |err| std.log.err("could not save {s}: {t}", .{ path, err });
+            if (comptime builtin.os.tag == .windows) {
+                capture.saveClientArea(app.gpa, io, app.host.hwnd, path) catch |err| std.log.err("could not save {s}: {t}", .{ path, err });
+            } else {
+                std.log.err("could not save {s}: this host does not capture its window yet", .{path});
+            }
             app.host.close();
         };
         if (app.options.frame_limit) |limit| if (app.frames == limit) app.host.close();
@@ -131,13 +136,13 @@ const TourOnHost = struct {
             }
             const ends_at = now.addSeconds(idle_seconds);
             ui.requestFrameAt(ends_at);
-            return .{ .ends_at = ends_at, .cpu_100ns = IdleMeasurement.processCpu100ns(), .frames = app.frames, .wakes = app.tour.wakes.load(.monotonic) };
+            return .{ .ends_at = ends_at, .cpu_ns = IdleMeasurement.processCpuNanoseconds(), .frames = app.frames, .wakes = app.tour.wakes.load(.monotonic) };
         };
         if (now.isBefore(started.ends_at)) {
             ui.requestFrameAt(started.ends_at);
             return started;
         }
-        const cpu_ms = @as(f64, @floatFromInt(IdleMeasurement.processCpu100ns() - started.cpu_100ns)) / 10_000;
+        const cpu_ms = @as(f64, @floatFromInt(IdleMeasurement.processCpuNanoseconds() - started.cpu_ns)) / std.time.ns_per_ms;
         // Less the measurement's own frame.
         const frames_between = app.frames - started.frames - 1;
         std.debug.print("idle: {d:.1} ms of CPU over {d} s, {d} frames, {d} wakes\n", .{ cpu_ms, idle_seconds, frames_between, app.tour.wakes.load(.monotonic) - started.wakes });
@@ -168,7 +173,7 @@ const TourOnHost = struct {
 /// window with the tour's text, and timing each submit for the tour's
 /// performance strip.
 const SokolRenderer = struct {
-    pub const zui_surfaces: zui.SurfaceKinds = .initOne(.win32);
+    pub const zui_surfaces: zui.SurfaceKinds = zui_host.Host.zui_surfaces;
     pub const ImageHandle = zui_sokol.Renderer.ImageHandle;
 
     sokol: zui_sokol.Renderer,
@@ -210,17 +215,22 @@ const SokolRenderer = struct {
 /// window, read again at its end.
 const IdleMeasurement = struct {
     ends_at: zui.Instant,
-    cpu_100ns: u64,
+    cpu_ns: u64,
     frames: u64,
     wakes: u32,
 
-    fn processCpu100ns() u64 {
-        var creation: u64 = 0;
-        var exit: u64 = 0;
-        var kernel: u64 = 0;
-        var user: u64 = 0;
-        _ = win32.GetProcessTimes(win32.GetCurrentProcess(), &creation, &exit, &kernel, &user);
-        return kernel + user;
+    fn processCpuNanoseconds() u64 {
+        if (comptime builtin.os.tag == .windows) {
+            var creation: u64 = 0;
+            var exit: u64 = 0;
+            var kernel: u64 = 0;
+            var user: u64 = 0;
+            _ = win32.GetProcessTimes(win32.GetCurrentProcess(), &creation, &exit, &kernel, &user);
+            return (kernel + user) * 100;
+        }
+        var spent: std.os.linux.timespec = undefined;
+        _ = std.os.linux.clock_gettime(.PROCESS_CPUTIME_ID, &spent);
+        return @as(u64, @intCast(spent.sec)) * std.time.ns_per_s + @as(u64, @intCast(spent.nsec));
     }
 };
 

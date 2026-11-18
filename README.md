@@ -3,11 +3,12 @@
 Native hosts for [zui](https://github.com/AaronJClausen/zui): each owns
 its OS's windows and event loop, and implements zui's host contract, so
 any renderer that draws into the same kind of surface can draw for it.
-One directory per OS, chosen by the target. Windows is the first.
+One directory per OS, chosen by the target: Windows, and Linux on
+Wayland.
 
 ```zig
 const zui_host = @import("zui_host");
-const Host = zui_host.Host; // zui_host.windows.Host on Windows
+const Host = zui_host.Host; // zui_host.windows.Host on Windows, zui_host.linux.Host on Linux
 ```
 
 ## The Windows host
@@ -52,6 +53,42 @@ window keeps drawing while the user drags its edges or moves it. It:
 It passes zui's host suite (`zui_testing.expectHostConforms`) against a
 hidden window, whose harness sends the messages Windows would.
 
+## The Linux host
+
+On Linux, `zui_host.Host` opens a Wayland window through libwayland-client
+and xdg-shell, and gives renderers its `wayland` surface (the `wl_display`
+and `wl_surface`). It reads and dispatches the compositor's events on the
+thread that polls it, since a Wayland client has no modal loop to escape.
+So far it:
+
+- reports the buffer scale the compositor prefers
+  (`wl_surface.preferred_buffer_scale`), keeping the window's size in
+  layout units when it changes, and takes the size the compositor
+  configures, such as a tiling compositor's tile;
+- reports the mouse, the wheel (40 layout units a notch, a touchpad's
+  distance as it is), keys through the compositor's keymap with their
+  modifiers and evdev codes, typed text, and whether the window has
+  focus;
+- closes when its close button or the compositor asks;
+- sets the cursor a frame asks for, where the compositor offers
+  `wp_cursor_shape_v1`;
+- waits as `nextFrame` says: at once, until an instant, or until input or
+  a wake, which is sticky and works from any thread (an `eventfd`); the
+  compositor's other events, such as a buffer released after each frame,
+  do not end a wait.
+
+It links libwayland-client and libxkbcommon. A window opened with
+`visible = false` is a surface with no role, which the compositor never
+shows. Key repeat, lifecycle events, the environment beyond focus,
+fractional scale, the clipboard, drops, file watching, the IME, a system
+material and X11 are still to come.
+
+It passes zui's host suite (`zui_testing.expectHostConforms`) against a
+window the compositor never shows, whose harness delivers what a
+compositor would to the host's own handlers; without a compositor to
+connect to, the suite and the host's own tests are skipped with a
+message.
+
 ## The desktop through the window
 
 `zig build material` shows a window whose root draws no background while
@@ -95,7 +132,8 @@ frames after the first.
 
 `zig build tour` runs [zui-sokol](https://github.com/AaronJClausen/zui-sokol)'s
 tour on this host, drawn by zui-sokol's renderer, which draws into a
-`win32` window through sokol_gfx with D3D11 and without sokol_app. The
+`win32` window through sokol_gfx with D3D11, or into a `wayland` surface
+with OpenGL through EGL, without sokol_app. The
 tour's application is zui-sokol's own (its `zui_sokol_tour` module),
 unchanged, and `zui_app.run` runs it: `examples/tour.zig` names this
 host, zui-sokol's renderer and the tour's text contract
@@ -112,7 +150,10 @@ zig build tour -- --screenshot tour.bmp      # save the window after a few frame
 
 Idle, it uses no CPU: on an i9-10900K in ReleaseSafe, the Layout Lab
 screen used 0.0 ms of CPU over 10 s with no frames and no wakes in three
-runs of four (Windows counts CPU time in 15.6 ms ticks).
+runs of four (Windows counts CPU time in 15.6 ms ticks). On Linux, under
+Hyprland with an NVIDIA RTX 2060 SUPER, it used 1.2 to 4.4 ms over 10 s,
+with 0 or 1 frames and no wakes, in five runs of six. `--screenshot` saves
+the window on Windows only so far.
 
 ## The tour in another process
 
@@ -138,18 +179,21 @@ under a second: the first frame arrives about 3 ms after connecting.
 
 | Command | What it does |
 |---|---|
-| `zig build test` | the unit tests, and on Windows zui's host suite and the host's own tests against a hidden window |
+| `zig build test` | the unit tests, and zui's host suite and the host's own tests against a window the user never sees (on Linux, skipped without a Wayland compositor) |
 | `zig build conformance` | only the host suite and the host's own tests |
 | `zig build check` | compile the host, its tests and the tour; add `-Dtarget=x86_64-windows` to cross-compile |
-| `zig build tour` | run the tour (Windows, Direct3D 11) |
+| `zig build tour` | run the tour (Windows, Direct3D 11; Linux, OpenGL through EGL on Wayland) |
 | `zig build material` | show the system material, or its fallback |
 | `zig build remote` | run the tour in another process and draw it here, over `zui_wire` |
 | `zig build theme` | a window styled by a theme file, restyled when it changes |
 | `zig build fmt` / `fmt-check` | format, or fail if a file is not formatted |
 
-CI checks the format, runs the tests on Windows in Debug and ReleaseSafe,
-and cross-compiles from Linux for x86-64 and ARM64 Windows. The examples
-are compiled there and run on a desktop.
+CI checks the format, runs the tests on Windows, and on Linux under a
+headless Weston, in Debug and ReleaseSafe, and cross-compiles from Linux
+for x86-64 and ARM64 Windows. The examples are compiled there and run on
+a desktop. On Linux the build needs `libwayland-dev libxkbcommon-dev
+libegl-dev`, and for the tour sokol's `libx11-dev libxi-dev
+libxcursor-dev libgl1-mesa-dev libpulse-dev`.
 
 The repository uses LF line endings everywhere (see `.gitattributes`).
 
@@ -170,13 +214,14 @@ With `zui_app`, name it as the application's host:
 ```zig
 const App = struct {
     pub const Host = zui_host.Host;
-    pub const Renderer = MyRenderer; // one that draws into .win32
+    pub const Renderer = MyRenderer; // one that draws into .win32, or .wayland on Linux
     // ...
 };
 ```
 
 The host must not move between `init` and `deinit`, since its window
-thread holds a pointer to it. `forced_scale` and
+thread (on Windows) and the compositor's listeners (on Linux) hold a
+pointer to it. `forced_scale` and
 `system_material_unavailable` may be set before `init`, which keeps them;
 `zui_app` starts each field at its default.
 
