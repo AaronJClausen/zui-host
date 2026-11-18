@@ -53,8 +53,8 @@ jobs:
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
           version: ${{ env.ZIG_VERSION }}
-      - name: Install Wayland, xkbcommon, EGL, sokol's X11, OpenGL and PulseAudio dependencies, and Weston
-        run: sudo apt-get update && sudo apt-get install -y libwayland-dev libxkbcommon-dev libegl-dev libx11-dev libxi-dev libxcursor-dev libgl1-mesa-dev libpulse-dev weston
+      - name: Install Wayland, xkbcommon, EGL, sokol's X11, OpenGL and PulseAudio dependencies, Weston and a D-Bus daemon
+        run: sudo apt-get update && sudo apt-get install -y libwayland-dev libxkbcommon-dev libegl-dev libx11-dev libxi-dev libxcursor-dev libgl1-mesa-dev libpulse-dev weston dbus-daemon
       - name: Start a headless Weston for the host suite
         run: |
           export XDG_RUNTIME_DIR="$RUNNER_TEMP/xdg"
@@ -63,6 +63,13 @@ jobs:
           echo "WAYLAND_DISPLAY=wayland-ci" >> "$GITHUB_ENV"
           weston --backend=headless --socket=wayland-ci --idle-time=0 &
           timeout 10 sh -c 'until [ -S "$XDG_RUNTIME_DIR/wayland-ci" ]; do sleep 0.1; done'
+      # No session bus runs here, so the host's environment stays at its
+      # defaults; on this bus of the tests' own, a test plays the portal.
+      - name: Start a session bus for the D-Bus test
+        run: |
+          dbus-daemon --session --nofork --address=unix:abstract=/zui-host-ci --print-address > "$RUNNER_TEMP/bus-address" &
+          timeout 10 sh -c 'until [ -s "$RUNNER_TEMP/bus-address" ]; do sleep 0.1; done'
+          echo "ZUI_HOST_TEST_SESSION_BUS=$(head -1 "$RUNNER_TEMP/bus-address")" >> "$GITHUB_ENV"
       - name: Run the unit tests and zui's host suite against a window Weston never shows
         run: zig build test --summary all
       - run: zig build test -Doptimize=ReleaseSafe

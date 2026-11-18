@@ -69,25 +69,53 @@ So far it:
   distance as it is), keys through the compositor's keymap with their
   modifiers and evdev codes, typed text, and whether the window has
   focus;
+- repeats a held key at the rate and after the delay the compositor
+  gives (`wl_keyboard.repeat_info`), each repeat a `key_down` with
+  `repeat` set and its text typed again; a modifier pressed meanwhile
+  leaves it repeating;
+- reports the environment the desktop gives over D-Bus: the theme, high
+  contrast and reduced motion from the XDG desktop portal's settings
+  (`org.freedesktop.appearance`), and power from UPower (on battery) and
+  power-profiles-daemon (`power-saver` is the saver), each change as it
+  is signalled. Without a session bus, a portal or either daemon, as in a
+  container or under a bare compositor, those settings stay at zui's
+  defaults, and `host.environmentSources()` says which answered;
+- reports lifecycle events: SIGINT, SIGTERM and SIGHUP are
+  `.terminate_requested`, after which the next poll reports the window
+  closed, unless the application handles or ignores the signal itself (a
+  second Ctrl+C ends the process); the system sleeping and waking
+  (logind's `PrepareForSleep`) are `.suspend` and `.resume`;
 - closes when its close button or the compositor asks;
 - sets the cursor a frame asks for, where the compositor offers
   `wp_cursor_shape_v1`;
-- waits as `nextFrame` says: at once, until an instant, or until input or
-  a wake, which is sticky and works from any thread (an `eventfd`); the
-  compositor's other events, such as a buffer released after each frame,
-  do not end a wait.
+- waits as `nextFrame` says: at once, until an instant, or until input,
+  a key's repeat, a signal or a wake, which is sticky and works from any
+  thread (an `eventfd`); the compositor's and the buses' other messages,
+  such as a buffer released after each frame, do not end a wait.
 
-It links libwayland-client and libxkbcommon. A window opened with
+It links libwayland-client and libxkbcommon, and speaks D-Bus itself: a
+client of its own, in `linux/dbus.zig`, reads the buses' sockets into
+fixed buffers, beside the display in the same wait, so it needs no
+libdbus and allocates nothing. `init` waits up to 250 ms for the desktop's
+current settings, so the first frame has them. A window opened with
 `visible = false` is a surface with no role, which the compositor never
-shows. Key repeat, lifecycle events, the environment beyond focus,
-fractional scale, the clipboard, drops, file watching, the IME, a system
-material and X11 are still to come.
+shows. Low memory, reduced transparency, fractional scale, the clipboard,
+drops, file watching, the IME, a system material and X11 are still to
+come.
 
 It passes zui's host suite (`zui_testing.expectHostConforms`) against a
 window the compositor never shows, whose harness delivers what a
 compositor would to the host's own handlers; without a compositor to
 connect to, the suite and the host's own tests are skipped with a
-message.
+message. The tests read no bus, but one: with
+`ZUI_HOST_TEST_SESSION_BUS` set to a bus's address, a test plays the
+portal on it, and checks that its answer and signals reach the host and
+another sender's do not.
+
+```sh
+dbus-daemon --session --nofork --address=unix:abstract=/zui-host-test --print-address
+ZUI_HOST_TEST_SESSION_BUS=unix:abstract=/zui-host-test zig build test
+```
 
 ## The desktop through the window
 
@@ -189,7 +217,7 @@ under a second: the first frame arrives about 3 ms after connecting.
 | `zig build fmt` / `fmt-check` | format, or fail if a file is not formatted |
 
 CI checks the format, runs the tests on Windows, and on Linux under a
-headless Weston, in Debug and ReleaseSafe, and cross-compiles from Linux
+headless Weston with a D-Bus daemon of its own, in Debug and ReleaseSafe, and cross-compiles from Linux
 for x86-64 and ARM64 Windows. The examples are compiled there and run on
 a desktop. On Linux the build needs `libwayland-dev libxkbcommon-dev
 libegl-dev`, and for the tour sokol's `libx11-dev libxi-dev
@@ -221,9 +249,10 @@ const App = struct {
 
 The host must not move between `init` and `deinit`, since its window
 thread (on Windows) and the compositor's listeners (on Linux) hold a
-pointer to it. `forced_scale` and
-`system_material_unavailable` may be set before `init`, which keeps them;
-`zui_app` starts each field at its default.
+pointer to it, as does the Linux host's signal handler. `forced_scale`,
+`system_material_unavailable` (Windows) and `bus_addresses` (Linux) may
+be set before `init`, which keeps them; `zui_app` starts each field at
+its default.
 
 ## License
 

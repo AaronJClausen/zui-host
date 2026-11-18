@@ -10,6 +10,7 @@ const zui = zui_host.zui;
 const zui_testing = @import("zui_testing");
 const Host = zui_host.Host;
 const keys = zui_host.linux.keys;
+const desktop_bus = zui_host.linux.desktop_bus;
 
 const testing = std.testing;
 
@@ -17,9 +18,16 @@ const UnshownWindow = struct {
     window_host: Host = undefined,
 
     /// With `forced_scale` set, a surface coordinate is that many layout
-    /// units at a zoom of 1 and a buffer scale of 1.
+    /// units at a zoom of 1 and a buffer scale of 1. The window reads no
+    /// bus, so its environment starts at zui's defaults.
     fn open(self: *UnshownWindow, forced_scale: ?f32) !void {
+        return self.openReading(forced_scale, .{ .session = null, .system = null });
+    }
+
+    /// Null reads the session's and the system's buses.
+    fn openReading(self: *UnshownWindow, forced_scale: ?f32, bus_addresses: ?desktop_bus.Addresses) !void {
         self.window_host.forced_scale = forced_scale;
+        self.window_host.bus_addresses = bus_addresses;
         self.window_host.init(testing.io, .{ .title = "zui host suite", .size = .{ 320, 240 }, .visible = false }) catch |err| switch (err) {
             error.NoWaylandDisplay => {
                 std.debug.print("skipped: no Wayland compositor to connect to (WAYLAND_DISPLAY and XDG_RUNTIME_DIR)\n", .{});
@@ -209,4 +217,164 @@ test "the close button closes the window at the next poll" {
     try testing.expect(polled.poll(window.host()));
     window.host().onClose();
     try testing.expect(!polled.poll(window.host()));
+}
+
+fn environmentOf(polled: *const Polled) struct { environment: zui.Environment, changes: usize } {
+    var environment: zui.Environment = .{};
+    var changes: usize = 0;
+    for (polled.builder.events()) |event| if (event == .environment and event.environment != .window_focused) {
+        environment.apply(event.environment);
+        changes += 1;
+    };
+    return .{ .environment = environment, .changes = changes };
+}
+
+test "without a bus to read, the first poll reports the environment at zui's defaults" {
+    var window: UnshownWindow = .{};
+    try window.openReading(1, .{ .session = "unix:path=/nonexistent/zui-host-session-bus", .system = "unix:path=/nonexistent/zui-host-system-bus" });
+    defer window.close();
+    var polled: Polled = .{};
+    polled.init();
+    _ = polled.poll(window.host());
+    const reported = environmentOf(&polled);
+    try testing.expectEqual(@as(usize, 4), reported.changes);
+    try testing.expectEqual(zui.Environment{ .window_focused = true }, reported.environment);
+    try testing.expectEqual(desktop_bus.Sources{}, window.host().environmentSources());
+}
+
+test "the desktop's own buses, where they run, report the whole environment within init's bound" {
+    var window: UnshownWindow = .{};
+    const started = std.Io.Timestamp.now(testing.io, .awake);
+    try window.openReading(1, null);
+    defer window.close();
+    const init_ns = started.durationTo(std.Io.Timestamp.now(testing.io, .awake)).nanoseconds;
+    try testing.expect(init_ns < std.time.ns_per_s);
+    var polled: Polled = .{};
+    polled.init();
+    _ = polled.poll(window.host());
+    try testing.expectEqual(@as(usize, 4), environmentOf(&polled).changes);
+}
+
+test "a setting the desktop changes is reported, and only what changed" {
+    var window: UnshownWindow = .{};
+    try window.open(1);
+    defer window.close();
+    const window_host = window.host();
+    var polled: Polled = .{};
+    polled.init();
+    _ = polled.poll(window_host);
+
+    window_host.onDesktopReport(.{ .theme = .dark });
+    window_host.onDesktopReport(.{ .contrast = .normal });
+    _ = polled.poll(window_host);
+    try testing.expectEqual(@as(usize, 1), environmentOf(&polled).changes);
+    try testing.expectEqual(zui.Environment.Theme.dark, polled.find(.environment).?.theme);
+
+    const expected_power = [_]struct { desktop_bus.Report, zui.Environment.Power }{
+        .{ .{ .on_battery = true }, .battery },
+        .{ .{ .power_saver = true }, .saver },
+        .{ .{ .power_saver = false }, .battery },
+        .{ .{ .on_battery = false }, .plugged },
+    };
+    for (expected_power) |step| {
+        window_host.onDesktopReport(step[0]);
+        _ = polled.poll(window_host);
+        try testing.expectEqual(step[1], polled.find(.environment).?.power);
+    }
+}
+
+test "the system preparing to sleep is a suspend, and waking a resume" {
+    var window: UnshownWindow = .{};
+    try window.open(1);
+    defer window.close();
+    var polled: Polled = .{};
+    polled.init();
+    window.host().onDesktopReport(.{ .preparing_for_sleep = true });
+    window.host().onDesktopReport(.{ .preparing_for_sleep = false });
+    _ = polled.poll(window.host());
+    var lifecycle: [2]zui.Lifecycle = undefined;
+    var count: usize = 0;
+    for (polled.builder.events()) |event| if (event == .lifecycle) {
+        lifecycle[count] = event.lifecycle;
+        count += 1;
+    };
+    try testing.expectEqualSlices(zui.Lifecycle, &.{ .@"suspend", .@"resume" }, lifecycle[0..count]);
+}
+
+test "SIGINT, SIGTERM and SIGHUP each wake the wait as a terminate request, after which the window reports closed" {
+    for ([_]std.posix.SIG{ .INT, .TERM, .HUP }) |signal| {
+        var window: UnshownWindow = .{};
+        try window.open(1);
+        defer window.close();
+        const window_host = window.host();
+        if (!window_host.handlesSignal(signal)) {
+            std.debug.print("skipped: SIG{t} already has a handler in this process\n", .{signal});
+            return error.SkipZigTest;
+        }
+        var polled: Polled = .{};
+        polled.init();
+        _ = polled.poll(window_host);
+        try std.posix.raise(signal);
+        window_host.zuiWait(.{ .at = window_host.now().addSeconds(2) });
+        try testing.expect(polled.poll(window_host));
+        try testing.expectEqual(zui.Lifecycle.terminate_requested, polled.find(.lifecycle).?);
+        try testing.expect(!polled.poll(window_host));
+    }
+}
+
+fn findRepeat(polled: *const Polled) ?zui.KeyEvent {
+    for (polled.builder.events()) |event| if (event == .key_down and event.key_down.repeat) return event.key_down;
+    return null;
+}
+
+test "a held key repeats after the delay at the compositor's rate, typing each time, until it is released" {
+    var window: UnshownWindow = .{};
+    try window.open(1);
+    defer window.close();
+    const window_host = window.host();
+    var polled: Polled = .{};
+    polled.init();
+    _ = polled.poll(window_host);
+    const a = evdevCodeOf(window_host, .a).?;
+
+    window_host.onRepeatInfo(100, 30);
+    window_host.onKey(a, true);
+    _ = polled.poll(window_host);
+    const press = polled.find(.key_down).?;
+    try testing.expect(!press.repeat);
+
+    const pressed_at = press.at;
+    window_host.zuiWait(.{ .at = pressed_at.addSeconds(2) });
+    try testing.expect(window_host.now().secondsSince(pressed_at) < 1);
+    _ = polled.poll(window_host);
+    const repeat = findRepeat(&polled).?;
+    try testing.expectEqual(zui.Key.a, repeat.key);
+    try testing.expect(repeat.at.secondsSince(pressed_at) >= 0.03);
+    var buffer: [32]u8 = undefined;
+    try testing.expect(std.mem.startsWith(u8, polled.typed(&buffer), "a"));
+
+    window_host.onKey(a, false);
+    try testing.expectEqual(@as(?zui.Instant, null), window_host.nextRepeatAt());
+    window_host.zuiWait(.{ .at = window_host.now().addSeconds(0.1) });
+    _ = polled.poll(window_host);
+    try testing.expectEqual(@as(?zui.KeyEvent, null), findRepeat(&polled));
+}
+
+test "a modifier pressed while a key is held leaves it repeating; losing focus, or a rate of 0, stops it" {
+    var window: UnshownWindow = .{};
+    try window.open(1);
+    defer window.close();
+    const window_host = window.host();
+    const a = evdevCodeOf(window_host, .a).?;
+
+    window_host.onKey(a, true);
+    const repeat_at = window_host.nextRepeatAt().?;
+    window_host.onKey(evdevCodeOf(window_host, .shift).?, true);
+    try testing.expectEqual(repeat_at, window_host.nextRepeatAt().?);
+    window_host.onKeyboardFocus(false);
+    try testing.expectEqual(@as(?zui.Instant, null), window_host.nextRepeatAt());
+
+    window_host.onRepeatInfo(0, 600);
+    window_host.onKey(a, true);
+    try testing.expectEqual(@as(?zui.Instant, null), window_host.nextRepeatAt());
 }

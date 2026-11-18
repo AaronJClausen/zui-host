@@ -4,6 +4,8 @@ const linux = std.os.linux;
 pub const wayland = @import("wayland.zig");
 pub const xkb = @import("xkb.zig");
 pub const keys = @import("keys.zig");
+pub const dbus = @import("dbus.zig");
+pub const desktop_bus = @import("desktop_bus.zig");
 
 const Proxy = wayland.Proxy;
 
@@ -13,14 +15,18 @@ const Proxy = wayland.Proxy;
 /// `zuiWait`.
 ///
 /// It reports the buffer scale the compositor prefers, the pointer, the
-/// wheel, keys through the compositor's keymap with their modifiers and
-/// evdev codes, typed text, focus and the close button; it sets the
-/// cursor where the compositor offers cursor shapes; and it waits for
-/// `nextFrame` on the display, a wake and a deadline.
+/// wheel, keys through the compositor's keymap with their modifiers,
+/// evdev codes and repeats, typed text, focus and the close button; the
+/// environment the desktop reports over D-Bus (theme, contrast, reduced
+/// motion, power); and SIGINT, SIGTERM and SIGHUP as terminate requests
+/// and the system sleeping and waking as lifecycle events. It sets the
+/// cursor where the compositor offers cursor shapes, and waits for
+/// `nextFrame` on the display, the desktop's buses, a wake and a deadline.
 ///
-/// `init` opens the window and `deinit` closes it. A window opened with
-/// `visible = false` is a surface without a role, which the compositor
-/// never shows.
+/// `init` opens the window and `deinit` closes it; the host must not move
+/// in between, since the compositor's listeners and the signal handler
+/// hold pointers to it. A window opened with `visible = false` is a
+/// surface without a role, which the compositor never shows.
 ///
 /// ```zig
 /// const App = struct {
@@ -40,6 +46,9 @@ pub const Host = struct {
     /// Physical pixels per layout unit in place of the buffer scale, for
     /// tests that must not depend on the monitor.
     forced_scale: ?f32 = null,
+    /// The buses the environment is read from in place of the session's
+    /// and the system's, for tests that must not depend on the desktop.
+    bus_addresses: ?desktop_bus.Addresses = null,
 
     display: *wayland.Display,
     registry: *Proxy,
@@ -76,10 +85,61 @@ pub const Host = struct {
     modifiers: zui.Modifiers,
     requests: zui.HostRequests,
     applied_cursor: ?zui.Cursor,
+    key_repeat: KeyRepeat,
+
+    desktop: desktop_bus.DesktopBus,
+    desktop_settings: DesktopSettings,
+    /// Null until `init` reports the whole environment.
+    reported_environment: ?ReportedEnvironment,
+
+    /// Set by the signal handler, and delivered by the next poll.
+    termination_signalled: std.atomic.Value(bool),
+    /// The poll after the one that delivered a terminate request reports
+    /// the window closed.
+    terminate_delivered: bool,
+    /// For each of `termination_signals`, whether this host handles it,
+    /// and what `deinit` gives it back.
+    handled_signals: [termination_signals.len]bool,
+    replaced_signal_actions: [termination_signals.len]std.posix.Sigaction,
 
     const event_capacity = 512;
     const text_capacity = 1024;
     const app_id = "zui";
+    /// How long `init` waits for the desktop's settings, so the first frame
+    /// has them; later answers arrive as changes.
+    const desktop_answer_ns = 250 * std.time.ns_per_ms;
+    /// A frame late by more repeats than this gets this many, not a burst.
+    const most_repeats_at_once = 4;
+    /// Keys per second; a compositor asking for more gets this many.
+    const fastest_repeat_rate = 1000;
+    const termination_signals = [_]std.posix.SIG{ .INT, .TERM, .HUP };
+
+    const KeyRepeat = struct {
+        /// Keys per second; 0 turns repeating off. Until the compositor
+        /// says otherwise, which before wl_keyboard version 4 it never
+        /// does, X's usual rate and delay.
+        rate: u32 = 25,
+        delay_ns: u64 = 600 * std.time.ns_per_ms,
+        held: ?HeldKey = null,
+
+        const HeldKey = struct { evdev_code: u32, next_at: zui.Instant };
+    };
+
+    const DesktopSettings = struct {
+        theme: zui.Environment.Theme = .light,
+        contrast: zui.Environment.Contrast = .normal,
+        reduced_motion: bool = false,
+        on_battery: bool = false,
+        power_saver: bool = false,
+    };
+
+    /// The fields of `zui.Environment` the desktop's settings decide.
+    const ReportedEnvironment = struct {
+        theme: zui.Environment.Theme,
+        contrast: zui.Environment.Contrast,
+        reduced_motion: bool,
+        power: zui.Environment.Power,
+    };
 
     const Globals = struct {
         compositor: ?*Proxy = null,
@@ -134,9 +194,11 @@ pub const Host = struct {
         const display = wayland.wl_display_connect(null) orelse return error.NoWaylandDisplay;
         errdefer wayland.wl_display_disconnect(display);
         const forced_scale = self.forced_scale;
+        const bus_addresses = self.bus_addresses;
         self.* = .{
             .io = io,
             .forced_scale = forced_scale,
+            .bus_addresses = bus_addresses,
             .display = display,
             .registry = undefined,
             .globals = .{},
@@ -164,6 +226,14 @@ pub const Host = struct {
             .modifiers = .{},
             .requests = .{},
             .applied_cursor = null,
+            .key_repeat = .{},
+            .desktop = .{},
+            .desktop_settings = .{},
+            .reported_environment = null,
+            .termination_signalled = .init(false),
+            .terminate_delivered = false,
+            .handled_signals = @splat(false),
+            .replaced_signal_actions = undefined,
         };
         errdefer xkb.xkb_context_unref(self.xkb_context);
         const wake_fd = linux.eventfd(0, linux.EFD.CLOEXEC | linux.EFD.NONBLOCK);
@@ -197,6 +267,9 @@ pub const Host = struct {
             if (wayland.wl_display_roundtrip(display) < 0) return error.CompositorUnreachable;
         }
         if (!self.configured) return error.WindowNotConfigured;
+
+        self.readDesktopEnvironment();
+        self.handleTerminationSignals();
     }
 
     fn giveToplevelRole(self: *Host, wm_base: *Proxy, options: zui.WindowOptions) !void {
@@ -222,6 +295,8 @@ pub const Host = struct {
     /// Call after the renderer's `deinit`, whose EGL objects live on this
     /// display.
     pub fn deinit(self: *Host) void {
+        self.restoreTerminationSignals();
+        self.desktop.close();
         self.releaseDevices(.{});
         if (self.toplevel) |toplevel| wayland.destroy(toplevel, wayland.xdg_toplevel_destroy);
         if (self.xdg_surface) |xdg_surface| wayland.destroy(xdg_surface, wayland.xdg_surface_destroy);
@@ -247,6 +322,7 @@ pub const Host = struct {
 
     pub fn zuiPoll(self: *Host, window: zui.WindowId, record: *zui.RecordBuilder) bool {
         std.debug.assert(window == .main);
+        if (self.terminate_delivered) return false;
         self.readAvailableEvents();
         if (self.closed) return false;
 
@@ -263,6 +339,10 @@ pub const Host = struct {
             const converted = inLayoutUnits(queued, surface_coordinates_per_unit);
             switch (converted) {
                 .text => |text| record.appendText(text),
+                .lifecycle => |change| {
+                    if (change == .terminate_requested) self.terminate_delivered = true;
+                    record.append(converted);
+                },
                 else => record.append(converted),
             }
         }
@@ -288,10 +368,12 @@ pub const Host = struct {
         position.* = .{ position[0] / surface_coordinates_per_unit, position[1] / surface_coordinates_per_unit };
     }
 
-    /// Reads whatever the compositor has sent, without waiting, and
-    /// dispatches it.
+    /// Reads whatever the compositor and the desktop have sent, without
+    /// waiting, and dispatches it, with any repeats and signals that came due.
     fn readAvailableEvents(self: *Host) void {
-        _ = self.waitForDisplay(0);
+        _ = self.waitForEvents(0);
+        self.deliverDueRepeats();
+        self.deliverTerminationSignal();
     }
 
     pub fn zuiWaker(self: *Host) zui.Waker {
@@ -304,41 +386,52 @@ pub const Host = struct {
         _ = linux.write(self.wake_fd, std.mem.asBytes(&one), @sizeOf(u64));
     }
 
-    /// Returns on a wake, input, or a change of size or scale, and for `.at`
-    /// also at the instant. The compositor's other events, such as a
-    /// buffer released after each frame, are dispatched without ending it.
+    /// Returns on a wake, input, a key's repeat, a signal, or a change of
+    /// size, scale or environment, and for `.at` also at the instant. The
+    /// compositor's and the buses' other messages, such as a buffer
+    /// released after each frame, are dispatched without ending it.
     pub fn zuiWait(self: *Host, next: zui.NextFrame) void {
         defer self.clearWake();
-        if (next == .immediately) return;
+        const frame_at: ?zui.Instant = switch (next) {
+            .immediately => return,
+            .on_event => null,
+            .at => |instant| instant,
+        };
         while (!self.input_arrived and !self.closed) {
-            const timeout_ns: ?u64 = switch (next) {
-                .immediately => unreachable,
-                .on_event => null,
-                .at => |instant| remaining: {
-                    const remaining = instant.nanoseconds -| self.now().nanoseconds;
-                    if (remaining == 0) return;
-                    break :remaining remaining;
-                },
-            };
-            if (self.waitForDisplay(timeout_ns) == .woken) return;
+            self.deliverDueRepeats();
+            self.deliverTerminationSignal();
+            if (self.input_arrived) return;
+            const now_instant = self.now();
+            if (frame_at) |instant| if (!now_instant.isBefore(instant)) return;
+            const timeout_ns: ?u64 = if (earlier(frame_at, self.nextRepeatAt())) |instant| instant.nanoseconds -| now_instant.nanoseconds else null;
+            if (self.waitForEvents(timeout_ns) == .woken) return;
         }
     }
 
-    const Waited = enum { display, woken, timed_out };
+    fn earlier(first: ?zui.Instant, second: ?zui.Instant) ?zui.Instant {
+        const one = first orelse return second;
+        const other = second orelse return one;
+        return if (other.isBefore(one)) other else one;
+    }
 
-    /// Waits up to `timeout_ns` (forever for null) for the display or a
-    /// wake, then reads and dispatches what the display sent.
-    fn waitForDisplay(self: *Host, timeout_ns: ?u64) Waited {
+    const Waited = enum { events, woken, timed_out };
+
+    /// Waits up to `timeout_ns` (forever for null) for the display, the
+    /// desktop's buses or a wake, then reads and dispatches what they sent.
+    fn waitForEvents(self: *Host, timeout_ns: ?u64) Waited {
         const display = self.display;
         while (wayland.wl_display_prepare_read(display) != 0) _ = wayland.wl_display_dispatch_pending(display);
         if (self.input_arrived and timeout_ns != 0) {
             wayland.wl_display_cancel_read(display);
-            return .display;
+            return .events;
         }
         _ = wayland.wl_display_flush(display);
+        const bus_fds = self.desktop.descriptors();
         var descriptors = [_]linux.pollfd{
             .{ .fd = wayland.wl_display_get_fd(display), .events = linux.POLL.IN, .revents = 0 },
             .{ .fd = self.wake_fd, .events = linux.POLL.IN, .revents = 0 },
+            .{ .fd = bus_fds[0], .events = linux.POLL.IN, .revents = 0 },
+            .{ .fd = bus_fds[1], .events = linux.POLL.IN, .revents = 0 },
         };
         var timeout: linux.timespec = undefined;
         if (timeout_ns) |nanoseconds| {
@@ -354,8 +447,9 @@ pub const Host = struct {
             if (polled and display_events & (linux.POLL.HUP | linux.POLL.ERR) != 0) self.closeAfterLostDisplay();
         }
         if (wayland.wl_display_dispatch_pending(display) < 0) self.closeAfterLostDisplay();
+        if (polled and descriptors[2].revents | descriptors[3].revents != 0) self.desktop.receive(self);
         if (polled and descriptors[1].revents & linux.POLL.IN != 0) return .woken;
-        return if (polled and ready > 0) .display else .timed_out;
+        return if (polled and ready > 0) .events else .timed_out;
     }
 
     fn closeAfterLostDisplay(self: *Host) void {
@@ -486,7 +580,10 @@ pub const Host = struct {
     }
 
     pub fn onKeyboardFocus(self: *Host, focused: bool) void {
-        if (!focused) self.modifiers = .{};
+        if (!focused) {
+            self.modifiers = .{};
+            self.key_repeat.held = null;
+        }
         self.deliver(.{ .environment = .{ .window_focused = focused } });
     }
 
@@ -501,10 +598,59 @@ pub const Host = struct {
         self.modifiers = .{ .shift = active(state, "Shift"), .control = active(state, "Control"), .alt = active(state, "Mod1"), .super = active(state, "Mod4") };
     }
 
+    /// A key held past the repeat delay repeats until it is released or
+    /// another key that repeats is pressed; a modifier pressed meanwhile
+    /// leaves it repeating.
     pub fn onKey(self: *Host, evdev_code: u32, pressed: bool) void {
-        const key_event: zui.KeyEvent = .{ .key = self.keyOf(evdev_code), .modifiers = self.modifiers, .scancode = evdev_code, .at = self.now() };
+        const at = self.now();
+        self.deliverKey(evdev_code, pressed, false, at);
+        const repeat = &self.key_repeat;
+        if (pressed and repeat.rate > 0 and self.keyRepeats(evdev_code)) {
+            repeat.held = .{ .evdev_code = evdev_code, .next_at = at.addNanoseconds(repeat.delay_ns) };
+        } else if (!pressed) if (repeat.held) |held| if (held.evdev_code == evdev_code) {
+            repeat.held = null;
+        };
+    }
+
+    /// Keys per second and the delay before the first repeat, in
+    /// milliseconds; a rate of 0 turns repeating off.
+    pub fn onRepeatInfo(self: *Host, rate: i32, delay_ms: i32) void {
+        self.key_repeat.rate = @intCast(std.math.clamp(rate, 0, fastest_repeat_rate));
+        self.key_repeat.delay_ns = @as(u64, @intCast(@max(delay_ms, 0))) * std.time.ns_per_ms;
+        if (self.key_repeat.rate == 0) self.key_repeat.held = null;
+    }
+
+    /// When the held key repeats next, or null when none is held.
+    pub fn nextRepeatAt(self: *const Host) ?zui.Instant {
+        const held = self.key_repeat.held orelse return null;
+        return held.next_at;
+    }
+
+    fn deliverKey(self: *Host, evdev_code: u32, pressed: bool, repeat: bool, at: zui.Instant) void {
+        const key_event: zui.KeyEvent = .{ .key = self.keyOf(evdev_code), .modifiers = self.modifiers, .repeat = repeat, .scancode = evdev_code, .at = at };
         self.deliver(if (pressed) .{ .key_down = key_event } else .{ .key_up = key_event });
         if (pressed) self.typeKey(evdev_code);
+    }
+
+    fn keyRepeats(self: *const Host, evdev_code: u32) bool {
+        const keymap = self.keymap orelse return false;
+        return xkb.xkb_keymap_key_repeats(keymap, evdev_code + xkb.evdev_offset) != 0;
+    }
+
+    /// Each repeat is delivered at the instant it was due.
+    fn deliverDueRepeats(self: *Host) void {
+        const held = if (self.key_repeat.held) |*held| held else return;
+        const interval_ns = std.time.ns_per_s / self.key_repeat.rate;
+        const now_instant = self.now();
+        var delivered: u32 = 0;
+        while (!now_instant.isBefore(held.next_at)) : (held.next_at = held.next_at.addNanoseconds(interval_ns)) {
+            if (delivered == most_repeats_at_once) {
+                held.next_at = now_instant.addNanoseconds(interval_ns);
+                break;
+            }
+            self.deliverKey(held.evdev_code, true, true, held.next_at);
+            delivered += 1;
+        }
     }
 
     /// The logical key at an evdev code in the current keymap.
@@ -533,6 +679,104 @@ pub const Host = struct {
         const typed = utf8[0..@intCast(len)];
         if (typed.len == 1 and (typed[0] < 0x20 or typed[0] == 0x7F)) return;
         self.deliverText(typed);
+    }
+
+    /// What the desktop reports; a harness calls this as the buses' replies
+    /// and signals would.
+    pub fn onDesktopReport(self: *Host, report: desktop_bus.Report) void {
+        const settings = &self.desktop_settings;
+        switch (report) {
+            .theme => |theme| settings.theme = theme,
+            .contrast => |contrast| settings.contrast = contrast,
+            .reduced_motion => |reduced_motion| settings.reduced_motion = reduced_motion,
+            .on_battery => |on_battery| settings.on_battery = on_battery,
+            .power_saver => |power_saver| settings.power_saver = power_saver,
+            .preparing_for_sleep => |sleeping| return self.deliver(.{ .lifecycle = if (sleeping) .@"suspend" else .@"resume" }),
+        }
+        if (self.reported_environment != null) self.reportEnvironment();
+    }
+
+    /// Which of the desktop's services answered. The settings of one that
+    /// did not, or of a bus that could not be reached, as in a container
+    /// or under a compositor without a session bus, stay at zui's defaults.
+    pub fn environmentSources(self: *const Host) desktop_bus.Sources {
+        return self.desktop.sources;
+    }
+
+    fn readDesktopEnvironment(self: *Host) void {
+        var session_address: [256]u8 = undefined;
+        const addresses = self.bus_addresses orelse desktop_bus.DesktopBus.addressesFromEnvironment(&session_address);
+        const deadline = self.now().addNanoseconds(desktop_answer_ns);
+        self.desktop.open(self.io, addresses, deadline);
+        while (self.desktop.awaitingReplies()) {
+            const remaining_ns = deadline.nanoseconds -| self.now().nanoseconds;
+            if (remaining_ns == 0) break;
+            const bus_fds = self.desktop.descriptors();
+            var descriptors = [_]linux.pollfd{
+                .{ .fd = bus_fds[0], .events = linux.POLL.IN, .revents = 0 },
+                .{ .fd = bus_fds[1], .events = linux.POLL.IN, .revents = 0 },
+            };
+            var timeout: linux.timespec = .{ .sec = @intCast(remaining_ns / std.time.ns_per_s), .nsec = @intCast(remaining_ns % std.time.ns_per_s) };
+            _ = linux.ppoll(&descriptors, descriptors.len, &timeout, null);
+            self.desktop.receive(self);
+        }
+        self.reportEnvironment();
+    }
+
+    /// Reports each setting that differs from what was last reported, or
+    /// every one the first time.
+    fn reportEnvironment(self: *Host) void {
+        const settings = self.desktop_settings;
+        const current: ReportedEnvironment = .{
+            .theme = settings.theme,
+            .contrast = settings.contrast,
+            .reduced_motion = settings.reduced_motion,
+            .power = if (settings.power_saver) .saver else if (settings.on_battery) .battery else .plugged,
+        };
+        const reported = self.reported_environment;
+        inline for (std.meta.fields(ReportedEnvironment)) |field| {
+            const value = @field(current, field.name);
+            if (reported == null or @field(reported.?, field.name) != value) {
+                self.deliver(.{ .environment = @unionInit(zui.EnvironmentChange, field.name, value) });
+            }
+        }
+        self.reported_environment = current;
+    }
+
+    /// Leaves alone a signal the application handles or ignores. Each
+    /// handler is reset as it runs, so a second Ctrl+C ends a process that
+    /// did not end at the first.
+    fn handleTerminationSignals(self: *Host) void {
+        if (signalled_host.cmpxchgStrong(null, self, .acq_rel, .monotonic) != null) return;
+        const action: std.posix.Sigaction = .{
+            .handler = .{ .handler = onTerminationSignal },
+            .mask = std.posix.sigemptyset(),
+            .flags = std.posix.SA.RESETHAND,
+        };
+        for (termination_signals, &self.handled_signals, &self.replaced_signal_actions) |signal, *handled, *replaced| {
+            std.posix.sigaction(signal, null, replaced);
+            handled.* = replaced.handler.handler == std.posix.SIG.DFL;
+            if (handled.*) std.posix.sigaction(signal, &action, null);
+        }
+    }
+
+    fn restoreTerminationSignals(self: *Host) void {
+        if (signalled_host.load(.acquire) != self) return;
+        for (termination_signals, self.handled_signals, &self.replaced_signal_actions) |signal, handled, *replaced| {
+            if (handled) std.posix.sigaction(signal, replaced, null);
+        }
+        signalled_host.store(null, .release);
+    }
+
+    /// Whether this host turns `signal` into a terminate request.
+    pub fn handlesSignal(self: *const Host, signal: std.posix.SIG) bool {
+        if (signalled_host.load(.acquire) != self) return false;
+        for (termination_signals, self.handled_signals) |handled_signal, handled| if (handled_signal == signal) return handled;
+        return false;
+    }
+
+    fn deliverTerminationSignal(self: *Host) void {
+        if (self.termination_signalled.swap(false, .acq_rel)) self.deliver(.{ .lifecycle = .terminate_requested });
     }
 
     fn applyCursor(self: *Host) void {
@@ -766,11 +1010,26 @@ pub const Host = struct {
             }
         }.modifiers,
         .repeat_info = struct {
-            fn repeatInfo(_: ?*anyopaque, _: ?*Proxy, _: i32, _: i32) callconv(.c) void {}
+            fn repeatInfo(data: ?*anyopaque, _: ?*Proxy, rate: i32, delay_ms: i32) callconv(.c) void {
+                hostFrom(data).onRepeatInfo(rate, delay_ms);
+            }
         }.repeatInfo,
     };
 };
 
+/// A signal handler has no context, so it reaches the host that installed
+/// it through here.
+var signalled_host: std.atomic.Value(?*Host) = .init(null);
+
+/// Only sets a flag and wakes, which a signal handler may do.
+fn onTerminationSignal(_: std.posix.SIG) callconv(.c) void {
+    const host = signalled_host.load(.acquire) orelse return;
+    host.termination_signalled.store(true, .release);
+    Host.wake(host);
+}
+
 test {
     _ = keys;
+    _ = dbus;
+    _ = desktop_bus;
 }

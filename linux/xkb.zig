@@ -24,6 +24,7 @@ pub extern "xkbcommon" fn xkb_context_unref(context: *Context) callconv(.c) void
 pub extern "xkbcommon" fn xkb_keymap_new_from_string(context: *Context, string: [*:0]const u8, format: c_int, flags: c_int) callconv(.c) ?*Keymap;
 pub extern "xkbcommon" fn xkb_keymap_new_from_names(context: *Context, names: ?*const RuleNames, flags: c_int) callconv(.c) ?*Keymap;
 pub extern "xkbcommon" fn xkb_keymap_unref(keymap: *Keymap) callconv(.c) void;
+pub extern "xkbcommon" fn xkb_keymap_key_repeats(keymap: *Keymap, key: u32) callconv(.c) c_int;
 pub extern "xkbcommon" fn xkb_keymap_key_get_syms_by_level(keymap: *Keymap, key: u32, layout: u32, level: u32, syms: *?[*]const Keysym) callconv(.c) c_int;
 pub extern "xkbcommon" fn xkb_state_new(keymap: *Keymap) callconv(.c) ?*State;
 pub extern "xkbcommon" fn xkb_state_unref(state: *State) callconv(.c) void;
