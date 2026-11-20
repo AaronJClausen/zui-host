@@ -9,8 +9,8 @@
             .hash = "zui-0.5.0-xfvfqi7vHABEAXHqjHlbLr7xqQ4rLAjOituFbaNLEPG_",
         },
         .zui_sokol = .{
-            .url = "git+https://github.com/AaronJClausen/zui-sokol#6e94c4bf89eab8c3a905b1e07110d36c6a2aad97",
-            .hash = "zui_sokol-0.2.0-LHR9oRwsCgACByFXYf1eiRpWkZSYvQqU3pSdRTsMsMpL",
+            .url = "git+https://github.com/AaronJClausen/zui-sokol#f03fb362c5cebdc6d9316803e01362323d00c3dd",
+            .hash = "zui_sokol-0.2.0-LHR9oZxGCgAqsNg5G7POvV5gQc1BTiwnFEhzsvnayZjT",
             .lazy = true,
         },
     },
