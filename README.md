@@ -241,6 +241,43 @@ it fails unless a frame draws the light background within 10 s. On the
 reference machine the restyled frame came 2 to 4 ms after the write, two
 frames after the first.
 
+## Host services
+
+`zig build services` has a button for each service, with its answer
+beside it: pick a file, save a file, show a notification, open a popup
+menu, set or clear the menu bar, copy, paste, and open
+<https://ziglang.org>. A right click anywhere opens the context menu,
+and Ctrl+C, Ctrl+V, Ctrl+O and Ctrl+S do what the menus say. Declaration
+only notes what was asked for, and the loader makes the calls between
+frames through `zui_app.ServicesOf`, so every answer comes back through
+one source, a `zui_async.Stream(zui.ServiceReply(16 * 1024), ...)`:
+
+```zig
+const services = zui_app.ServicesOf(zui_host.Host);
+
+pub fn zuiLoader(app: *App, _: *const Ui, _: std.Io) void {
+    if (services.has_file_dialogs and app.wants_file) {
+        app.wants_file = false;
+        services.file_dialogs.show(app.host, .main, .of("pick a file"), .{ .title = "Pick a file" }, .of(&app.sources.replies)) catch {};
+    }
+}
+```
+
+```sh
+zig build services                 # interactive window
+zig build services -- --check      # every service against the host's fake, in a hidden window, then quit
+```
+
+`--check` hides the window and answers every service through the host's
+fake (`Host.fakeServices`), so nothing opens or shows. It presses each
+button in turn, chooses an item from the menu bar as Windows would
+report it, and fails unless each answer shows in a frame within 10 s.
+It uses the real clipboard, and so replaces what it holds. A paste right
+after a copy often finds the clipboard held by clipboard history, and is
+answered `.failed = .unavailable`; the check presses Paste again, as a
+user would. Setting a menu bar shrinks the window's content by the bar's
+height.
+
 ## The tour on it
 
 `zig build tour` runs [zui-sokol](https://github.com/AaronJClausen/zui-sokol)'s
@@ -300,6 +337,7 @@ under a second: the first frame arrives about 3 ms after connecting.
 | `zig build remote` | run the tour in another process and draw it here, over `zui_wire` |
 | `zig build theme` | a window styled by a theme file, restyled when it changes |
 | `zig build accessible` | `zui_widgets` controls for Narrator and Accessibility Insights |
+| `zig build services` | every host service from buttons, each answer shown; `-- --check` runs it against the fake |
 | `zig build fmt` / `fmt-check` | format, or fail if a file is not formatted |
 
 CI checks the format, runs the tests on Windows, and on Linux under a
@@ -338,7 +376,8 @@ thread (on Windows) and the compositor's listeners (on Linux) hold a
 pointer to it, as does the Linux host's signal handler. `forced_scale`,
 `system_material_unavailable` (Windows) and `bus_addresses` (Linux) may
 be set before `init`, which keeps them; `zui_app` starts each field at
-its default.
+its default. `service_fake` may be set before `init` too, or after it
+with `Host.fakeServices(fake)`, before the first service call.
 
 ## License
 

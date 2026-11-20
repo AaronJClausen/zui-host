@@ -350,6 +350,23 @@ pub const Host = struct {
         }
     }
 
+    /// `service_fake` set after `init`, for an application under
+    /// `zui_app`, which starts every field at its default before `init`.
+    /// Call it before the first service call, from the thread that makes
+    /// them.
+    ///
+    /// ```zig
+    /// pub fn init(app: *App, start: zui_app.Start(App)) !void {
+    ///     if (app.checking) start.host.fakeServices(&app.service_fake);
+    /// }
+    /// ```
+    pub fn fakeServices(self: *Host, fake: *services.ServiceFake) void {
+        win32.AcquireSRWLockExclusive(&self.services.lock);
+        defer win32.ReleaseSRWLockExclusive(&self.services.lock);
+        self.service_fake = fake;
+        self.services.fake = fake;
+    }
+
     fn manualResetEvent() !win32.HANDLE {
         return win32.CreateEventW(null, 1, 0, null) orelse error.NoEvent;
     }
