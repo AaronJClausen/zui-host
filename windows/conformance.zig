@@ -7,6 +7,7 @@ const zui_host = @import("zui_host");
 const zui = zui_host.zui;
 const zui_testing = @import("zui_testing");
 const zui_async = @import("zui_async");
+const zui_widgets = @import("zui_widgets");
 const Host = zui_host.Host;
 const win32 = zui_host.windows.win32;
 const keys = zui_host.windows.keys;
@@ -532,4 +533,219 @@ test "semantics past the window's room are cut from the end and reported" {
     const cut = (try client.findByName(window_element, "Sa")).?;
     defer cut.release();
     try testing.expectEqual(@as(?uia_client.Element, null), try client.findByName(window_element, "Open"));
+}
+
+/// Every byte is half as wide as the font is tall.
+const HalfWidthText = struct {
+    pub fn zuiMeasure(_: *HalfWidthText, run: []const u8, key: zui.MeasureKey(u16)) [2]f32 {
+        return .{ @as(f32, @floatFromInt(run.len)) * key.size / 2, key.size };
+    }
+};
+
+const ControlsUi = zui.Context(.{ .Text = HalfWidthText, .features = .{ .semantics = true }, .limits = .{ .max_elements = 256 } });
+const qualities = [_][]const u8{ "Low", "Medium", "High" };
+
+/// A hidden window showing one of each `zui_widgets` control, whose frames
+/// the test runs itself, so what UI Automation asks arrives in the next.
+const ControlsWindow = struct {
+    window: HiddenWindow = .{},
+    text: HalfWidthText = .{},
+    ui: ControlsUi = undefined,
+    events: [64]zui.Event = undefined,
+    text_buffer: [ControlsUi.limits.max_text_input_bytes + ControlsUi.limits.max_dropped_path_bytes]u8 = undefined,
+    builder: zui.RecordBuilder = undefined,
+    widgets: zui_widgets.Widgets(ControlsUi) = .{},
+    saves: u32 = 0,
+    autosave: bool = true,
+    volume: f32 = 0.5,
+    quality: usize = 0,
+    details_open: bool = false,
+    name_bytes: [32]u8 = undefined,
+    name: zui_widgets.EditableText = undefined,
+    /// The last frame listed the dropdown's options.
+    options_shown: bool = false,
+
+    fn open(self: *ControlsWindow) !void {
+        try self.window.openWithSemantics(1, .{ .nodes = 256, .text_bytes = 4096 });
+        errdefer self.window.close();
+        self.ui = try .init(testing.allocator, testing.io, &self.text);
+        self.builder = .init(&self.events, &self.text_buffer);
+        self.name = .init(&self.name_bytes, "Ada");
+        self.frame();
+    }
+
+    fn close(self: *ControlsWindow) void {
+        self.ui.deinit(testing.allocator);
+        self.window.close();
+    }
+
+    fn frame(self: *ControlsWindow) void {
+        _ = self.window.window_host.zuiPoll(.main, &self.builder);
+        self.ui.beginFrame(&self.builder.record());
+        self.declare();
+        const drawn = self.ui.endFrame();
+        _ = self.window.window_host.zuiSemantics(.main, drawn.semantics());
+        self.options_shown = false;
+        for (drawn.semantics()) |node| self.options_shown = self.options_shown or node.role == .option;
+        self.ui.release(drawn);
+    }
+
+    fn declare(self: *ControlsWindow) void {
+        const ui = &self.ui;
+        ui.open(.{ .layout = .{ .direction = .top_to_bottom, .sizing = .grow_both, .child_gap = 4 } });
+        defer ui.close();
+        if (self.widgets.button(ui, .of("save"), "Save", .{})) self.saves += 1;
+        _ = self.widgets.checkbox(ui, .of("autosave"), "Autosave", &self.autosave, .{});
+        _ = self.widgets.slider(ui, .of("volume"), &self.volume, .{ .step = 0.1, .label = "Volume" });
+        _ = self.widgets.textField(ui, .of("name"), &self.name, .{ .label = "Name" });
+        _ = self.widgets.dropdown(ui, .of("quality"), &self.quality, &qualities, .{ .label = "Quality" });
+        _ = self.widgets.disclosure(ui, .of("details"), "Details", &self.details_open);
+    }
+
+    /// Runs frames until `reached` holds, for at most two seconds.
+    fn frameUntil(self: *ControlsWindow, comptime reached: fn (*const ControlsWindow) bool) !void {
+        for (0..200) |_| {
+            self.frame();
+            if (reached(self)) return;
+            try testing.io.sleep(.fromMilliseconds(10), .awake);
+        }
+        return error.FrameNeverCame;
+    }
+};
+
+fn findNamed(client: *uia_client.Client, window_element: uia_client.Element, name: []const u8) !uia_client.Element {
+    return try client.findByName(window_element, name) orelse error.ElementNotFound;
+}
+
+test "each zui_widgets control offers UI Automation the pattern that stands for it, with its state" {
+    var controls: ControlsWindow = .{};
+    try controls.open();
+    defer controls.close();
+    var client: uia_client.Client = try .init();
+    defer client.deinit();
+    const window_element = try client.elementFromHandle(controls.window.window_host.hwnd);
+    defer window_element.release();
+    var buffer: [64]u8 = undefined;
+
+    const save = try findNamed(&client, window_element, "Save");
+    defer save.release();
+    try testing.expect(try save.hasPattern(uia.UIA_InvokePatternId));
+    try testing.expect(!try save.hasPattern(uia.UIA_TogglePatternId));
+
+    const autosave = try findNamed(&client, window_element, "Autosave");
+    defer autosave.release();
+    try testing.expectEqual(@as(?uia.ToggleState, .on), try autosave.toggleState());
+    try testing.expect(!try autosave.hasPattern(uia.UIA_InvokePatternId));
+
+    const volume = try findNamed(&client, window_element, "Volume");
+    defer volume.release();
+    const range = (try volume.range()).?;
+    try testing.expectApproxEqAbs(@as(f64, 0.5), range.value, 1e-6);
+    try testing.expectEqual(@as(f64, 0), range.min);
+    try testing.expectEqual(@as(f64, 1), range.max);
+    try testing.expect(!range.read_only);
+
+    const name = try findNamed(&client, window_element, "Name");
+    defer name.release();
+    try testing.expectEqualStrings("Ada", (try name.valueText(&buffer)).?);
+    try testing.expectEqual(@as(?bool, false), try name.valueIsReadOnly());
+    try testing.expectError(error.AutomationFailed, name.setValueText(std.unicode.utf8ToUtf16LeStringLiteral("Grace")));
+
+    const quality = try findNamed(&client, window_element, "Quality");
+    defer quality.release();
+    try testing.expectEqual(@as(?uia.ExpandCollapseState, .collapsed), try quality.expandCollapseState());
+    try testing.expectEqualStrings("Low", (try quality.valueText(&buffer)).?);
+    try testing.expectEqual(@as(?bool, true), try quality.valueIsReadOnly());
+    try testing.expect(!try quality.hasPattern(uia.UIA_InvokePatternId));
+
+    const details = try findNamed(&client, window_element, "Details");
+    defer details.release();
+    try testing.expectEqual(@as(?uia.ExpandCollapseState, .collapsed), try details.expandCollapseState());
+    try testing.expect(try details.hasPattern(uia.UIA_InvokePatternId));
+}
+
+test "toggling, setting a range, expanding and selecting through UI Automation each arrive as the action that answers them" {
+    var controls: ControlsWindow = .{};
+    try controls.open();
+    defer controls.close();
+    var client: uia_client.Client = try .init();
+    defer client.deinit();
+    const window_element = try client.elementFromHandle(controls.window.window_host.hwnd);
+    defer window_element.release();
+    var buffer: [64]u8 = undefined;
+
+    const autosave = try findNamed(&client, window_element, "Autosave");
+    defer autosave.release();
+    try testing.expect(try autosave.toggle());
+    try controls.frameUntil(struct {
+        fn reached(window: *const ControlsWindow) bool {
+            return !window.autosave;
+        }
+    }.reached);
+    try testing.expectEqual(@as(?uia.ToggleState, .off), try autosave.toggleState());
+
+    const volume = try findNamed(&client, window_element, "Volume");
+    defer volume.release();
+    try testing.expect(try volume.setRangeValue(0.8));
+    try controls.frameUntil(struct {
+        fn reached(window: *const ControlsWindow) bool {
+            return window.volume > 0.75;
+        }
+    }.reached);
+    try testing.expectApproxEqAbs(@as(f32, 0.8), controls.volume, 1e-5);
+    try testing.expectError(error.AutomationFailed, volume.setRangeValue(2));
+
+    const quality = try findNamed(&client, window_element, "Quality");
+    defer quality.release();
+    try testing.expect(try quality.expand());
+    try controls.frameUntil(struct {
+        fn reached(window: *const ControlsWindow) bool {
+            return window.options_shown;
+        }
+    }.reached);
+    try testing.expectEqual(@as(?uia.ExpandCollapseState, .expanded), try quality.expandCollapseState());
+
+    const high = try findNamed(&client, window_element, "High");
+    defer high.release();
+    try testing.expectEqual(@as(?bool, false), try high.isSelected());
+    const list = (try high.selectionContainer()).?;
+    defer list.release();
+    const selected = (try list.firstSelected()).?;
+    try testing.expectEqual(@as(i32, 1), selected.count);
+    defer selected.first.?.release();
+    try testing.expectEqualStrings("Low", try selected.first.?.name(&buffer));
+
+    try testing.expect(try high.select());
+    try controls.frameUntil(struct {
+        fn reached(window: *const ControlsWindow) bool {
+            return window.quality == 2;
+        }
+    }.reached);
+    try testing.expectEqualStrings("High", (try quality.valueText(&buffer)).?);
+    try testing.expectEqual(@as(?uia.ExpandCollapseState, .collapsed), try quality.expandCollapseState());
+}
+
+test "a client listening for a property hears it change when a frame changes it" {
+    var controls: ControlsWindow = .{};
+    try controls.open();
+    defer controls.close();
+    var client: uia_client.Client = try .init();
+    defer client.deinit();
+    const window_element = try client.elementFromHandle(controls.window.window_host.hwnd);
+    defer window_element.release();
+    var changes: uia_client.PropertyChanges = .{};
+    try changes.listen(&client, window_element, uia.UIA_ToggleToggleStatePropertyId);
+    defer client.stopListening();
+
+    controls.frame();
+    const autosave = try findNamed(&client, window_element, "Autosave");
+    defer autosave.release();
+    try testing.expect(try autosave.toggle());
+    for (0..200) |_| {
+        controls.frame();
+        if (changes.seen.load(.acquire) != 0) break;
+        try testing.io.sleep(.fromMilliseconds(10), .awake);
+    }
+    try testing.expect(changes.seen.load(.acquire) != 0);
+    try testing.expectEqual(@as(i32, @intFromEnum(uia.ToggleState.off)), changes.last_integer.load(.acquire));
 }

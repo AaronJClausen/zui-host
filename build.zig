@@ -37,6 +37,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "zui_host", .module = host_module },
             .{ .name = "zui_testing", .module = zui_dependency.module("zui_testing") },
             .{ .name = "zui_async", .module = zui_dependency.module("zui_async") },
+            .{ .name = "zui_widgets", .module = zui_dependency.module("zui_widgets") },
         },
     }) });
     linkThroughLlvmOnLinux(conformance_tests);

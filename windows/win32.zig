@@ -468,5 +468,6 @@ pub extern "oleaut32" fn VariantClear(variant: *VARIANT) callconv(.winapi) HRESU
 pub extern "oleaut32" fn SafeArrayCreateVector(vt: VARTYPE, lower_bound: LONG, count: u32) callconv(.winapi) ?*SAFEARRAY;
 pub extern "oleaut32" fn SafeArrayAccessData(array: *SAFEARRAY, data: *?*anyopaque) callconv(.winapi) HRESULT;
 pub extern "oleaut32" fn SafeArrayUnaccessData(array: *SAFEARRAY) callconv(.winapi) HRESULT;
+pub extern "oleaut32" fn SafeArrayPutElement(array: *SAFEARRAY, indices: *const LONG, element: *anyopaque) callconv(.winapi) HRESULT;
 pub extern "oleaut32" fn SafeArrayDestroy(array: *SAFEARRAY) callconv(.winapi) HRESULT;
 pub extern "oleaut32" fn SafeArrayGetUBound(array: *SAFEARRAY, dimension: UINT, bound: *LONG) callconv(.winapi) HRESULT;

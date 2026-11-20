@@ -42,9 +42,12 @@ pub const Bridge = struct {
 
     const allocator = std.heap.page_allocator;
 
+    /// What listening clients were last told, to raise only what changed.
     const Announced = struct {
         structure: u64 = 0,
         focused_id: u64 = 0,
+        summaries: [2]Summaries = .{ .{}, .{} },
+        current: u1 = 0,
     };
 
     /// With no nodes of room, the bridge stays off and allocates nothing.
@@ -53,12 +56,14 @@ pub const Bridge = struct {
         if (capacity.nodes == 0) return;
         errdefer self.deinit();
         for (&self.snapshots) |*snapshot| try snapshot.allocate(capacity);
+        for (&self.announced.summaries) |*summaries| try summaries.allocate(capacity.nodes);
         self.elements = try allocator.alloc(Element, capacity.nodes);
         for (self.elements) |*element| element.* = .{ .bridge = self };
     }
 
     pub fn deinit(self: *Bridge) void {
         for (&self.snapshots) |*snapshot| snapshot.free();
+        for (&self.announced.summaries) |*summaries| summaries.free();
         allocator.free(self.elements);
         self.elements = &.{};
     }
@@ -97,7 +102,7 @@ pub const Bridge = struct {
                 },
             };
             back.link(index);
-            back.insertIndex(source.id, index);
+            back.index.insert(source.id, index);
             if (source.state.focused and back.focused == no_node) back.focused = index;
             structure.update(std.mem.asBytes(&source.id));
             structure.update(std.mem.asBytes(&parent));
@@ -130,26 +135,81 @@ pub const Bridge = struct {
     }
 
     /// Raises what changed since the last call, while a client listens:
-    /// the focus, when the window has it, and the tree's shape. Runs on the
-    /// window thread, so the UI thread never waits on a client.
+    /// the focus, when the window has it, the tree's shape, and each
+    /// node's name, value and state. Runs on the window thread, so the UI
+    /// thread never waits on a client.
     pub fn announceChanges(self: *Bridge) void {
         if (!self.answered or uia.UiaClientsAreListening() == 0) return;
+        const announced = &self.announced;
+        const previous = &announced.summaries[announced.current];
+        const next = &announced.summaries[announced.current ^ 1];
         const snapshot = self.readFront();
         const structure = snapshot.structure;
         const focused_id: u64 = if (snapshot.focused == no_node) 0 else snapshot.nodes[snapshot.focused].id;
+        next.fill(snapshot);
         self.doneReading();
+        announced.current ^= 1;
 
-        if (structure != self.announced.structure) {
-            self.announced.structure = structure;
+        if (structure != announced.structure) {
+            announced.structure = structure;
             _ = uia.UiaRaiseStructureChangedEvent(&self.root.simple, uia.StructureChangeType_ChildrenInvalidated, null, 0);
         }
-        if (focused_id != self.announced.focused_id) {
-            self.announced.focused_id = focused_id;
+        if (focused_id != announced.focused_id) {
+            announced.focused_id = focused_id;
             if (focused_id != 0 and win32.GetFocus() == self.hwnd) if (self.elementFor(focused_id)) |element| {
                 _ = uia.UiaRaiseAutomationEvent(&element.simple, uia.UIA_AutomationFocusChangedEventId);
                 _ = element.release();
             };
         }
+        for (next.items[0..next.count]) |now| {
+            const before = previous.items[previous.index.find(now.id) orelse continue];
+            if (!std.meta.eql(before, now)) self.raisePropertyChanges(before, now);
+        }
+    }
+
+    fn raisePropertyChanges(self: *Bridge, before: Summary, now: Summary) void {
+        const element = self.elementFor(now.id) orelse return;
+        defer _ = element.release();
+        if (before.label != now.label) self.raiseTextChange(element, uia.UIA_NamePropertyId, .label);
+        if (before.value_text != now.value_text) self.raiseTextChange(element, uia.UIA_ValueValuePropertyId, .value);
+        if (before.range_value_bits != now.range_value_bits) {
+            raiseChange(element, uia.UIA_RangeValueValuePropertyId, .{ .vt = win32.VT_R8, .value = .{ .double = @bitCast(now.range_value_bits) } });
+        }
+        if (before.checked != now.checked) if (now.checked) |checked| {
+            raiseChange(element, uia.UIA_ToggleToggleStatePropertyId, integer(@intFromEnum(toggleState(checked))));
+        };
+        if (before.expanded != now.expanded) if (now.expanded) |expanded| {
+            raiseChange(element, uia.UIA_ExpandCollapseExpandCollapseStatePropertyId, integer(@intFromEnum(expandCollapseState(expanded))));
+        };
+        if (before.selected != now.selected) {
+            raiseChange(element, uia.UIA_SelectionItemIsSelectedPropertyId, boolean(now.selected));
+            if (now.selected) _ = uia.UiaRaiseAutomationEvent(&element.simple, uia.UIA_SelectionItem_ElementSelectedEventId);
+        }
+        if (before.disabled != now.disabled) raiseChange(element, uia.UIA_IsEnabledPropertyId, boolean(!now.disabled));
+    }
+
+    /// Reads the text again, since summaries keep only its hash: from the
+    /// newest front, which is what a client would read.
+    fn raiseTextChange(self: *Bridge, element: *Element, property: uia.PROPERTYID, which: enum { label, value }) void {
+        const snapshot = self.readFront();
+        const new_value: win32.VARIANT = if (snapshot.find(element.id)) |index| text: {
+            const node = &snapshot.nodes[index];
+            const span = switch (which) {
+                .label => node.label,
+                .value => if (node.value == .text) node.value.text else TextSpan{},
+            };
+            break :text string(snapshot.textOf(span)) catch .{};
+        } else .{};
+        self.doneReading();
+        raiseChange(element, property, new_value);
+    }
+
+    /// The old value is left empty, as UI Automation allows: summaries
+    /// keep only what tells a change.
+    fn raiseChange(element: *Element, property: uia.PROPERTYID, new_value: win32.VARIANT) void {
+        var raised = new_value;
+        _ = uia.UiaRaiseAutomationPropertyChangedEvent(&element.simple, property, .{}, raised);
+        _ = win32.VariantClear(&raised);
     }
 
     /// Tells UI Automation the window is going, so clients drop what they
@@ -201,8 +261,7 @@ pub const Bridge = struct {
         return .{ @floatFromInt(origin.x), @floatFromInt(origin.y) };
     }
 
-    /// The fragment for node `index` of `snapshot`, or for the root when it
-    /// has no node.
+    /// The fragment for node `index` of `snapshot`, or null for no node.
     fn fragmentOf(self: *Bridge, snapshot: *const Snapshot, index: u32, found: *?*uia.IRawElementProviderFragment) HRESULT {
         if (index == no_node) {
             found.* = null;
@@ -240,6 +299,101 @@ const Node = struct {
         text: TextSpan,
         range: zui.SemanticRange,
     };
+
+    fn takes(self: *const Node, action: zui.ActionKind) bool {
+        return !self.state.disabled and self.actions.contains(action);
+    }
+
+    /// A radio and an option are chosen, not toggled, even when they say
+    /// whether they are checked.
+    fn offersToggle(self: *const Node) bool {
+        return self.state.checked != null and !self.offersSelectionItem();
+    }
+
+    fn offersSelectionItem(self: *const Node) bool {
+        return self.role == .option or self.role == .radio;
+    }
+
+    /// Only when no other pattern stands for the click, so a client toggles
+    /// a checkbox or opens a combo box by its own pattern.
+    fn offersInvoke(self: *const Node) bool {
+        return self.actions.contains(.invoke) and !self.offersToggle() and !self.offersSelectionItem() and self.role != .combo_box;
+    }
+
+    fn offersExpandCollapse(self: *const Node) bool {
+        return self.state.expanded != null;
+    }
+
+    fn offersRangeValue(self: *const Node) bool {
+        return self.value == .range;
+    }
+
+    fn offersValue(self: *const Node) bool {
+        return self.value == .text;
+    }
+
+    fn offersSelection(self: *const Node) bool {
+        return self.role == .list_box;
+    }
+
+    fn isExpanded(self: *const Node) bool {
+        return self.state.expanded == true;
+    }
+
+    fn isCollapsed(self: *const Node) bool {
+        return self.state.expanded == false;
+    }
+
+    fn isSelected(self: *const Node) bool {
+        return self.state.selected;
+    }
+};
+
+/// Open addressing from a node's id to its index.
+const IdIndex = struct {
+    slots: []Slot = &.{},
+
+    const Slot = struct {
+        id: u64 = 0,
+        /// 0 is an empty slot.
+        index_plus_one: u32 = 0,
+    };
+
+    fn allocate(self: *IdIndex, nodes: u32) !void {
+        self.slots = try Bridge.allocator.alloc(Slot, try std.math.ceilPowerOfTwo(usize, @as(usize, nodes) * 2));
+        self.clear();
+    }
+
+    fn free(self: *IdIndex) void {
+        Bridge.allocator.free(self.slots);
+        self.slots = &.{};
+    }
+
+    fn clear(self: *IdIndex) void {
+        @memset(self.slots, .{});
+    }
+
+    fn slotOf(self: *const IdIndex, id: u64) usize {
+        return @as(usize, @truncate((id *% 0x9E37_79B9_7F4A_7C15) >> 32)) & (self.slots.len - 1);
+    }
+
+    /// A second index for an id already listed keeps the first.
+    fn insert(self: *IdIndex, id: u64, index: u32) void {
+        var slot = self.slotOf(id);
+        while (self.slots[slot].index_plus_one != 0) : (slot = (slot + 1) & (self.slots.len - 1)) {
+            if (self.slots[slot].id == id) return;
+        }
+        self.slots[slot] = .{ .id = id, .index_plus_one = index + 1 };
+    }
+
+    fn find(self: *const IdIndex, id: u64) ?u32 {
+        if (self.slots.len == 0) return null;
+        var slot = self.slotOf(id);
+        while (self.slots[slot].index_plus_one != 0) : (slot = (slot + 1) & (self.slots.len - 1)) {
+            if (self.slots[slot].id == id) return self.slots[slot].index_plus_one - 1;
+        }
+        return null;
+    }
 };
 
 const Snapshot = struct {
@@ -247,8 +401,7 @@ const Snapshot = struct {
     count: u32 = 0,
     text: []u8 = &.{},
     text_len: u32 = 0,
-    /// Open addressing from a node's id to its index plus one; 0 is empty.
-    index_slots: []u32 = &.{},
+    index: IdIndex = .{},
     first_root: u32 = no_node,
     last_root: u32 = no_node,
     focused: u32 = no_node,
@@ -258,19 +411,18 @@ const Snapshot = struct {
     fn allocate(self: *Snapshot, capacity: zui.SemanticsCapacity) !void {
         self.nodes = try Bridge.allocator.alloc(Node, capacity.nodes);
         self.text = try Bridge.allocator.alloc(u8, capacity.text_bytes);
-        self.index_slots = try Bridge.allocator.alloc(u32, try std.math.ceilPowerOfTwo(usize, @as(usize, capacity.nodes) * 2));
-        @memset(self.index_slots, 0);
+        try self.index.allocate(capacity.nodes);
     }
 
     fn free(self: *Snapshot) void {
         Bridge.allocator.free(self.nodes);
         Bridge.allocator.free(self.text);
-        Bridge.allocator.free(self.index_slots);
+        self.index.free();
         self.* = .{};
     }
 
     fn clear(self: *Snapshot, pixels_per_unit: f32) void {
-        @memset(self.index_slots, 0);
+        self.index.clear();
         self.count = 0;
         self.text_len = 0;
         self.first_root = no_node;
@@ -311,27 +463,8 @@ const Snapshot = struct {
         parent.last_child = index;
     }
 
-    fn slotOf(self: *const Snapshot, id: u64) usize {
-        return @as(usize, @truncate((id *% 0x9E37_79B9_7F4A_7C15) >> 32)) & (self.index_slots.len - 1);
-    }
-
-    /// A second node with an id already listed keeps the first's.
-    fn insertIndex(self: *Snapshot, id: u64, index: u32) void {
-        var slot = self.slotOf(id);
-        while (self.index_slots[slot] != 0) : (slot = (slot + 1) & (self.index_slots.len - 1)) {
-            if (self.nodes[self.index_slots[slot] - 1].id == id) return;
-        }
-        self.index_slots[slot] = index + 1;
-    }
-
     fn find(self: *const Snapshot, id: u64) ?u32 {
-        if (self.index_slots.len == 0) return null;
-        var slot = self.slotOf(id);
-        while (self.index_slots[slot] != 0) : (slot = (slot + 1) & (self.index_slots.len - 1)) {
-            const index = self.index_slots[slot] - 1;
-            if (self.nodes[index].id == id) return index;
-        }
-        return null;
+        return self.index.find(id);
     }
 
     /// The last node, in tree order, whose bounds hold `point`: the
@@ -344,6 +477,70 @@ const Snapshot = struct {
             if (point[0] >= bounds.x and point[0] < bounds.x + bounds.width and point[1] >= bounds.y and point[1] < bounds.y + bounds.height) return index;
         }
         return no_node;
+    }
+
+    fn isWithin(self: *const Snapshot, index: u32, ancestor: u32) bool {
+        var enclosing = self.nodes[index].parent;
+        while (enclosing != no_node) : (enclosing = self.nodes[enclosing].parent) {
+            if (enclosing == ancestor) return true;
+        }
+        return false;
+    }
+
+    /// The nearest node around `index` with `role`, or `no_node`.
+    fn enclosingWith(self: *const Snapshot, index: u32, role: zui.SemanticRole) u32 {
+        var enclosing = self.nodes[index].parent;
+        while (enclosing != no_node) : (enclosing = self.nodes[enclosing].parent) {
+            if (self.nodes[enclosing].role == role) return enclosing;
+        }
+        return no_node;
+    }
+};
+
+/// What a node shows a client, enough to tell that it changed.
+const Summary = struct {
+    id: u64,
+    label: u64,
+    value_text: u64,
+    range_value_bits: u64,
+    checked: ?bool,
+    expanded: ?bool,
+    selected: bool,
+    disabled: bool,
+};
+
+const Summaries = struct {
+    items: []Summary = &.{},
+    count: u32 = 0,
+    index: IdIndex = .{},
+
+    fn allocate(self: *Summaries, nodes: u32) !void {
+        self.items = try Bridge.allocator.alloc(Summary, nodes);
+        try self.index.allocate(nodes);
+    }
+
+    fn free(self: *Summaries) void {
+        Bridge.allocator.free(self.items);
+        self.index.free();
+        self.* = .{};
+    }
+
+    fn fill(self: *Summaries, snapshot: *const Snapshot) void {
+        self.index.clear();
+        for (snapshot.nodes[0..snapshot.count], self.items[0..snapshot.count], 0..) |*node, *summary, index| {
+            summary.* = .{
+                .id = node.id,
+                .label = std.hash.Wyhash.hash(0, snapshot.textOf(node.label)),
+                .value_text = if (node.value == .text) std.hash.Wyhash.hash(0, snapshot.textOf(node.value.text)) else 0,
+                .range_value_bits = if (node.value == .range) @bitCast(node.value.range.value) else 0,
+                .checked = node.state.checked,
+                .expanded = node.state.expanded,
+                .selected = node.state.selected,
+                .disabled = node.state.disabled,
+            };
+            self.index.insert(node.id, @intCast(index));
+        }
+        self.count = snapshot.count;
     }
 };
 
@@ -361,10 +558,28 @@ fn integer(value: i32) win32.VARIANT {
 
 /// A `VT_BSTR` holding `utf8`, which OLE allocates for the caller to free.
 fn string(utf8: []const u8) error{OutOfMemory}!win32.VARIANT {
+    return .{ .vt = win32.VT_BSTR, .value = .{ .string = try allocateString(utf8) } };
+}
+
+fn allocateString(utf8: []const u8) error{OutOfMemory}!win32.BSTR {
     const units = std.unicode.calcUtf16LeLen(utf8) catch 0;
     const allocated = win32.SysAllocStringLen(null, @intCast(units)) orelse return error.OutOfMemory;
     if (units != 0) _ = std.unicode.utf8ToUtf16Le(allocated[0..units], utf8) catch unreachable;
-    return .{ .vt = win32.VT_BSTR, .value = .{ .string = allocated } };
+    return allocated;
+}
+
+fn winBool(value: bool) win32.BOOL {
+    return @intFromBool(value);
+}
+
+fn toggleState(checked: ?bool) uia.ToggleState {
+    const known = checked orelse return .indeterminate;
+    return if (known) .on else .off;
+}
+
+fn expandCollapseState(expanded: ?bool) uia.ExpandCollapseState {
+    const known = expanded orelse return .leaf_node;
+    return if (known) .expanded else .collapsed;
 }
 
 fn controlType(role: zui.SemanticRole) uia.CONTROLTYPEID {
@@ -384,6 +599,20 @@ fn controlType(role: zui.SemanticRole) uia.CONTROLTYPEID {
         .image => uia.UIA_ImageControlTypeId,
         .dialog, .scroll_area => uia.UIA_PaneControlTypeId,
     };
+}
+
+/// The steps an `adjust` moves a range by to reach `target`: whole steps
+/// when it has a step, and one toward it when it moves continuously.
+fn stepsToward(range: zui.SemanticRange, target: f64) i32 {
+    const distance = target - range.value;
+    if (range.step <= 0) return if (distance > 0) 1 else if (distance < 0) -1 else 0;
+    const steps = @round(distance / range.step);
+    return @intFromFloat(std.math.clamp(steps, std.math.minInt(i32), std.math.maxInt(i32)));
+}
+
+/// What one small step moves a range by, when it moves continuously.
+fn smallChange(range: zui.SemanticRange) f64 {
+    return if (range.step > 0) range.step else (range.max - range.min) / 100;
 }
 
 /// The `IUnknown` methods of `Object`'s interface in its field `field`,
@@ -416,6 +645,12 @@ const Element = struct {
     simple: uia.IRawElementProviderSimple = .{ .vtable = &simple_vtable },
     fragment: uia.IRawElementProviderFragment = .{ .vtable = &fragment_vtable },
     invoke: uia.IInvokeProvider = .{ .vtable = &invoke_vtable },
+    toggle: uia.IToggleProvider = .{ .vtable = &toggle_vtable },
+    expand_collapse: uia.IExpandCollapseProvider = .{ .vtable = &expand_collapse_vtable },
+    range_value: uia.IRangeValueProvider = .{ .vtable = &range_value_vtable },
+    value: uia.IValueProvider = .{ .vtable = &value_vtable },
+    selection_item: uia.ISelectionItemProvider = .{ .vtable = &selection_item_vtable },
+    selection: uia.ISelectionProvider = .{ .vtable = &selection_vtable },
     references: std.atomic.Value(u32) = .init(0),
     id: u64 = 0,
     bridge: *Bridge,
@@ -423,6 +658,12 @@ const Element = struct {
     const Simple = UnknownOf(Element, uia.IRawElementProviderSimple, "simple");
     const Fragment = UnknownOf(Element, uia.IRawElementProviderFragment, "fragment");
     const Invoke = UnknownOf(Element, uia.IInvokeProvider, "invoke");
+    const Toggle = UnknownOf(Element, uia.IToggleProvider, "toggle");
+    const ExpandCollapse = UnknownOf(Element, uia.IExpandCollapseProvider, "expand_collapse");
+    const RangeValue = UnknownOf(Element, uia.IRangeValueProvider, "range_value");
+    const Value = UnknownOf(Element, uia.IValueProvider, "value");
+    const SelectionItem = UnknownOf(Element, uia.ISelectionItemProvider, "selection_item");
+    const Selection = UnknownOf(Element, uia.ISelectionProvider, "selection");
 
     const simple_vtable: uia.IRawElementProviderSimple.VTable = .{
         .unknown = Simple.methods,
@@ -444,6 +685,47 @@ const Element = struct {
         .unknown = Invoke.methods,
         .Invoke = invokeNode,
     };
+    const toggle_vtable: uia.IToggleProvider.VTable = .{
+        .unknown = Toggle.methods,
+        .Toggle = toggleNode,
+        .get_ToggleState = currentToggleState,
+    };
+    const expand_collapse_vtable: uia.IExpandCollapseProvider.VTable = .{
+        .unknown = ExpandCollapse.methods,
+        .Expand = expand,
+        .Collapse = collapse,
+        .get_ExpandCollapseState = currentExpandCollapseState,
+    };
+    const range_value_vtable: uia.IRangeValueProvider.VTable = .{
+        .unknown = RangeValue.methods,
+        .SetValue = setRangeValue,
+        .get_Value = rangeValue,
+        .get_IsReadOnly = rangeIsReadOnly,
+        .get_Maximum = rangeMaximum,
+        .get_Minimum = rangeMinimum,
+        .get_LargeChange = rangeLargeChange,
+        .get_SmallChange = rangeSmallChange,
+    };
+    const value_vtable: uia.IValueProvider.VTable = .{
+        .unknown = Value.methods,
+        .SetValue = setTextValue,
+        .get_Value = textValue,
+        .get_IsReadOnly = textIsReadOnly,
+    };
+    const selection_item_vtable: uia.ISelectionItemProvider.VTable = .{
+        .unknown = SelectionItem.methods,
+        .Select = select,
+        .AddToSelection = select,
+        .RemoveFromSelection = removeFromSelection,
+        .get_IsSelected = isSelected,
+        .get_SelectionContainer = selectionContainer,
+    };
+    const selection_vtable: uia.ISelectionProvider.VTable = .{
+        .unknown = Selection.methods,
+        .GetSelection = currentSelection,
+        .get_CanSelectMultiple = selectsOne,
+        .get_IsSelectionRequired = selectsOne,
+    };
 
     fn queryInterface(self: *Element, iid: *const GUID, found: *?*anyopaque) HRESULT {
         found.* = if (sameGuid(iid, win32.IID_IUnknown) or sameGuid(iid, uia.IID_IRawElementProviderSimple))
@@ -452,6 +734,18 @@ const Element = struct {
             &self.fragment
         else if (sameGuid(iid, uia.IID_IInvokeProvider))
             &self.invoke
+        else if (sameGuid(iid, uia.IID_IToggleProvider))
+            &self.toggle
+        else if (sameGuid(iid, uia.IID_IExpandCollapseProvider))
+            &self.expand_collapse
+        else if (sameGuid(iid, uia.IID_IRangeValueProvider))
+            &self.range_value
+        else if (sameGuid(iid, uia.IID_IValueProvider))
+            &self.value
+        else if (sameGuid(iid, uia.IID_ISelectionItemProvider))
+            &self.selection_item
+        else if (sameGuid(iid, uia.IID_ISelectionProvider))
+            &self.selection
         else
             return noInterface(found);
         _ = self.addRef();
@@ -466,15 +760,47 @@ const Element = struct {
         return self.references.fetchSub(1, .acq_rel) - 1;
     }
 
+    const Reading = struct {
+        snapshot: *const Snapshot,
+        index: u32,
+
+        fn node(self: Reading) *const Node {
+            return &self.snapshot.nodes[self.index];
+        }
+    };
+
     /// Holds the bridge's lock shared until `doneReading`; null when the
     /// node is gone.
-    fn read(self: *Element) ?struct { snapshot: *const Snapshot, index: u32 } {
+    fn read(self: *Element) ?Reading {
         const snapshot = self.bridge.readFront();
         const index = snapshot.find(self.id) orelse {
             self.bridge.doneReading();
             return null;
         };
         return .{ .snapshot = snapshot, .index = index };
+    }
+
+    /// Copies what `answer` gives from the node into `result`, or fails
+    /// when the node is gone.
+    fn answerFromNode(self: *Element, comptime Result: type, result: *Result, comptime answer: fn (*const Node) Result) HRESULT {
+        const reading = self.read() orelse return uia.UIA_E_ELEMENTNOTAVAILABLE;
+        defer self.bridge.doneReading();
+        result.* = answer(reading.node());
+        return win32.S_OK;
+    }
+
+    /// Delivers `action` when the node takes `needed` and is not already as
+    /// asked, after letting go of the lock, since the host's inbox has a
+    /// lock of its own.
+    fn request(self: *Element, comptime needed: zui.ActionKind, action: zui.Action, comptime already_done: ?fn (*const Node) bool) HRESULT {
+        const reading = self.read() orelse return uia.UIA_E_ELEMENTNOTAVAILABLE;
+        const node = reading.node();
+        const takes = node.takes(needed);
+        const done = if (already_done) |isDone| isDone(node) else false;
+        self.bridge.doneReading();
+        if (!takes) return uia.UIA_E_ELEMENTNOTENABLED;
+        if (!done) self.bridge.sink.deliver(.{ .target = self.id, .action = action });
+        return win32.S_OK;
     }
 
     fn providerOptions(_: *uia.IRawElementProviderSimple, options: *i32) callconv(.winapi) HRESULT {
@@ -486,12 +812,20 @@ const Element = struct {
         const self = Simple.object(simple);
         found.* = null;
         const reading = self.read() orelse return uia.UIA_E_ELEMENTNOTAVAILABLE;
-        const actions = reading.snapshot.nodes[reading.index].actions;
+        const node = reading.node();
+        const offered: ?*anyopaque = switch (pattern) {
+            uia.UIA_InvokePatternId => if (node.offersInvoke()) &self.invoke else null,
+            uia.UIA_TogglePatternId => if (node.offersToggle()) &self.toggle else null,
+            uia.UIA_ExpandCollapsePatternId => if (node.offersExpandCollapse()) &self.expand_collapse else null,
+            uia.UIA_RangeValuePatternId => if (node.offersRangeValue()) &self.range_value else null,
+            uia.UIA_ValuePatternId => if (node.offersValue()) &self.value else null,
+            uia.UIA_SelectionItemPatternId => if (node.offersSelectionItem()) &self.selection_item else null,
+            uia.UIA_SelectionPatternId => if (node.offersSelection()) &self.selection else null,
+            else => null,
+        };
         self.bridge.doneReading();
-        if (pattern == uia.UIA_InvokePatternId and actions.contains(.invoke)) {
-            found.* = &self.invoke;
-            _ = self.addRef();
-        }
+        if (offered != null) _ = self.addRef();
+        found.* = offered;
         return win32.S_OK;
     }
 
@@ -500,7 +834,7 @@ const Element = struct {
         value.* = .{};
         const reading = self.read() orelse return uia.UIA_E_ELEMENTNOTAVAILABLE;
         defer self.bridge.doneReading();
-        const node = &reading.snapshot.nodes[reading.index];
+        const node = reading.node();
         value.* = switch (property) {
             uia.UIA_ControlTypePropertyId => integer(controlType(node.role)),
             uia.UIA_NamePropertyId => string(reading.snapshot.textOf(node.label)) catch return win32.E_OUTOFMEMORY,
@@ -528,7 +862,7 @@ const Element = struct {
         found.* = null;
         const reading = self.read() orelse return uia.UIA_E_ELEMENTNOTAVAILABLE;
         defer self.bridge.doneReading();
-        const node = &reading.snapshot.nodes[reading.index];
+        const node = reading.node();
         const target = switch (direction) {
             .parent => {
                 if (node.parent == no_node) {
@@ -569,7 +903,7 @@ const Element = struct {
         const self = Fragment.object(fragment);
         bounds.* = .{};
         const reading = self.read() orelse return uia.UIA_E_ELEMENTNOTAVAILABLE;
-        const node_bounds = reading.snapshot.nodes[reading.index].bounds;
+        const node_bounds = reading.node().bounds;
         const scale: f64 = reading.snapshot.pixels_per_unit;
         self.bridge.doneReading();
         const origin = self.bridge.clientOrigin();
@@ -583,7 +917,7 @@ const Element = struct {
     }
 
     fn setFocus(fragment: *uia.IRawElementProviderFragment) callconv(.winapi) HRESULT {
-        return Fragment.object(fragment).request(.focus, .focus);
+        return Fragment.object(fragment).request(.focus, .focus, null);
     }
 
     fn fragmentRoot(fragment: *uia.IRawElementProviderFragment, found: *?*uia.IRawElementProviderFragmentRoot) callconv(.winapi) HRESULT {
@@ -594,18 +928,185 @@ const Element = struct {
     }
 
     fn invokeNode(invoke: *uia.IInvokeProvider) callconv(.winapi) HRESULT {
-        return Invoke.object(invoke).request(.invoke, .invoke);
+        return Invoke.object(invoke).request(.invoke, .invoke, null);
     }
 
-    /// Delivers `action` when the node takes `needed`, after letting go of
-    /// the lock, since the host's inbox has a lock of its own.
-    fn request(self: *Element, comptime needed: zui.ActionKind, action: zui.Action) HRESULT {
+    fn toggleNode(toggle: *uia.IToggleProvider) callconv(.winapi) HRESULT {
+        return Toggle.object(toggle).request(.invoke, .invoke, null);
+    }
+
+    fn currentToggleState(toggle: *uia.IToggleProvider, state: *uia.ToggleState) callconv(.winapi) HRESULT {
+        return Toggle.object(toggle).answerFromNode(uia.ToggleState, state, struct {
+            fn answer(node: *const Node) uia.ToggleState {
+                return toggleState(node.state.checked);
+            }
+        }.answer);
+    }
+
+    fn expand(expand_collapse: *uia.IExpandCollapseProvider) callconv(.winapi) HRESULT {
+        return ExpandCollapse.object(expand_collapse).request(.invoke, .invoke, Node.isExpanded);
+    }
+
+    fn collapse(expand_collapse: *uia.IExpandCollapseProvider) callconv(.winapi) HRESULT {
+        return ExpandCollapse.object(expand_collapse).request(.invoke, .invoke, Node.isCollapsed);
+    }
+
+    fn currentExpandCollapseState(expand_collapse: *uia.IExpandCollapseProvider, state: *uia.ExpandCollapseState) callconv(.winapi) HRESULT {
+        return ExpandCollapse.object(expand_collapse).answerFromNode(uia.ExpandCollapseState, state, struct {
+            fn answer(node: *const Node) uia.ExpandCollapseState {
+                return expandCollapseState(node.state.expanded);
+            }
+        }.answer);
+    }
+
+    fn rangeOf(node: *const Node) zui.SemanticRange {
+        return if (node.value == .range) node.value.range else .{ .value = 0 };
+    }
+
+    fn setRangeValue(range_value: *uia.IRangeValueProvider, target: f64) callconv(.winapi) HRESULT {
+        const self = RangeValue.object(range_value);
         const reading = self.read() orelse return uia.UIA_E_ELEMENTNOTAVAILABLE;
-        const node = &reading.snapshot.nodes[reading.index];
-        const takes = !node.state.disabled and node.actions.contains(needed);
+        const node = reading.node();
+        const range = rangeOf(node);
+        const takes = node.takes(.adjust);
         self.bridge.doneReading();
         if (!takes) return uia.UIA_E_ELEMENTNOTENABLED;
-        self.bridge.sink.deliver(.{ .target = self.id, .action = action });
+        if (!(target >= range.min and target <= range.max)) return win32.E_INVALIDARG;
+        const steps = stepsToward(range, target);
+        if (steps != 0) self.bridge.sink.deliver(.{ .target = self.id, .action = .{ .adjust = steps } });
+        return win32.S_OK;
+    }
+
+    fn rangeAnswer(comptime field: enum { value, min, max, small_change, large_change }) fn (*uia.IRangeValueProvider, *f64) callconv(.winapi) HRESULT {
+        return struct {
+            fn answer(node: *const Node) f64 {
+                const range = rangeOf(node);
+                return switch (field) {
+                    .value => range.value,
+                    .min => range.min,
+                    .max => range.max,
+                    .small_change => smallChange(range),
+                    .large_change => smallChange(range) * 10,
+                };
+            }
+
+            fn method(range_value: *uia.IRangeValueProvider, result: *f64) callconv(.winapi) HRESULT {
+                return RangeValue.object(range_value).answerFromNode(f64, result, answer);
+            }
+        }.method;
+    }
+
+    const rangeValue = rangeAnswer(.value);
+    const rangeMinimum = rangeAnswer(.min);
+    const rangeMaximum = rangeAnswer(.max);
+    const rangeSmallChange = rangeAnswer(.small_change);
+    const rangeLargeChange = rangeAnswer(.large_change);
+
+    fn rangeIsReadOnly(range_value: *uia.IRangeValueProvider, read_only: *win32.BOOL) callconv(.winapi) HRESULT {
+        return RangeValue.object(range_value).answerFromNode(win32.BOOL, read_only, struct {
+            fn answer(node: *const Node) win32.BOOL {
+                return winBool(!node.takes(.adjust));
+            }
+        }.answer);
+    }
+
+    /// zui has no action that replaces an element's text: a client types
+    /// into a text field through the keyboard.
+    fn setTextValue(value: *uia.IValueProvider, _: [*:0]const u16) callconv(.winapi) HRESULT {
+        const self = Value.object(value);
+        _ = self.read() orelse return uia.UIA_E_ELEMENTNOTAVAILABLE;
+        self.bridge.doneReading();
+        return uia.UIA_E_INVALIDOPERATION;
+    }
+
+    fn textValue(value: *uia.IValueProvider, found: *win32.BSTR) callconv(.winapi) HRESULT {
+        const self = Value.object(value);
+        found.* = null;
+        const reading = self.read() orelse return uia.UIA_E_ELEMENTNOTAVAILABLE;
+        defer self.bridge.doneReading();
+        const node = reading.node();
+        const span = if (node.value == .text) node.value.text else TextSpan{};
+        found.* = allocateString(reading.snapshot.textOf(span)) catch return win32.E_OUTOFMEMORY;
+        return win32.S_OK;
+    }
+
+    /// An enabled text field reads as editable, which it is from the
+    /// keyboard; a combo box's text is its choice, changed by choosing.
+    fn textIsReadOnly(value: *uia.IValueProvider, read_only: *win32.BOOL) callconv(.winapi) HRESULT {
+        return Value.object(value).answerFromNode(win32.BOOL, read_only, struct {
+            fn answer(node: *const Node) win32.BOOL {
+                return winBool(node.role != .text_field or node.state.disabled);
+            }
+        }.answer);
+    }
+
+    fn select(selection_item: *uia.ISelectionItemProvider) callconv(.winapi) HRESULT {
+        return SelectionItem.object(selection_item).request(.invoke, .invoke, Node.isSelected);
+    }
+
+    /// One choice is always made, so a selected one cannot be taken away.
+    fn removeFromSelection(selection_item: *uia.ISelectionItemProvider) callconv(.winapi) HRESULT {
+        const self = SelectionItem.object(selection_item);
+        const reading = self.read() orelse return uia.UIA_E_ELEMENTNOTAVAILABLE;
+        const selected = reading.node().state.selected;
+        self.bridge.doneReading();
+        return if (selected) uia.UIA_E_INVALIDOPERATION else win32.S_OK;
+    }
+
+    fn isSelected(selection_item: *uia.ISelectionItemProvider, selected: *win32.BOOL) callconv(.winapi) HRESULT {
+        return SelectionItem.object(selection_item).answerFromNode(win32.BOOL, selected, struct {
+            fn answer(node: *const Node) win32.BOOL {
+                return winBool(node.state.selected);
+            }
+        }.answer);
+    }
+
+    /// The list around an option, or the group around a radio.
+    fn selectionContainer(selection_item: *uia.ISelectionItemProvider, found: *?*uia.IRawElementProviderSimple) callconv(.winapi) HRESULT {
+        const self = SelectionItem.object(selection_item);
+        found.* = null;
+        const reading = self.read() orelse return uia.UIA_E_ELEMENTNOTAVAILABLE;
+        defer self.bridge.doneReading();
+        const node = reading.node();
+        const container = if (node.role == .option) reading.snapshot.enclosingWith(reading.index, .list_box) else node.parent;
+        if (container == no_node) return win32.S_OK;
+        const element = self.bridge.elementFor(reading.snapshot.nodes[container].id) orelse return win32.E_OUTOFMEMORY;
+        found.* = &element.simple;
+        return win32.S_OK;
+    }
+
+    /// The selected options inside the list, as `VT_UNKNOWN` providers.
+    fn currentSelection(selection: *uia.ISelectionProvider, found: *?*win32.SAFEARRAY) callconv(.winapi) HRESULT {
+        const self = Selection.object(selection);
+        found.* = null;
+        const reading = self.read() orelse return uia.UIA_E_ELEMENTNOTAVAILABLE;
+        defer self.bridge.doneReading();
+        const snapshot = reading.snapshot;
+        var selected_count: u32 = 0;
+        var index = reading.index + 1;
+        while (index < snapshot.count and snapshot.isWithin(index, reading.index)) : (index += 1) {
+            if (snapshot.nodes[index].state.selected) selected_count += 1;
+        }
+        const array = win32.SafeArrayCreateVector(win32.VT_UNKNOWN, 0, selected_count) orelse return win32.E_OUTOFMEMORY;
+        var position: win32.LONG = 0;
+        index = reading.index + 1;
+        while (index < snapshot.count and snapshot.isWithin(index, reading.index)) : (index += 1) {
+            if (!snapshot.nodes[index].state.selected) continue;
+            const element = self.bridge.elementFor(snapshot.nodes[index].id) orelse {
+                _ = win32.SafeArrayDestroy(array);
+                return win32.E_OUTOFMEMORY;
+            };
+            // The array takes a reference of its own.
+            _ = win32.SafeArrayPutElement(array, &position, &element.simple);
+            _ = element.release();
+            position += 1;
+        }
+        found.* = array;
+        return win32.S_OK;
+    }
+
+    fn selectsOne(_: *uia.ISelectionProvider, answer: *win32.BOOL) callconv(.winapi) HRESULT {
+        answer.* = 0;
         return win32.S_OK;
     }
 };
@@ -776,6 +1277,8 @@ test "a snapshot links each node to its parent and siblings, and finds it by id"
     try std.testing.expectEqual(@as(u32, 1), snapshot.nodes[2].previous_sibling);
     try std.testing.expectEqual(@as(u32, 3), snapshot.nodes[0].next_sibling);
     try std.testing.expectEqualStrings("Open", snapshot.textOf(snapshot.nodes[2].label));
+    try std.testing.expect(snapshot.isWithin(2, 0));
+    try std.testing.expect(!snapshot.isWithin(3, 0));
 }
 
 test "a list longer than the room keeps its start, and text that does not fit is cut at a character" {
@@ -803,4 +1306,32 @@ test "a bridge without room keeps nothing and allocates nothing" {
     const node: zui.SemanticNode = .{ .id = 1, .parent = null, .role = .button, .label = "Save", .value = .none, .bounds = .{}, .state = .{}, .actions = .initEmpty() };
     try std.testing.expect(!bridge.hasRoom());
     try std.testing.expectEqual(zui.SemanticsDropped{ .nodes = 1, .text_bytes = 4 }, bridge.publish(&.{node}, 1));
+}
+
+test "each role offers the patterns that stand for what it does" {
+    const node: Node = .{ .id = 1, .parent = no_node, .role = .button, .state = .{}, .actions = .initOne(.invoke), .bounds = .{}, .label = .{}, .value = .none };
+    try std.testing.expect(node.offersInvoke() and !node.offersToggle());
+    var checkbox = node;
+    checkbox.role = .checkbox;
+    checkbox.state.checked = false;
+    try std.testing.expect(checkbox.offersToggle() and !checkbox.offersInvoke());
+    var option = node;
+    option.role = .option;
+    option.state.checked = true;
+    try std.testing.expect(option.offersSelectionItem() and !option.offersToggle() and !option.offersInvoke());
+    var combo_box = node;
+    combo_box.role = .combo_box;
+    combo_box.state.expanded = false;
+    try std.testing.expect(combo_box.offersExpandCollapse() and !combo_box.offersInvoke());
+    var disclosure = node;
+    disclosure.state.expanded = true;
+    try std.testing.expect(disclosure.offersExpandCollapse() and disclosure.offersInvoke());
+}
+
+test "setting a range moves it by whole steps, or by one toward the target when it has none" {
+    try std.testing.expectEqual(@as(i32, 3), stepsToward(.{ .value = 0.5, .step = 0.1 }, 0.8));
+    try std.testing.expectEqual(@as(i32, -2), stepsToward(.{ .value = 50, .min = 0, .max = 100, .step = 5 }, 41));
+    try std.testing.expectEqual(@as(i32, 1), stepsToward(.{ .value = 0.5 }, 0.9));
+    try std.testing.expectEqual(@as(i32, -1), stepsToward(.{ .value = 0.5 }, 0.1));
+    try std.testing.expectEqual(@as(i32, 0), stepsToward(.{ .value = 0.5 }, 0.5));
 }
