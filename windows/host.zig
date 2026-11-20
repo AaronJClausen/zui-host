@@ -18,7 +18,8 @@ const W = std.unicode.utf8ToUtf16LeStringLiteral;
 /// contrast, animations, power, HDR headroom), lifecycle events from console control
 /// events, the session ending and the system sleeping, and dropped files;
 /// it sets the cursor and places the IME window; it reads and writes the
-/// clipboard and opens URLs; it watches directories for changes; it bridges `Frame.semantics()` to UI Automation, reporting
+/// clipboard, opens URLs and shows notifications; it watches directories
+/// for changes; it bridges `Frame.semantics()` to UI Automation, reporting
 /// what an assistive technology asks for as `action` events; and it waits
 /// for `nextFrame` on its wake, its input and a high-resolution timer.
 ///
@@ -90,6 +91,22 @@ pub const Host = struct {
         }
     };
 
+    /// A balloon of the window's notification-area icon, which Windows 10
+    /// and 11 show as a toast: its title cut at a character to 63 UTF-16
+    /// units and its body to 255. It answers `.notification_activated` when
+    /// clicked and `.notification_dismissed` when it times out, is closed,
+    /// or the next one replaces it; one still showing at `deinit` is not
+    /// answered.
+    pub const zuiNotifications = struct {
+        pub fn show(host: *Host, request: zui.ServiceRequest, notification: zui.Notification, sink: zui.ServiceSink) zui.ServiceError!void {
+            try host.services.claimNotification(request, notification, sink);
+            if (win32.PostMessageW(host.hwnd, wm_show_notification, 0, 0) == 0) {
+                host.services.releaseNotification();
+                return error.Unavailable;
+            }
+        }
+    };
+
     /// Watches up to `file_watch.Watches.capacity` directories, each with
     /// its subdirectories, until `deinit`.
     pub const zuiFileWatch = struct {
@@ -151,6 +168,10 @@ pub const Host = struct {
     const wm_semantics_changed = win32.WM_APP + 3;
     const wm_read_clipboard = win32.WM_APP + 4;
     const wm_open_url = win32.WM_APP + 5;
+    const wm_show_notification = win32.WM_APP + 6;
+    /// What the notification-area icon sends the window when its balloon
+    /// is shown, clicked, timed out or closed.
+    pub const wm_notify_icon = win32.WM_APP + 7;
 
     const Inbox = struct {
         /// Positions are in physical pixels until a poll converts them.
@@ -218,6 +239,8 @@ pub const Host = struct {
         /// Windows took the backdrop the window asked for.
         backdrop_applied: bool = false,
         monitor: ?win32.HMONITOR = null,
+        title: [256:0]u16 = @splat(0),
+        title_len: usize = 0,
     };
 
     pub fn init(self: *Host, io: std.Io, options: zui.WindowOptions) !void {
@@ -478,12 +501,12 @@ pub const Host = struct {
         _ = win32.RegisterClassExW(&class);
 
         const options = self.window.options;
-        var title: [256:0]u16 = undefined;
-        const title_len = std.unicode.utf8ToUtf16Le(title[0 .. title.len - 1], options.title[0..@min(options.title.len, 255)]) catch 0;
-        title[title_len] = 0;
+        const title = &self.window.title;
+        self.window.title_len = std.unicode.utf8ToUtf16Le(title[0 .. title.len - 1], options.title[0..@min(options.title.len, 255)]) catch 0;
+        title[self.window.title_len] = 0;
         const style = windowStyle(options);
 
-        const hwnd = win32.CreateWindowExW(0, class_name, &title, style, win32.CW_USEDEFAULT, win32.CW_USEDEFAULT, win32.CW_USEDEFAULT, win32.CW_USEDEFAULT, null, null, instance, null) orelse return error.WindowNotCreated;
+        const hwnd = win32.CreateWindowExW(0, class_name, title, style, win32.CW_USEDEFAULT, win32.CW_USEDEFAULT, win32.CW_USEDEFAULT, win32.CW_USEDEFAULT, null, null, instance, null) orelse return error.WindowNotCreated;
         self.accessibility.hwnd = hwnd;
         _ = win32.SetWindowLongPtrW(hwnd, win32.GWLP_USERDATA, @bitCast(@intFromPtr(self)));
 
@@ -541,6 +564,7 @@ pub const Host = struct {
             },
             win32.WM_DESTROY => {
                 self.accessibility.disconnect(hwnd);
+                self.services.removeNotifyIcon(hwnd);
                 win32.PostQuitMessage(0);
                 return 0;
             },
@@ -644,6 +668,14 @@ pub const Host = struct {
             },
             wm_open_url => {
                 self.services.openUrl(hwnd);
+                return 0;
+            },
+            wm_show_notification => {
+                self.services.showNotification(hwnd, wm_notify_icon, self.window.title[0..self.window.title_len], self.zuiWaker());
+                return 0;
+            },
+            wm_notify_icon => {
+                self.services.answerNotifyIconEvent(hwnd, lparam, self.zuiWaker());
                 return 0;
             },
             win32.WM_GETOBJECT => if (self.accessibility.answerGetObject(hwnd, wparam, lparam)) |answered| return answered,

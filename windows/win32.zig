@@ -162,6 +162,46 @@ pub const DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2: isize = -4;
 pub const CF_UNICODETEXT = 13;
 pub const GMEM_MOVEABLE = 0x0002;
 
+pub const WM_USER = 0x0400;
+pub const IDI_APPLICATION = 32512;
+pub const NIM_ADD = 0x00000000;
+pub const NIM_MODIFY = 0x00000001;
+pub const NIM_DELETE = 0x00000002;
+pub const NIM_SETVERSION = 0x00000004;
+pub const NIF_MESSAGE = 0x00000001;
+pub const NIF_ICON = 0x00000002;
+pub const NIF_TIP = 0x00000004;
+pub const NIF_INFO = 0x00000010;
+pub const NIIF_INFO = 0x00000001;
+pub const NOTIFYICON_VERSION_4 = 4;
+pub const NIN_BALLOONSHOW = WM_USER + 2;
+pub const NIN_BALLOONHIDE = WM_USER + 3;
+pub const NIN_BALLOONTIMEOUT = WM_USER + 4;
+pub const NIN_BALLOONUSERCLICK = WM_USER + 5;
+
+pub const NOTIFYICONDATAW = extern struct {
+    cbSize: DWORD = @sizeOf(NOTIFYICONDATAW),
+    hWnd: ?HWND = null,
+    uID: UINT = 0,
+    uFlags: UINT = 0,
+    uCallbackMessage: UINT = 0,
+    hIcon: ?HICON = null,
+    szTip: [128]u16 = @splat(0),
+    dwState: DWORD = 0,
+    dwStateMask: DWORD = 0,
+    szInfo: [256]u16 = @splat(0),
+    /// `uTimeout` before Vista; `uVersion` for `NIM_SETVERSION`.
+    uVersion: UINT = 0,
+    szInfoTitle: [64]u16 = @splat(0),
+    dwInfoFlags: DWORD = 0,
+    guidItem: GUID = .{ .data1 = 0, .data2 = 0, .data3 = 0, .data4 = @splat(0) },
+    hBalloonIcon: ?HICON = null,
+};
+
+comptime {
+    if (@sizeOf(usize) == 8 and @sizeOf(NOTIFYICONDATAW) != 976) @compileError("NOTIFYICONDATAW does not match the SDK's layout");
+}
+
 pub const CFS_FORCE_POSITION = 0x0020;
 pub const CFS_EXCLUDE = 0x0080;
 pub const IACE_DEFAULT = 0x0010;
@@ -277,6 +317,7 @@ pub extern "user32" fn SetProcessDpiAwarenessContext(context: isize) callconv(.w
 pub extern "user32" fn SetWindowLongPtrW(hwnd: HWND, index: c_int, value: isize) callconv(.winapi) isize;
 pub extern "user32" fn GetWindowLongPtrW(hwnd: HWND, index: c_int) callconv(.winapi) isize;
 pub extern "user32" fn LoadCursorW(instance: ?HINSTANCE, name: usize) callconv(.winapi) ?HCURSOR;
+pub extern "user32" fn LoadIconW(instance: ?HINSTANCE, name: usize) callconv(.winapi) ?HICON;
 pub extern "user32" fn SetCursor(cursor: ?HCURSOR) callconv(.winapi) ?HCURSOR;
 pub extern "user32" fn TrackMouseEvent(track: *TRACKMOUSEEVENT) callconv(.winapi) BOOL;
 pub extern "user32" fn SetCapture(hwnd: HWND) callconv(.winapi) ?HWND;
@@ -330,6 +371,7 @@ pub extern "shell32" fn DragAcceptFiles(hwnd: HWND, accept: BOOL) callconv(.wina
 pub extern "shell32" fn DragQueryFileW(drop: HDROP, index: UINT, file: ?[*]u16, capacity: UINT) callconv(.winapi) UINT;
 pub extern "shell32" fn DragQueryPoint(drop: HDROP, point: *POINT) callconv(.winapi) BOOL;
 pub extern "shell32" fn DragFinish(drop: HDROP) callconv(.winapi) void;
+pub extern "shell32" fn Shell_NotifyIconW(message: DWORD, data: *const NOTIFYICONDATAW) callconv(.winapi) BOOL;
 pub extern "shell32" fn ShellExecuteW(hwnd: ?HWND, operation: ?[*:0]const u16, file: [*:0]const u16, parameters: ?[*:0]const u16, directory: ?[*:0]const u16, show: c_int) callconv(.winapi) ?HINSTANCE;
 
 pub extern "imm32" fn ImmGetContext(hwnd: HWND) callconv(.winapi) ?HIMC;

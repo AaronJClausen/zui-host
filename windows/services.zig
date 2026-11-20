@@ -12,8 +12,15 @@ pub const Services = struct {
     clipboard_read: ?PendingAnswer = null,
     url_pending: bool = false,
     url: [url_capacity:0]u16 = undefined,
-    /// Only the window thread uses it.
+    notification_pending: ?PendingAnswer = null,
+    notification_title: NotificationTitle = @splat(0),
+    notification_body: NotificationBody = @splat(0),
+    /// Only the window thread uses these.
     clipboard_text: [clipboard_text_capacity]u8 = undefined,
+    /// The notification showing, answered when the user clicks it, it times
+    /// out or is closed, or the next one replaces it.
+    notification_shown: ?PendingAnswer = null,
+    notify_icon_added: bool = false,
     /// Hands nothing to the system when set.
     fake: ?*ServiceFake = null,
 
@@ -22,6 +29,13 @@ pub const Services = struct {
     /// UTF-8 bytes of the clipboard's text a read answers with; the rest is
     /// counted as left out.
     pub const clipboard_text_capacity = 64 * 1024;
+    /// The window's icon in the notification area, which shows its
+    /// notifications.
+    pub const notify_icon_id = 1;
+
+    /// As `NOTIFYICONDATAW` holds them, each ending in a 0.
+    pub const NotificationTitle = @FieldType(win32.NOTIFYICONDATAW, "szInfoTitle");
+    pub const NotificationBody = @FieldType(win32.NOTIFYICONDATAW, "szInfo");
 
     const PendingAnswer = struct { request: zui.ServiceRequest, sink: zui.ServiceSink };
 
@@ -56,6 +70,24 @@ pub const Services = struct {
         win32.AcquireSRWLockExclusive(&self.lock);
         defer win32.ReleaseSRWLockExclusive(&self.lock);
         self.url_pending = false;
+    }
+
+    /// Copies the notification's text for the window thread to show, each
+    /// part cut at a character to what the notification area holds.
+    pub fn claimNotification(self: *Services, request: zui.ServiceRequest, notification: zui.Notification, sink: zui.ServiceSink) zui.ServiceError!void {
+        if (!std.unicode.utf8ValidateSlice(notification.title) or !std.unicode.utf8ValidateSlice(notification.body)) return error.InvalidUtf8;
+        win32.AcquireSRWLockExclusive(&self.lock);
+        defer win32.ReleaseSRWLockExclusive(&self.lock);
+        if (self.notification_pending != null) return error.Busy;
+        utf16CutToFit(notification.title, &self.notification_title);
+        utf16CutToFit(notification.body, &self.notification_body);
+        self.notification_pending = .{ .request = request, .sink = sink };
+    }
+
+    pub fn releaseNotification(self: *Services) void {
+        win32.AcquireSRWLockExclusive(&self.lock);
+        defer win32.ReleaseSRWLockExclusive(&self.lock);
+        self.notification_pending = null;
     }
 
     /// On the window thread, which owns `hwnd`, as the clipboard asks of
@@ -94,13 +126,108 @@ pub const Services = struct {
         if (self.fake) |fake| return fake.recordOpenedUrl(url);
         _ = win32.ShellExecuteW(hwnd, W("open"), url, null, null, win32.SW_SHOWNORMAL);
     }
+
+    /// On the window thread: shows the claimed notification as a balloon of
+    /// the window's notification-area icon, which Windows 10 and 11 show
+    /// as a toast. The icon's `callback_message` brings back what became of
+    /// it, for `answerNotifyIconEvent`.
+    pub fn showNotification(self: *Services, hwnd: win32.HWND, callback_message: win32.UINT, title: []const u16, waker: zui.Waker) void {
+        var balloon: win32.NOTIFYICONDATAW = .{ .hWnd = hwnd, .uID = notify_icon_id, .uFlags = win32.NIF_INFO, .dwInfoFlags = win32.NIIF_INFO };
+        win32.AcquireSRWLockExclusive(&self.lock);
+        const pending = self.notification_pending orelse {
+            win32.ReleaseSRWLockExclusive(&self.lock);
+            return;
+        };
+        balloon.szInfoTitle = self.notification_title;
+        balloon.szInfo = self.notification_body;
+        self.notification_pending = null;
+        win32.ReleaseSRWLockExclusive(&self.lock);
+
+        if (self.notification_shown) |replaced| publish(replaced, .notification_dismissed, waker);
+        self.notification_shown = pending;
+        if (!self.notify_icon_added) {
+            var icon: win32.NOTIFYICONDATAW = .{
+                .hWnd = hwnd,
+                .uID = notify_icon_id,
+                .uFlags = win32.NIF_MESSAGE | win32.NIF_ICON | win32.NIF_TIP,
+                .uCallbackMessage = callback_message,
+                .hIcon = win32.LoadIconW(null, win32.IDI_APPLICATION),
+            };
+            const tip_len = @min(title.len, icon.szTip.len - 1);
+            @memcpy(icon.szTip[0..tip_len], title[0..tip_len]);
+            if (!self.notifyIcon(win32.NIM_ADD, &icon)) return self.answerShown(.{ .failed = .unavailable }, waker);
+            self.notify_icon_added = true;
+            icon.uVersion = win32.NOTIFYICON_VERSION_4;
+            _ = self.notifyIcon(win32.NIM_SETVERSION, &icon);
+        }
+        if (!self.notifyIcon(win32.NIM_MODIFY, &balloon)) {
+            self.answerShown(.{ .failed = .unavailable }, waker);
+            return self.removeNotifyIcon(hwnd);
+        }
+        if (self.fake) |fake| if (fake.takeScriptedNotificationEvent()) |event| {
+            _ = win32.PostMessageW(hwnd, callback_message, 0, notifyIconEventLparam(event));
+        };
+    }
+
+    /// On the window thread, for the icon's callback message: with
+    /// `NOTIFYICON_VERSION_4`, the event is the low word of `lparam`.
+    pub fn answerNotifyIconEvent(self: *Services, hwnd: win32.HWND, lparam: win32.LPARAM, waker: zui.Waker) void {
+        const outcome: zui.ServiceAnswer.Outcome = switch (win32.loword(lparam)) {
+            win32.NIN_BALLOONUSERCLICK => .notification_activated,
+            win32.NIN_BALLOONTIMEOUT, win32.NIN_BALLOONHIDE => .notification_dismissed,
+            else => return,
+        };
+        if (self.notification_shown == null) return;
+        self.answerShown(outcome, waker);
+        self.removeNotifyIcon(hwnd);
+    }
+
+    /// On the window thread, when the balloon has ended or the window closes.
+    pub fn removeNotifyIcon(self: *Services, hwnd: win32.HWND) void {
+        if (!self.notify_icon_added) return;
+        _ = self.notifyIcon(win32.NIM_DELETE, &.{ .hWnd = hwnd, .uID = notify_icon_id });
+        self.notify_icon_added = false;
+    }
+
+    fn answerShown(self: *Services, outcome: zui.ServiceAnswer.Outcome, waker: zui.Waker) void {
+        const shown = self.notification_shown orelse return;
+        self.notification_shown = null;
+        publish(shown, outcome, waker);
+    }
+
+    fn publish(pending: PendingAnswer, outcome: zui.ServiceAnswer.Outcome, waker: zui.Waker) void {
+        const answer: zui.ServiceAnswer = .{ .request = pending.request, .outcome = outcome };
+        waker.wakeIf(pending.sink.publish(&answer));
+    }
+
+    fn notifyIcon(self: *Services, message: win32.DWORD, data: *const win32.NOTIFYICONDATAW) bool {
+        if (self.fake) |fake| return fake.recordNotifyIcon(message, data);
+        return win32.Shell_NotifyIconW(message, data) != 0;
+    }
 };
+
+/// What Windows sends the icon's callback message with, under
+/// `NOTIFYICON_VERSION_4`: the event, and the icon's id in the high word.
+pub fn notifyIconEventLparam(event: win32.UINT) win32.LPARAM {
+    return @bitCast(@as(usize, event) | @as(usize, Services.notify_icon_id) << 16);
+}
 
 /// For tests: what the host would have handed to the system, kept instead
 /// of handing it over, so no browser opens.
 pub const ServiceFake = struct {
     opened_url: [Services.url_capacity * 3]u8 = undefined,
     opened_url_len: std.atomic.Value(usize) = .init(0),
+    /// The notification-area event the next balloon is answered with, as
+    /// though the user had clicked it or let it go; 0 for none.
+    scripted_notification_event: std.atomic.Value(win32.UINT) = .init(0),
+    /// Each `Shell_NotifyIconW` call the host would have made, by message.
+    notify_icon_calls: [notify_icon_messages]std.atomic.Value(u32) = @splat(.init(0)),
+    /// The last balloon's text, valid once `notify_icon_calls` counts its
+    /// `NIM_MODIFY`.
+    balloon_title: Services.NotificationTitle = @splat(0),
+    balloon_body: Services.NotificationBody = @splat(0),
+
+    const notify_icon_messages = win32.NIM_SETVERSION + 1;
 
     /// The last URL the host would have opened.
     pub fn openedUrl(self: *const ServiceFake) ?[]const u8 {
@@ -108,9 +235,37 @@ pub const ServiceFake = struct {
         return if (len == 0) null else self.opened_url[0..len];
     }
 
+    pub const NotificationOutcome = enum { activated, dismissed };
+
+    /// Answers the next notification shown as though the user had done this.
+    pub fn scriptNotification(self: *ServiceFake, outcome: NotificationOutcome) void {
+        self.scripted_notification_event.store(switch (outcome) {
+            .activated => win32.NIN_BALLOONUSERCLICK,
+            .dismissed => win32.NIN_BALLOONTIMEOUT,
+        }, .release);
+    }
+
+    pub fn notifyIconCalls(self: *const ServiceFake, message: win32.DWORD) u32 {
+        return self.notify_icon_calls[message].load(.acquire);
+    }
+
     fn recordOpenedUrl(self: *ServiceFake, url: [:0]const u16) void {
         const len = std.unicode.utf16LeToUtf8(&self.opened_url, url) catch 0;
         self.opened_url_len.store(len, .release);
+    }
+
+    fn takeScriptedNotificationEvent(self: *ServiceFake) ?win32.UINT {
+        const event = self.scripted_notification_event.swap(0, .acq_rel);
+        return if (event == 0) null else event;
+    }
+
+    fn recordNotifyIcon(self: *ServiceFake, message: win32.DWORD, data: *const win32.NOTIFYICONDATAW) bool {
+        if (message == win32.NIM_MODIFY and data.uFlags & win32.NIF_INFO != 0) {
+            self.balloon_title = data.szInfoTitle;
+            self.balloon_body = data.szInfo;
+        }
+        _ = self.notify_icon_calls[message].fetchAdd(1, .release);
+        return true;
     }
 };
 
@@ -136,6 +291,27 @@ pub fn utf8FromClipboard(units: []const u16, buffer: []u8) Converted {
         index += if (pairs_with_next) 2 else 1;
     }
     return .{ .len = len, .left_out_bytes = std.math.lossyCast(u32, std.unicode.calcWtf8Len(units[index..])) };
+}
+
+/// Valid UTF-8 as UTF-16 in `buffer`, ending in a 0, cut at a character
+/// when it does not fit.
+pub fn utf16CutToFit(utf8: []const u8, buffer: []u16) void {
+    var len: usize = 0;
+    var codepoints = std.unicode.Utf8View.initUnchecked(utf8).iterator();
+    while (codepoints.nextCodepoint()) |codepoint| {
+        if (codepoint < 0x10000) {
+            if (len + 1 > buffer.len - 1) break;
+            buffer[len] = @intCast(codepoint);
+            len += 1;
+        } else {
+            if (len + 2 > buffer.len - 1) break;
+            const above_plane_zero = codepoint - 0x10000;
+            buffer[len] = @intCast(0xD800 + (above_plane_zero >> 10));
+            buffer[len + 1] = @intCast(0xDC00 + (above_plane_zero & 0x3FF));
+            len += 2;
+        }
+    }
+    buffer[len] = 0;
 }
 
 const NoSource = struct {
@@ -171,4 +347,28 @@ test "the clipboard's text becomes UTF-8 with lone surrogates replaced, cut at a
     const cut = utf8FromClipboard(&text, &small);
     try std.testing.expectEqualStrings("h\u{E9}", small[0..cut.len]);
     try std.testing.expectEqual(@as(u32, 4 + 3 + 1), cut.left_out_bytes);
+}
+
+test "a notification's text becomes UTF-16 ending in a 0, cut before a character that does not fit" {
+    var buffer: [5]u16 = undefined;
+    utf16CutToFit("h\u{E9}", &buffer);
+    try std.testing.expectEqualSlices(u16, &.{ 'h', 0xE9, 0 }, buffer[0..3]);
+    utf16CutToFit("ab\u{1F600}!", &buffer);
+    try std.testing.expectEqualSlices(u16, &.{ 'a', 'b', 0xD83D, 0xDE00, 0 }, &buffer);
+    utf16CutToFit("abc\u{1F600}", &buffer);
+    try std.testing.expectEqualSlices(u16, &.{ 'a', 'b', 'c', 0 }, buffer[0..4]);
+}
+
+test "a notification is refused when its text is not UTF-8, or while the last is still waiting for the window thread" {
+    var services: Services = .{};
+    var nothing: u8 = 0;
+    const sink: zui.ServiceSink = .{ .context = &nothing, .publishFn = NoSource.publish };
+    try std.testing.expectError(error.InvalidUtf8, services.claimNotification(.of("saved"), .{ .title = "\xff" }, sink));
+    try std.testing.expectError(error.InvalidUtf8, services.claimNotification(.of("saved"), .{ .title = "Saved", .body = "\xc3" }, sink));
+    try services.claimNotification(.of("saved"), .{ .title = "Saved " ++ "x" ** 100, .body = "zui" }, sink);
+    try std.testing.expectError(error.Busy, services.claimNotification(.of("again"), .{ .title = "Saved" }, sink));
+    try std.testing.expectEqual(@as(u16, 0), services.notification_title[services.notification_title.len - 1]);
+    try std.testing.expectEqualSlices(u16, W("zui"), std.mem.sliceTo(&services.notification_body, 0));
+    services.releaseNotification();
+    try services.claimNotification(.of("again"), .{ .title = "Saved" }, sink);
 }

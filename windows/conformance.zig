@@ -83,6 +83,13 @@ const MessageHarness = struct {
         return self.window.service_fake.openedUrl();
     }
 
+    pub fn scriptServices(self: *MessageHarness, script: zui_testing.ServiceScript) void {
+        self.window.service_fake.scriptNotification(switch (script.notification) {
+            .activated => .activated,
+            .dismissed => .dismissed,
+        });
+    }
+
     pub fn close(self: *MessageHarness) void {
         self.window.window_host.close();
     }
@@ -283,6 +290,74 @@ test "a URL reaches the system from the window thread, and what is not one never
     const deadline = host.now().addNanoseconds(2 * std.time.ns_per_s);
     while (window.service_fake.openedUrl() == null and host.now().isBefore(deadline)) try testing.io.sleep(.fromMilliseconds(5), .awake);
     try testing.expectEqualStrings(url, window.service_fake.openedUrl() orelse "");
+}
+
+/// Waits for at most two seconds until the window thread has made `count`
+/// `Shell_NotifyIconW` calls with `message`.
+fn awaitNotifyIconCalls(window: *HiddenWindow, message: win32.DWORD, count: u32) !void {
+    const deadline = window.window_host.now().addNanoseconds(2 * std.time.ns_per_s);
+    while (window.service_fake.notifyIconCalls(message) < count) {
+        if (!window.window_host.now().isBefore(deadline)) return error.NotShown;
+        try testing.io.sleep(.fromMilliseconds(5), .awake);
+    }
+}
+
+fn sendNotifyIconEvent(window: *HiddenWindow, event: win32.UINT) void {
+    window.send(Host.wm_notify_icon, 0, zui_host.windows.services.notifyIconEventLparam(event));
+}
+
+test "a notification shows as a balloon of the window's icon, its title cut at a character, and answers activated when clicked" {
+    var window: HiddenWindow = .{};
+    try window.open(1);
+    defer window.close();
+    const host = &window.window_host;
+    var replies: Replies = .{};
+    const saved: zui.ServiceRequest = .of("saved");
+    try Host.zuiNotifications.show(host, saved, .{ .title = "Saved " ++ "é" ** 60, .body = "zui → notification ✓" }, .of(&replies));
+    try awaitNotifyIconCalls(&window, win32.NIM_MODIFY, 1);
+    try testing.expectEqual(@as(u32, 1), window.service_fake.notifyIconCalls(win32.NIM_ADD));
+    try testing.expectEqual(@as(u32, 1), window.service_fake.notifyIconCalls(win32.NIM_SETVERSION));
+    const title = std.mem.sliceTo(&window.service_fake.balloon_title, 0);
+    try testing.expectEqual(@as(usize, 63), title.len);
+    try testing.expectEqualSlices(u16, std.unicode.utf8ToUtf16LeStringLiteral("Saved " ++ "é" ** 57), title);
+    try testing.expectEqualSlices(u16, std.unicode.utf8ToUtf16LeStringLiteral("zui → notification ✓"), std.mem.sliceTo(&window.service_fake.balloon_body, 0));
+
+    sendNotifyIconEvent(&window, win32.NIN_BALLOONSHOW);
+    sendNotifyIconEvent(&window, win32.NIN_BALLOONUSERCLICK);
+    const reply = try awaitReply(host, &replies);
+    try testing.expectEqual(saved, reply.request);
+    try testing.expectEqual(.notification_activated, reply.kind);
+    try testing.expectEqual(@as(u32, 1), window.service_fake.notifyIconCalls(win32.NIM_DELETE));
+}
+
+test "a notification replaced by the next is dismissed, so is one that times out, and the icon goes with the last" {
+    var window: HiddenWindow = .{};
+    try window.open(1);
+    defer window.close();
+    const host = &window.window_host;
+    var replies: Replies = .{};
+    const first: zui.ServiceRequest = .of("first");
+    const second: zui.ServiceRequest = .of("second");
+    try Host.zuiNotifications.show(host, first, .{ .title = "First" }, .of(&replies));
+    try awaitNotifyIconCalls(&window, win32.NIM_MODIFY, 1);
+    try Host.zuiNotifications.show(host, second, .{ .title = "Second" }, .of(&replies));
+    try awaitNotifyIconCalls(&window, win32.NIM_MODIFY, 2);
+    const replaced = try awaitReply(host, &replies);
+    try testing.expectEqual(first, replaced.request);
+    try testing.expectEqual(.notification_dismissed, replaced.kind);
+    try testing.expectEqual(@as(u32, 1), window.service_fake.notifyIconCalls(win32.NIM_ADD));
+    try testing.expectEqual(@as(u32, 0), window.service_fake.notifyIconCalls(win32.NIM_DELETE));
+
+    sendNotifyIconEvent(&window, win32.NIN_BALLOONTIMEOUT);
+    const timed_out = try awaitReply(host, &replies);
+    try testing.expectEqual(second, timed_out.request);
+    try testing.expectEqual(.notification_dismissed, timed_out.kind);
+    try testing.expectEqual(@as(u32, 1), window.service_fake.notifyIconCalls(win32.NIM_DELETE));
+
+    sendNotifyIconEvent(&window, win32.NIN_BALLOONHIDE);
+    replies.zuiSwap();
+    var unanswered = replies.zuiView().items();
+    try testing.expectEqual(null, unanswered.next());
 }
 
 test "requests reach the window: the cursor it shows, and an IME only while text input is asked for" {
