@@ -53,7 +53,8 @@ window keeps drawing while the user drags its edges or moves it. It:
   menu at a position in layout units, one at a time with a file dialog,
   answering the item chosen or `.canceled`, and `setBar(host, window,
   request, items, sink)`, which replaces the window's menu bar, or
-  removes it given no items, and answers each item chosen from it. Labels
+  removes it given no items, and answers each item chosen from it, or is
+  `error.Unavailable` under a custom title bar, which would hide it. Labels
   show as written, with shortcuts after them (`Ctrl+Shift+S`). Each call
   returns at once; the window thread does the work and publishes every
   answer, a `zui.ServiceReply`, into a source of the application's, so
@@ -77,7 +78,12 @@ window keeps drawing while the user drags its edges or moves it. It:
 - bridges `Frame.semantics()` to UI Automation, through `zuiSemantics`,
   when the window was opened with room for it (`WindowOptions.semantics`,
   which `zui_app` sizes from `Config.limits` when `features.semantics` is
-  on); see *Accessibility* below.
+  on); see *Accessibility* below;
+- leaves the title bar to the application for a window opened with
+  `WindowOptions.title_bar = .custom`, reporting
+  `Environment.custom_title_bar` and `.window_maximized`, and answers
+  Windows from the frame's chrome regions, which `zui_app` hands to
+  `zuiChromeRegions`; see *A custom title bar* below.
 
 It passes zui's host suite (`zui_testing.expectHostConforms`) against a
 hidden window, whose harness sends the messages Windows would.
@@ -278,6 +284,52 @@ answered `.failed = .unavailable`; the check presses Paste again, as a
 user would. Setting a menu bar shrinks the window's content by the bar's
 height.
 
+## A custom title bar
+
+`zig build title-bar` draws its own title bar over Mica: a title, a
+search field and minimize, maximize and close buttons. The application
+marks each part with `Element.chrome`, behind `features.chrome_regions`,
+and opens the window with `.title_bar = .custom`:
+
+```zig
+ui.open(.{ .id = .of("title bar"), .chrome = .title_bar, .layout = .{ .sizing = .{ .width = .grow, .height = .fixed(32) } } });
+defer ui.close();
+_ = widgets.textField(ui, .of("search"), &app.search, .{ .label = "Search" }); // interactive, so it stays the application's
+if (captionButton(ui, .of("close"), .close_button, "Close")) app.host.close(); // the keyboard's or Narrator's click
+```
+
+The window keeps the system's frame on the left, right and bottom, so DWM
+draws its border, rounded corners and shadow, and only the caption goes.
+`WM_NCHITTEST` is answered from the system's borders first, then a resize
+band the host keeps along the top, then the frame's regions, the last on
+top: a title bar is `HTCAPTION`, so Windows drags the window, maximizes it
+on a double click, opens the system menu on a right click and snaps it
+with Win+arrows; the maximize button is `HTMAXBUTTON`, so hovering it
+shows snap layouts; resize edges and grips are the `HT` code of their
+edge; and the interactive elements inside the title bar stay
+`HTCLIENT`. The host keeps a copy of up to 256 regions, in pixels, under a
+lock the window thread takes shared.
+
+Over the caption buttons the pointer still reaches zui, so they show
+hover and press. The host works them itself when a press and its release
+land on the same button, as Windows' own buttons, and ends the press with
+`pointer_cancel` rather than a release, so zui reports no click. An
+application acts on `clicked` only for the keyboard and Narrator, through
+`Host.minimize`, `Host.toggleMaximized` and `Host.close`, so each button
+is worked once. Maximized, the content starts below the edge of the
+monitor.
+
+```sh
+zig build title-bar                          # interactive window
+zig build title-bar -- --no-system-material  # the solid background Windows 10 shows
+zig build title-bar -- --check               # hit-test each part in a hidden window, then quit
+```
+
+`--check` hides the window, draws it twice, sends `WM_NCHITTEST` at each
+part as laid out, and exits 0 only when the title is `HTCAPTION`, the
+search field and the content `HTCLIENT`, and the buttons `HTMINBUTTON`,
+`HTMAXBUTTON` and `HTCLOSE`.
+
 ## The tour on it
 
 `zig build tour` runs [zui-sokol](https://github.com/AaronJClausen/zui-sokol)'s
@@ -338,6 +390,7 @@ under a second: the first frame arrives about 3 ms after connecting.
 | `zig build theme` | a window styled by a theme file, restyled when it changes |
 | `zig build accessible` | `zui_widgets` controls for Narrator and Accessibility Insights |
 | `zig build services` | every host service from buttons, each answer shown; `-- --check` runs it against the fake |
+| `zig build title-bar` | a title bar the application draws, which Windows still drags, snaps and resizes; `-- --check` hit-tests it hidden |
 | `zig build fmt` / `fmt-check` | format, or fail if a file is not formatted |
 
 CI checks the format, runs the tests on Windows, and on Linux under a

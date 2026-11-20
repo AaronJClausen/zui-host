@@ -154,11 +154,53 @@ pub const WS_MAXIMIZEBOX: DWORD = 0x00010000;
 pub const CW_USEDEFAULT: c_int = @bitCast(@as(u32, 0x80000000));
 pub const SW_SHOWNORMAL = 1;
 pub const GWLP_USERDATA = -21;
+pub const SWP_NOSIZE = 0x0001;
 pub const SWP_NOMOVE = 0x0002;
 pub const SWP_NOZORDER = 0x0004;
 pub const SWP_NOACTIVATE = 0x0010;
+pub const SWP_FRAMECHANGED = 0x0020;
+pub const SIZE_RESTORED = 0;
+pub const SIZE_MAXIMIZED = 2;
+pub const WM_SYSCOMMAND = 0x0112;
+pub const SC_MINIMIZE = 0xF020;
+pub const SC_MAXIMIZE = 0xF030;
+pub const SC_CLOSE = 0xF060;
+pub const SC_RESTORE = 0xF120;
+pub const SM_CYSIZEFRAME = 33;
+pub const SM_CXPADDEDBORDER = 92;
+
+pub const WM_NCCALCSIZE = 0x0083;
+pub const WM_NCHITTEST = 0x0084;
+pub const WM_NCMOUSEMOVE = 0x00A0;
+pub const WM_NCLBUTTONDOWN = 0x00A1;
+pub const WM_NCLBUTTONUP = 0x00A2;
+pub const WM_NCLBUTTONDBLCLK = 0x00A3;
+pub const WM_NCMOUSELEAVE = 0x02A2;
+
+pub const HTNOWHERE = 0;
 pub const HTCLIENT = 1;
+pub const HTCAPTION = 2;
+pub const HTMINBUTTON = 8;
+pub const HTMAXBUTTON = 9;
+pub const HTLEFT = 10;
+pub const HTRIGHT = 11;
+pub const HTTOP = 12;
+pub const HTTOPLEFT = 13;
+pub const HTTOPRIGHT = 14;
+pub const HTBOTTOM = 15;
+pub const HTBOTTOMLEFT = 16;
+pub const HTBOTTOMRIGHT = 17;
+pub const HTBORDER = 18;
+pub const HTCLOSE = 20;
 pub const TME_LEAVE = 0x00000002;
+pub const TME_NONCLIENT = 0x00000010;
+
+/// What `WM_NCCALCSIZE` points `lParam` at when `wParam` is true: the
+/// window's proposed rect first, which becomes its client rect.
+pub const NCCALCSIZE_PARAMS = extern struct {
+    rgrc: [3]RECT,
+    lppos: ?*anyopaque,
+};
 pub const MK_LBUTTON = 0x0001;
 pub const USER_DEFAULT_SCREEN_DPI = 96;
 pub const DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2: isize = -4;
@@ -328,6 +370,9 @@ pub extern "user32" fn SetCapture(hwnd: HWND) callconv(.winapi) ?HWND;
 pub extern "user32" fn ReleaseCapture() callconv(.winapi) BOOL;
 pub extern "user32" fn GetKeyState(virtual_key: c_int) callconv(.winapi) i16;
 pub extern "user32" fn ScreenToClient(hwnd: HWND, point: *POINT) callconv(.winapi) BOOL;
+pub extern "user32" fn GetWindowRect(hwnd: HWND, rect: *RECT) callconv(.winapi) BOOL;
+pub extern "user32" fn IsZoomed(hwnd: HWND) callconv(.winapi) BOOL;
+pub extern "user32" fn GetSystemMetricsForDpi(index: c_int, dpi: UINT) callconv(.winapi) c_int;
 pub extern "user32" fn ClientToScreen(hwnd: HWND, point: *POINT) callconv(.winapi) BOOL;
 pub extern "user32" fn GetFocus() callconv(.winapi) ?HWND;
 pub extern "user32" fn BeginPaint(hwnd: HWND, paint: *PAINTSTRUCT) callconv(.winapi) ?HDC;

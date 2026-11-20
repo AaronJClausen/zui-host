@@ -94,7 +94,7 @@ fn addTour(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builti
     check_step.dependOn(&tour.step);
 }
 
-/// The remote, material, HDR, theme, accessibility and services examples, which run
+/// The remote, material, HDR, theme, accessibility, services and title bar examples, which run
 /// only on the Windows host so far.
 fn addWindowsExamples(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, host_module: *std.Build.Module, zui_dependency: *std.Build.Dependency, check_step: *std.Build.Step) void {
     const app_module = zui_dependency.module("zui_app");
@@ -216,4 +216,24 @@ fn addWindowsExamples(b: *std.Build, target: std.Build.ResolvedTarget, optimize:
     if (b.args) |arguments| run_services.addArgs(arguments);
     b.step("services", "Call every host service from buttons, each answer shown (`-- --check` answers them through the host's fake and quits)").dependOn(&run_services.step);
     check_step.dependOn(&services.step);
+
+    const title_bar = b.addExecutable(.{
+        .name = "zui-host-title-bar",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("examples/title_bar.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "zui_host", .module = host_module },
+                .{ .name = "zui_app", .module = app_module },
+                .{ .name = "zui_widgets", .module = zui_dependency.module("zui_widgets") },
+                .{ .name = "zui_sokol", .module = zui_sokol_dependency.module("zui_sokol") },
+            },
+        }),
+    });
+    b.installArtifact(title_bar);
+    const run_title_bar = b.addRunArtifact(title_bar);
+    if (b.args) |arguments| run_title_bar.addArgs(arguments);
+    b.step("title-bar", "Draw the title bar in the window, which Windows still drags, snaps and resizes (`-- --check` hit-tests it hidden and quits)").dependOn(&run_title_bar.step);
+    check_step.dependOn(&title_bar.step);
 }

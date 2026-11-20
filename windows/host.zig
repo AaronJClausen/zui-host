@@ -9,6 +9,7 @@ pub const accessibility = @import("accessibility.zig");
 pub const services = @import("services.zig");
 pub const file_dialog = @import("file_dialog.zig");
 pub const menu = @import("menu.zig");
+pub const chrome = @import("chrome.zig");
 
 const W = std.unicode.utf8ToUtf16LeStringLiteral;
 
@@ -20,7 +21,9 @@ const W = std.unicode.utf8ToUtf16LeStringLiteral;
 /// contrast, animations, power, HDR headroom), lifecycle events from console control
 /// events, the session ending and the system sleeping, and dropped files;
 /// it sets the cursor and places the IME window; it reads and writes the
-/// clipboard, opens URLs, shows notifications, file dialogs and menus; it watches directories
+/// clipboard, opens URLs, shows notifications, file dialogs and menus; it
+/// leaves the title bar to the application when asked, answering the
+/// window manager from the frame's chrome regions; it watches directories
 /// for changes; it bridges `Frame.semantics()` to UI Automation, reporting
 /// what an assistive technology asks for as `action` events; and it waits
 /// for `nextFrame` on its wake, its input and a high-resolution timer.
@@ -37,7 +40,7 @@ const W = std.unicode.utf8ToUtf16LeStringLiteral;
 /// ```
 pub const Host = struct {
     pub const zui_surfaces: zui.SurfaceKinds = .initOne(.win32);
-    pub const zui_capabilities: zui.HostCapabilities = .{ .windows = .one, .system_material = true };
+    pub const zui_capabilities: zui.HostCapabilities = .{ .windows = .one, .system_material = true, .custom_title_bar = true };
     /// `.scrgb_fp16` while the window's monitor runs in HDR, when the
     /// window was opened with it.
     pub const zui_output_formats: zui.OutputFormats = .initMany(&.{ .sdr, .scrgb_fp16 });
@@ -132,7 +135,10 @@ pub const Host = struct {
     /// dialog, and answers the item chosen or `.canceled`; one still open at
     /// `deinit` is closed and not answered. `setBar` replaces the window's
     /// menu bar, or removes it given no items, and answers each item chosen
-    /// from it; the client area shrinks by the bar's height.
+    /// from it; the client area shrinks by the bar's height. A window with a
+    /// custom title bar has no room for a native bar, which would sit
+    /// hidden under the drawn one, so there `setBar` is `error.Unavailable`
+    /// and the application draws its menus in its title bar.
     pub const zuiMenus = struct {
         pub fn popup(host: *Host, window: zui.WindowId, request: zui.ServiceRequest, items: []const zui.MenuItem, position: [2]f32, sink: zui.ServiceSink) zui.ServiceError!void {
             std.debug.assert(window == .main);
@@ -149,6 +155,7 @@ pub const Host = struct {
 
         pub fn setBar(host: *Host, window: zui.WindowId, request: zui.ServiceRequest, items: []const zui.MenuItem, sink: zui.ServiceSink) zui.ServiceError!void {
             std.debug.assert(window == .main);
+            if (host.custom_title_bar) return error.Unavailable;
             try host.services.claimMenuBar(request, items, sink);
             if (win32.PostMessageW(host.hwnd, wm_set_menu_bar, 0, 0) == 0) {
                 host.services.releaseMenuBar();
@@ -194,6 +201,9 @@ pub const Host = struct {
     terminate_delivered: bool,
     /// What the last poll converted pixels to layout units by.
     pixels_per_unit: f32,
+    /// The window was opened with `title_bar = .custom`.
+    custom_title_bar: bool,
+    chrome_snapshot: chrome.ChromeSnapshot,
 
     lock: win32.SRWLOCK,
     /// Shared with the window thread, under `lock`.
@@ -294,6 +304,10 @@ pub const Host = struct {
         monitor: ?win32.HMONITOR = null,
         title: [256:0]u16 = @splat(0),
         title_len: usize = 0,
+        tracking_non_client: bool = false,
+        /// The caption button a press began on, as its hit-test code; its
+        /// release on the same button works it.
+        pressed_caption_button: ?usize = null,
     };
 
     pub fn init(self: *Host, io: std.Io, options: zui.WindowOptions) !void {
@@ -318,6 +332,8 @@ pub const Host = struct {
             .was_low_on_memory = false,
             .terminate_delivered = false,
             .pixels_per_unit = 1,
+            .custom_title_bar = options.title_bar == .custom,
+            .chrome_snapshot = .{},
             .lock = .{},
             .inbox = .{},
             .requests = .{},
@@ -494,10 +510,32 @@ pub const Host = struct {
         return dropped;
     }
 
+    /// Keeps up to `chrome.ChromeSnapshot.capacity` of `regions`, in
+    /// physical pixels, for the window thread to answer `WM_NCHITTEST` from;
+    /// the rest are cut from the end and counted in `chrome_snapshot.dropped`.
+    /// A window opened with a native title bar keeps none.
+    pub fn zuiChromeRegions(self: *Host, window: zui.WindowId, regions: []const zui.ChromeRegion) void {
+        std.debug.assert(window == .main);
+        if (!self.custom_title_bar) return;
+        self.chrome_snapshot.publish(regions, self.pixels_per_unit);
+    }
+
     /// Closes the window as its close button does: the next poll returns
     /// false.
     pub fn close(self: *Host) void {
         _ = win32.SendMessageW(self.hwnd, win32.WM_CLOSE, 0, 0);
+    }
+
+    /// Minimizes the window as its minimize button does, for an application
+    /// that works its drawn caption buttons from `clicked`, as the keyboard
+    /// and Narrator press them.
+    pub fn minimize(self: *Host) void {
+        _ = win32.PostMessageW(self.hwnd, win32.WM_SYSCOMMAND, win32.SC_MINIMIZE, 0);
+    }
+
+    /// Maximizes the window, or restores it when it is maximized.
+    pub fn toggleMaximized(self: *Host) void {
+        _ = win32.PostMessageW(self.hwnd, win32.WM_SYSCOMMAND, if (win32.IsZoomed(self.hwnd) != 0) win32.SC_RESTORE else win32.SC_MAXIMIZE, 0);
     }
 
     /// The window's client area, in physical pixels.
@@ -587,6 +625,7 @@ pub const Host = struct {
         };
         _ = win32.AdjustWindowRectExForDpi(&frame, style, 0, 0, dpi);
         _ = win32.SetWindowPos(hwnd, null, 0, 0, frame.right - frame.left, frame.bottom - frame.top, win32.SWP_NOMOVE | win32.SWP_NOZORDER | win32.SWP_NOACTIVATE);
+        if (self.custom_title_bar) dropCaption(hwnd, .{ frame.right - frame.left, frame.bottom - frame.top }, options.size, dpi);
         self.recordClientSize(hwnd, dpi);
 
         win32.DragAcceptFiles(hwnd, 1);
@@ -595,6 +634,23 @@ pub const Host = struct {
         self.reportEnvironment(hwnd, true);
         if (options.visible) _ = win32.ShowWindow(hwnd, win32.SW_SHOWNORMAL);
         return hwnd;
+    }
+
+    /// Has Windows ask `WM_NCCALCSIZE` again, which now leaves out the
+    /// caption, then sizes the window so its client area is `size` again.
+    fn dropCaption(hwnd: win32.HWND, window_size: [2]i32, size: [2]u32, dpi: u32) void {
+        const unchanged = win32.SWP_NOMOVE | win32.SWP_NOZORDER | win32.SWP_NOACTIVATE;
+        _ = win32.SetWindowPos(hwnd, null, 0, 0, 0, 0, unchanged | win32.SWP_NOSIZE | win32.SWP_FRAMECHANGED);
+        var client: win32.RECT = .{};
+        _ = win32.GetClientRect(hwnd, &client);
+        const wanted: [2]i32 = .{ @intCast(size[0] * dpi / win32.USER_DEFAULT_SCREEN_DPI), @intCast(size[1] * dpi / win32.USER_DEFAULT_SCREEN_DPI) };
+        _ = win32.SetWindowPos(hwnd, null, 0, 0, window_size[0] + wanted[0] - client.right, window_size[1] + wanted[1] - client.bottom, unchanged);
+    }
+
+    /// The height of the resize band a window keeps at its top without a
+    /// caption, as the system's frame is on its other sides.
+    fn resizeBandThickness(dpi: u32) i32 {
+        return win32.GetSystemMetricsForDpi(win32.SM_CYSIZEFRAME, dpi) + win32.GetSystemMetricsForDpi(win32.SM_CXPADDEDBORDER, dpi);
     }
 
     fn windowStyle(options: zui.WindowOptions) win32.DWORD {
@@ -639,7 +695,43 @@ pub const Host = struct {
                 win32.PostQuitMessage(0);
                 return 0;
             },
-            win32.WM_SIZE => self.recordClientSize(hwnd, win32.GetDpiForWindow(hwnd)),
+            win32.WM_SIZE => {
+                self.recordClientSize(hwnd, win32.GetDpiForWindow(hwnd));
+                if (wparam == win32.SIZE_MAXIMIZED or wparam == win32.SIZE_RESTORED) self.reportMaximized(wparam == win32.SIZE_MAXIMIZED);
+            },
+            win32.WM_NCCALCSIZE => if (self.custom_title_bar and wparam != 0) return calculateClientWithoutCaption(hwnd, lparam),
+            win32.WM_NCHITTEST => if (self.custom_title_bar) return self.hitTestNonClient(hwnd, lparam),
+            win32.WM_NCMOUSEMOVE => if (self.custom_title_bar and !chrome.isResizeCode(@bitCast(wparam))) {
+                if (!self.window.tracking_non_client) {
+                    var track: win32.TRACKMOUSEEVENT = .{ .dwFlags = win32.TME_LEAVE | win32.TME_NONCLIENT, .hwndTrack = hwnd };
+                    self.window.tracking_non_client = win32.TrackMouseEvent(&track) != 0;
+                }
+                self.deliver(.{ .pointer_move = .{ .pointer = nonClientMouse(hwnd, lparam, at) } });
+            },
+            win32.WM_NCMOUSELEAVE => if (self.custom_title_bar) {
+                self.window.tracking_non_client = false;
+                if (self.window.pressed_caption_button != null) {
+                    self.window.pressed_caption_button = null;
+                    self.deliver(.{ .pointer_cancel = .mouse });
+                }
+                if (!self.window.tracking_mouse) self.deliver(.{ .pointer_leave = .mouse });
+            },
+            win32.WM_NCLBUTTONDOWN, win32.WM_NCLBUTTONDBLCLK => if (self.custom_title_bar and chrome.isCaptionButtonCode(wparam)) {
+                self.window.pressed_caption_button = wparam;
+                self.deliver(.{ .pointer_down = .{ .pointer = nonClientMouse(hwnd, lparam, at), .button = .primary } });
+                return 0;
+            },
+            // The press ends as a cancel, not a release: the host works the
+            // button, so zui shows the press but reports no click, and an
+            // application acting on `clicked` for the keyboard and assistive
+            // technologies never works it twice.
+            win32.WM_NCLBUTTONUP => if (self.custom_title_bar and chrome.isCaptionButtonCode(wparam)) {
+                self.deliver(.{ .pointer_cancel = .mouse });
+                const pressed = self.window.pressed_caption_button;
+                self.window.pressed_caption_button = null;
+                if (pressed == wparam) workCaptionButton(hwnd, wparam);
+                return 0;
+            },
             win32.WM_MOVE => if (win32.MonitorFromWindow(hwnd, win32.MONITOR_DEFAULTTONEAREST) != self.window.monitor) self.reportDisplayColor(hwnd, false),
             win32.WM_DISPLAYCHANGE => self.reportDisplayColor(hwnd, false),
             win32.WM_DPICHANGED => {
@@ -794,6 +886,72 @@ pub const Host = struct {
         return .{ .id = .mouse, .kind = .mouse, .position = .{ @floatFromInt(point[0]), @floatFromInt(point[1]) }, .at = at };
     }
 
+    /// A non-client mouse message carries a screen point; zui takes client
+    /// pixels.
+    fn nonClientMouse(hwnd: win32.HWND, lparam: win32.LPARAM, at: zui.Instant) zui.Pointer {
+        const screen = win32.pointFromLparam(lparam);
+        var point: win32.POINT = .{ .x = screen[0], .y = screen[1] };
+        _ = win32.ScreenToClient(hwnd, &point);
+        return .{ .id = .mouse, .kind = .mouse, .position = .{ @floatFromInt(point.x), @floatFromInt(point.y) }, .at = at };
+    }
+
+    /// The system's frame on the left, right and bottom stays, so DWM keeps
+    /// the border, the rounded corners and the shadow; only the caption
+    /// goes. A maximized window reaches past its monitor by the frame's
+    /// thickness, which the client top leaves out.
+    fn calculateClientWithoutCaption(hwnd: win32.HWND, lparam: win32.LPARAM) win32.LRESULT {
+        const params: *win32.NCCALCSIZE_PARAMS = @ptrFromInt(@as(usize, @bitCast(lparam)));
+        const proposed_top = params.rgrc[0].top;
+        const answered = win32.DefWindowProcW(hwnd, win32.WM_NCCALCSIZE, 1, lparam);
+        if (answered != 0) return answered;
+        params.rgrc[0].top = proposed_top;
+        if (win32.IsZoomed(hwnd) != 0) params.rgrc[0].top += resizeBandThickness(win32.GetDpiForWindow(hwnd));
+        return 0;
+    }
+
+    /// The system's own borders first, then the top resize band the caption
+    /// left behind, then the frame's chrome regions, the last on top.
+    fn hitTestNonClient(self: *Host, hwnd: win32.HWND, lparam: win32.LPARAM) win32.LRESULT {
+        const system_answer = win32.DefWindowProcW(hwnd, win32.WM_NCHITTEST, 0, lparam);
+        if (chrome.isResizeCode(system_answer)) return system_answer;
+        const screen = win32.pointFromLparam(lparam);
+        var point: win32.POINT = .{ .x = screen[0], .y = screen[1] };
+        _ = win32.ScreenToClient(hwnd, &point);
+        const resizable = self.window.options.resizable;
+        if (resizable and win32.IsZoomed(hwnd) == 0) {
+            const band = resizeBandThickness(win32.GetDpiForWindow(hwnd));
+            if (point.y >= 0 and point.y < band) {
+                var client: win32.RECT = .{};
+                _ = win32.GetClientRect(hwnd, &client);
+                if (point.x < band) return win32.HTTOPLEFT;
+                if (point.x >= client.right - band) return win32.HTTOPRIGHT;
+                return win32.HTTOP;
+            }
+        }
+        const kind = self.chrome_snapshot.kindAt(point) orelse return win32.HTCLIENT;
+        const code = chrome.hitTestCode(kind);
+        if (!resizable and chrome.isResizeCode(code)) return win32.HTCLIENT;
+        return code;
+    }
+
+    /// Through `WM_SYSCOMMAND`, as the system's own buttons, so Windows
+    /// animates it and a close arrives as `WM_CLOSE`.
+    fn workCaptionButton(hwnd: win32.HWND, code: usize) void {
+        const command: usize = switch (code) {
+            win32.HTMINBUTTON => win32.SC_MINIMIZE,
+            win32.HTMAXBUTTON => if (win32.IsZoomed(hwnd) != 0) win32.SC_RESTORE else win32.SC_MAXIMIZE,
+            win32.HTCLOSE => win32.SC_CLOSE,
+            else => return,
+        };
+        _ = win32.PostMessageW(hwnd, win32.WM_SYSCOMMAND, command, 0);
+    }
+
+    fn reportMaximized(self: *Host, maximized: bool) void {
+        if (maximized == self.window.environment.window_maximized) return;
+        self.window.environment.window_maximized = maximized;
+        self.deliver(.{ .environment = .{ .window_maximized = maximized } });
+    }
+
     fn buttonOf(message: win32.UINT) zui.Button {
         return switch (message) {
             win32.WM_RBUTTONDOWN, win32.WM_RBUTTONUP => .secondary,
@@ -945,6 +1103,12 @@ pub const Host = struct {
             reported.system_material = system_material;
             self.deliver(.{ .environment = .{ .system_material = system_material } });
         }
+        if (first) {
+            reported.custom_title_bar = self.custom_title_bar;
+            self.deliver(.{ .environment = .{ .custom_title_bar = self.custom_title_bar } });
+            reported.window_maximized = win32.IsZoomed(hwnd) != 0;
+            self.deliver(.{ .environment = .{ .window_maximized = reported.window_maximized } });
+        }
         self.reportDisplayColor(hwnd, first);
     }
 
@@ -1051,4 +1215,5 @@ test {
     _ = services;
     _ = file_dialog;
     _ = menu;
+    _ = chrome;
 }

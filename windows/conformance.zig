@@ -26,9 +26,28 @@ const HiddenWindow = struct {
     }
 
     fn openWithSemantics(self: *HiddenWindow, forced_scale: ?f32, semantics: zui.SemanticsCapacity) !void {
+        try self.openWith(forced_scale, .{ .title = "zui host suite", .size = .{ 320, 240 }, .visible = false, .semantics = semantics });
+    }
+
+    fn openWith(self: *HiddenWindow, forced_scale: ?f32, options: zui.WindowOptions) !void {
         self.window_host.forced_scale = forced_scale;
         self.window_host.service_fake = &self.service_fake;
-        try self.window_host.init(testing.io, .{ .title = "zui host suite", .size = .{ 320, 240 }, .visible = false, .semantics = semantics });
+        try self.window_host.init(testing.io, options);
+    }
+
+    fn openWithCustomTitleBar(self: *HiddenWindow, forced_scale: ?f32) !void {
+        try self.openWith(forced_scale, .{ .title = "zui host suite", .size = .{ 320, 240 }, .visible = false, .title_bar = .custom });
+    }
+
+    /// A point in client pixels as a mouse message's screen `lParam`.
+    fn screenLparam(self: *HiddenWindow, client_point: [2]i32) win32.LPARAM {
+        var point: win32.POINT = .{ .x = client_point[0], .y = client_point[1] };
+        _ = win32.ClientToScreen(self.window_host.hwnd, &point);
+        return win32.lparamFromPoint(@intCast(point.x), @intCast(point.y));
+    }
+
+    fn hitTest(self: *HiddenWindow, client_point: [2]i32) win32.LRESULT {
+        return win32.SendMessageW(self.window_host.hwnd, win32.WM_NCHITTEST, 0, self.screenLparam(client_point));
     }
 
     fn close(self: *HiddenWindow) void {
@@ -1266,4 +1285,189 @@ test "through UI Automation a dialog closes, an element shows its menu, and a he
     try testing.expect(try dialog.closeWindow());
     try expectAction(&window.window_host, &polled, .{ .target = dialog_id, .action = .dismiss });
     try testing.expect(!try reset.closeWindow());
+}
+
+fn reportedEnvironment(polled: *const Polled) zui.Environment {
+    var environment: zui.Environment = .{};
+    for (polled.builder.events()) |event| if (event == .environment) environment.apply(event.environment);
+    return environment;
+}
+
+test "the host passes zui's host suite on a window with a custom title bar" {
+    var harness: MessageHarness = .{};
+    try harness.window.openWith(1, .{ .title = "zui host suite", .size = .{ 320, 240 }, .visible = false, .semantics = .{ .nodes = 8, .text_bytes = 64 }, .title_bar = .custom });
+    defer harness.window.close();
+    try zui_testing.expectHostConforms(Host, &harness, .{ .io = testing.io });
+}
+
+test "a custom title bar leaves out the caption, keeps the client size asked for, and is reported" {
+    var window: HiddenWindow = .{};
+    try window.openWithCustomTitleBar(1);
+    defer window.close();
+    const hwnd = window.window_host.hwnd;
+    var window_rect: win32.RECT = .{};
+    _ = win32.GetWindowRect(hwnd, &window_rect);
+    var client_origin: win32.POINT = .{};
+    _ = win32.ClientToScreen(hwnd, &client_origin);
+    try testing.expectEqual(window_rect.top, client_origin.y);
+
+    var client: win32.RECT = .{};
+    _ = win32.GetClientRect(hwnd, &client);
+    const dpi = win32.GetDpiForWindow(hwnd);
+    try testing.expectEqual(@as(i32, @intCast(320 * dpi / win32.USER_DEFAULT_SCREEN_DPI)), client.right);
+    try testing.expectEqual(@as(i32, @intCast(240 * dpi / win32.USER_DEFAULT_SCREEN_DPI)), client.bottom);
+
+    var polled: Polled = .{};
+    polled.init();
+    _ = polled.poll(&window.window_host);
+    const environment = reportedEnvironment(&polled);
+    try testing.expect(environment.custom_title_bar);
+    try testing.expect(!environment.window_maximized);
+}
+
+test "a native title bar is reported as the system's, keeps no chrome, and its hit test is the system's" {
+    var window: HiddenWindow = .{};
+    try window.open(1);
+    defer window.close();
+    var polled: Polled = .{};
+    polled.init();
+    _ = polled.poll(&window.window_host);
+    try testing.expect(!reportedEnvironment(&polled).custom_title_bar);
+
+    var regions = [_]zui.ChromeRegion{.{ .id = 1, .bounds = .{ .width = 320, .height = 240 }, .kind = .close_button }};
+    window.window_host.zuiChromeRegions(.main, &regions);
+    try testing.expectEqual(@as(usize, 0), window.window_host.chrome_snapshot.count);
+    try testing.expectEqual(@as(win32.LRESULT, win32.HTCAPTION), window.hitTest(.{ 100, -10 }));
+    try testing.expectEqual(@as(win32.LRESULT, win32.HTCLIENT), window.hitTest(.{ 100, 100 }));
+}
+
+const title_bar_height = 20;
+
+/// A title bar across the top, a search field in it, three caption buttons
+/// at its right and a resize grip in the bottom-right corner, in layout
+/// units for a viewport of `width` by `height`.
+fn titleBarRegions(width: f32, height: f32) [6]zui.ChromeRegion {
+    return .{
+        .{ .id = 1, .bounds = .{ .width = width, .height = title_bar_height }, .kind = .title_bar },
+        .{ .id = 2, .bounds = .{ .x = 20, .y = 2, .width = 40, .height = 16 }, .kind = .client },
+        .{ .id = 3, .bounds = .{ .x = width - 69, .width = 23, .height = title_bar_height }, .kind = .minimize_button },
+        .{ .id = 4, .bounds = .{ .x = width - 46, .width = 23, .height = title_bar_height }, .kind = .maximize_button },
+        .{ .id = 5, .bounds = .{ .x = width - 23, .width = 23, .height = title_bar_height }, .kind = .close_button },
+        .{ .id = 6, .bounds = .{ .x = width - 8, .y = height - 8, .width = 8, .height = 8 }, .kind = .resize_bottom_right },
+    };
+}
+
+/// A point inside `region`, below the top resize band, in client pixels at
+/// `scale`.
+fn insideInPixels(region: zui.ChromeRegion, scale: f32) [2]i32 {
+    const bounds = region.bounds;
+    return .{ @intFromFloat((bounds.x + bounds.width / 2) * scale), @intFromFloat((bounds.y + bounds.height * 0.75) * scale) };
+}
+
+/// A window with a custom title bar, polled once and handed
+/// `titleBarRegions` for its viewport.
+const TitleBarWindow = struct {
+    window: HiddenWindow = .{},
+    polled: Polled = .{},
+    regions: [6]zui.ChromeRegion = undefined,
+
+    fn open(self: *TitleBarWindow, scale: f32) !void {
+        try self.window.openWithCustomTitleBar(scale);
+        self.polled.init();
+        _ = self.polled.poll(&self.window.window_host);
+        const viewport = self.polled.builder.params.viewport;
+        self.regions = titleBarRegions(viewport[0], viewport[1]);
+        var handed = self.regions;
+        self.window.window_host.zuiChromeRegions(.main, &handed);
+        @memset(std.mem.sliceAsBytes(&handed), 0xaa);
+    }
+
+    fn close(self: *TitleBarWindow) void {
+        self.window.close();
+    }
+};
+
+test "the window manager is answered from a copy of the chrome regions at the window's scale, after the system's borders and the top band" {
+    const scale = 2;
+    var titled: TitleBarWindow = .{};
+    try titled.open(scale);
+    defer titled.close();
+    const window = &titled.window;
+    const regions = &titled.regions;
+
+    try testing.expectEqual(@as(win32.LRESULT, win32.HTCAPTION), window.hitTest(.{ 70 * scale, 15 * scale }));
+    try testing.expectEqual(@as(win32.LRESULT, win32.HTCLIENT), window.hitTest(insideInPixels(regions[1], scale)));
+    try testing.expectEqual(@as(win32.LRESULT, win32.HTMINBUTTON), window.hitTest(insideInPixels(regions[2], scale)));
+    try testing.expectEqual(@as(win32.LRESULT, win32.HTMAXBUTTON), window.hitTest(insideInPixels(regions[3], scale)));
+    try testing.expectEqual(@as(win32.LRESULT, win32.HTCLOSE), window.hitTest(insideInPixels(regions[4], scale)));
+    try testing.expectEqual(@as(win32.LRESULT, win32.HTBOTTOMRIGHT), window.hitTest(insideInPixels(regions[5], scale)));
+    try testing.expectEqual(@as(win32.LRESULT, win32.HTCLIENT), window.hitTest(.{ 100 * scale, 60 * scale }));
+
+    var client: win32.RECT = .{};
+    _ = win32.GetClientRect(window.window_host.hwnd, &client);
+    try testing.expectEqual(@as(win32.LRESULT, win32.HTTOP), window.hitTest(.{ @divTrunc(client.right, 2), 1 }));
+    try testing.expectEqual(@as(win32.LRESULT, win32.HTLEFT), window.hitTest(.{ -2, @divTrunc(client.bottom, 2) }));
+    try testing.expectEqual(@as(win32.LRESULT, win32.HTRIGHT), window.hitTest(.{ client.right + 1, @divTrunc(client.bottom, 2) }));
+    try testing.expectEqual(@as(win32.LRESULT, win32.HTBOTTOM), window.hitTest(.{ @divTrunc(client.right, 2), client.bottom + 1 }));
+}
+
+test "the pointer over a caption button reaches zui at its client point, and leaving the window ends its hover" {
+    const scale = 2;
+    var titled: TitleBarWindow = .{};
+    try titled.open(scale);
+    defer titled.close();
+    const window = &titled.window;
+
+    const maximize = insideInPixels(titled.regions[3], scale);
+    window.send(win32.WM_NCMOUSEMOVE, win32.HTMAXBUTTON, window.screenLparam(maximize));
+    _ = titled.polled.poll(&window.window_host);
+    const moved = titled.polled.find(.pointer_move) orelse return error.MoveNotDelivered;
+    try testing.expectApproxEqAbs(@as(f32, @floatFromInt(maximize[0])) / scale, moved.pointer.position[0], 0.01);
+    try testing.expectApproxEqAbs(@as(f32, @floatFromInt(maximize[1])) / scale, moved.pointer.position[1], 0.01);
+
+    window.send(win32.WM_NCMOUSELEAVE, 0, 0);
+    _ = titled.polled.poll(&window.window_host);
+    try testing.expect(titled.polled.find(.pointer_leave) != null);
+}
+
+test "a press on the drawn close button reaches zui and its release cancels it, so zui sees no click, then the host closes the window as the system's button does" {
+    var titled: TitleBarWindow = .{};
+    try titled.open(1);
+    defer titled.close();
+    const window = &titled.window;
+    const polled = &titled.polled;
+
+    const close_point = window.screenLparam(insideInPixels(titled.regions[4], 1));
+    window.send(win32.WM_NCLBUTTONDOWN, win32.HTCLOSE, close_point);
+    window.send(win32.WM_NCLBUTTONUP, win32.HTCLOSE, close_point);
+    try testing.expect(polled.poll(&window.window_host));
+    try testing.expect(polled.find(.pointer_down) != null);
+    try testing.expect(polled.find(.pointer_cancel) != null);
+    try testing.expect(polled.find(.pointer_up) == null);
+    for (0..200) |_| {
+        if (!polled.poll(&window.window_host)) return;
+        try testing.io.sleep(.fromMilliseconds(5), .awake);
+    }
+    return error.WindowNotClosed;
+}
+
+test "a release on another caption button than the press works neither" {
+    var titled: TitleBarWindow = .{};
+    try titled.open(1);
+    defer titled.close();
+    const window = &titled.window;
+
+    window.send(win32.WM_NCLBUTTONDOWN, win32.HTCLOSE, window.screenLparam(insideInPixels(titled.regions[4], 1)));
+    window.send(win32.WM_NCLBUTTONUP, win32.HTMINBUTTON, window.screenLparam(insideInPixels(titled.regions[2], 1)));
+    try testing.io.sleep(.fromMilliseconds(50), .awake);
+    try testing.expect(titled.polled.poll(&window.window_host));
+    try testing.expect(win32.IsZoomed(window.window_host.hwnd) == 0);
+}
+
+test "under a custom title bar a native menu bar is unavailable, since the drawn bar would hide it" {
+    var window: HiddenWindow = .{};
+    try window.openWithCustomTitleBar(1);
+    defer window.close();
+    var replies: Replies = .{};
+    try testing.expectError(error.Unavailable, Host.zuiMenus.setBar(&window.window_host, .main, .of("file menu"), &.{.{ .id = @enumFromInt(1), .label = "File" }}, .of(&replies)));
 }
