@@ -341,6 +341,29 @@ part as laid out, and exits 0 only when the title is `HTCAPTION`, the
 search field and the content `HTCLIENT`, and the buttons `HTMINBUTTON`,
 `HTMAXBUTTON` and `HTCLOSE`.
 
+## Many windows
+
+`zig build many-windows` runs one application in two windows through
+`zui_app`: each declares its own UI in a context of its own and counts
+its own clicks, and a count shared by both is published into each
+window's `zui_async.Latest(u32)`. Any window opens another or closes
+itself, and the run ends with the last. zui-sokol draws each through its
+own swapchain on one device.
+
+```sh
+zig build many-windows                         # interactive windows
+zig build many-windows -- --check              # open, click and close hidden windows, then quit
+zig build many-windows -- --measure-idle       # CPU time of two idle windows over 10 s
+zig build many-windows -- --measure-animation  # frame rates of one, then two, windows animating
+```
+
+`--check` opens a hidden second window, clicks its buttons through the
+host, and exits 0 only when the second counts its own click, both show
+the shared count, the first counted none, and the first draws on after
+the second closes. On a 144 Hz monitor, two windows animating at once
+each hold 143 frames a second, as one alone holds 144, and two idle
+windows use no CPU.
+
 ## The tour on it
 
 `zig build tour` runs [zui-sokol](https://github.com/AaronJClausen/zui-sokol)'s
@@ -402,6 +425,7 @@ under a second: the first frame arrives about 3 ms after connecting.
 | `zig build accessible` | `zui_widgets` controls for Narrator and Accessibility Insights |
 | `zig build services` | every host service from buttons, each answer shown; `-- --check` runs it against the fake |
 | `zig build title-bar` | a title bar the application draws, which Windows still drags, snaps and resizes; `-- --check` hit-tests it hidden |
+| `zig build many-windows` | one application in two windows, each with its own UI; `-- --check` clicks and closes them hidden |
 | `zig build fmt` / `fmt-check` | format, or fail if a file is not formatted |
 
 CI checks the format, runs the tests on Windows, and on Linux under a

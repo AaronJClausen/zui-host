@@ -94,7 +94,7 @@ fn addTour(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builti
     check_step.dependOn(&tour.step);
 }
 
-/// The remote, material, HDR, theme, accessibility, services and title bar examples, which run
+/// The remote, material, HDR, theme, accessibility, services, title bar and many-windows examples, which run
 /// only on the Windows host so far.
 fn addWindowsExamples(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, host_module: *std.Build.Module, zui_dependency: *std.Build.Dependency, check_step: *std.Build.Step) void {
     const app_module = zui_dependency.module("zui_app");
@@ -236,4 +236,25 @@ fn addWindowsExamples(b: *std.Build, target: std.Build.ResolvedTarget, optimize:
     if (b.args) |arguments| run_title_bar.addArgs(arguments);
     b.step("title-bar", "Draw the title bar in the window, which Windows still drags, snaps and resizes (`-- --check` hit-tests it hidden and quits)").dependOn(&run_title_bar.step);
     check_step.dependOn(&title_bar.step);
+
+    const many_windows = b.addExecutable(.{
+        .name = "zui-host-many-windows",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("examples/many_windows.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "zui_host", .module = host_module },
+                .{ .name = "zui_app", .module = app_module },
+                .{ .name = "zui_async", .module = zui_dependency.module("zui_async") },
+                .{ .name = "zui_widgets", .module = zui_dependency.module("zui_widgets") },
+                .{ .name = "zui_sokol", .module = zui_sokol_dependency.module("zui_sokol") },
+            },
+        }),
+    });
+    b.installArtifact(many_windows);
+    const run_many_windows = b.addRunArtifact(many_windows);
+    if (b.args) |arguments| run_many_windows.addArgs(arguments);
+    b.step("many-windows", "Run one application in two windows, each with its own UI (`-- --check` clicks and closes them hidden and quits; `--measure-idle`, `--measure-animation`)").dependOn(&run_many_windows.step);
+    check_step.dependOn(&many_windows.step);
 }
