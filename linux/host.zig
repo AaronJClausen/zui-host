@@ -6,6 +6,8 @@ pub const xkb = @import("xkb.zig");
 pub const keys = @import("keys.zig");
 pub const dbus = @import("dbus.zig");
 pub const desktop_bus = @import("desktop_bus.zig");
+pub const data_device = @import("data_device.zig");
+pub const file_watch = @import("file_watch.zig");
 
 const Proxy = wayland.Proxy;
 
@@ -14,14 +16,17 @@ const Proxy = wayland.Proxy;
 /// loop to escape, so events are read and dispatched in `zuiPoll` and
 /// `zuiWait`.
 ///
-/// It reports the buffer scale the compositor prefers, the pointer, the
-/// wheel, keys through the compositor's keymap with their modifiers,
-/// evdev codes and repeats, typed text, focus and the close button; the
+/// It reports the scale the compositor prefers, fractional where it
+/// offers fractional scales and viewports, the pointer, the wheel, keys
+/// through the compositor's keymap with their modifiers, evdev codes and
+/// repeats, typed text, focus, files dropped and the close button; the
 /// environment the desktop reports over D-Bus (theme, contrast, reduced
 /// motion, power); and SIGINT, SIGTERM and SIGHUP as terminate requests
 /// and the system sleeping and waking as lifecycle events. It sets the
-/// cursor where the compositor offers cursor shapes, and waits for
-/// `nextFrame` on the display, the desktop's buses, a wake and a deadline.
+/// cursor where the compositor offers cursor shapes, reads and writes the
+/// clipboard, watches directories, and waits for `nextFrame` on the
+/// display, the desktop's buses, its transfers and watches, a wake and a
+/// deadline.
 ///
 /// `init` opens the window and `deinit` closes it; the host must not move
 /// in between, since the compositor's listeners and the signal handler
@@ -38,6 +43,34 @@ const Proxy = wayland.Proxy;
 pub const Host = struct {
     pub const zui_surfaces: zui.SurfaceKinds = .initOne(.wayland);
     pub const zui_capabilities: zui.HostCapabilities = .{ .windows = .one };
+
+    /// The clipboard's selection, as text. `write` offers it as UTF-8 to
+    /// any reader, up to `data_device.DataDevice.clipboard_text_capacity`
+    /// bytes. `read` answers from the host's wait once the selection's
+    /// owner has written it, with up to that many bytes, `""` when the
+    /// clipboard holds no text, or `.failed` when its owner takes longer
+    /// than `data_device.DataDevice.transfer_timeout_ns`. While no other
+    /// selection has been named since the last `write`, it answers that
+    /// text at once.
+    pub const zuiClipboard = struct {
+        pub fn write(host: *Host, text: []const u8) zui.ServiceError!void {
+            try host.data_device.writeSelection(host.globals.data_device_manager, text, host.latest_input_serial);
+            _ = wayland.wl_display_flush(host.display);
+        }
+
+        pub fn read(host: *Host, request: zui.ServiceRequest, sink: zui.ServiceSink) zui.ServiceError!void {
+            try host.data_device.readSelection(request, sink, host.zuiWaker());
+            _ = wayland.wl_display_flush(host.display);
+        }
+    };
+
+    /// Watches up to `file_watch.Watches.capacity` directories, each with
+    /// its subdirectories, until `deinit`, publishing from the host's wait.
+    pub const zuiFileWatch = struct {
+        pub fn watch(host: *Host, directory: []const u8, sink: zui.FileChangeSink) zui.FileWatchError!void {
+            return host.file_watches.start(directory, sink, host.zuiWaker());
+        }
+    };
 
     /// Layout units scrolled per notch of the mouse wheel.
     pub const wheel_step = 40;
@@ -59,6 +92,10 @@ pub const Host = struct {
     pointer: ?*Proxy,
     keyboard: ?*Proxy,
     cursor_shape_device: ?*Proxy,
+    /// Both null unless the compositor offers fractional scales and
+    /// viewports, which the host uses together.
+    fractional_scale: ?*Proxy,
+    viewport: ?*Proxy,
     xkb_context: *xkb.Context,
     keymap: ?*xkb.Keymap,
     key_state: ?*xkb.State,
@@ -72,21 +109,34 @@ pub const Host = struct {
     input_arrived: bool,
     closed: bool,
     configured: bool,
-    /// In surface coordinates, which are physical pixels over the buffer scale.
+    /// In surface coordinates, which are physical pixels over
+    /// `pixelsPerSurfaceCoordinate()`.
     surface_size: [2]u32,
     configured_size: ?[2]u32,
     buffer_scale: i32,
+    /// In 120ths, null until the compositor first prefers one; from then
+    /// on the buffer scale stays 1 and the viewport sizes the surface.
+    preferred_fractional_scale: ?u32,
+    /// The surface size the viewport was last given.
+    viewport_destination: ?[2]u32,
     /// What the last poll converted surface coordinates to layout units by.
     surface_coordinates_per_unit: f32,
 
     pointer_position: [2]f32,
     pointer_enter_serial: ?u32,
+    /// The serial of the last key, button or focus, which setting the
+    /// clipboard's selection names.
+    latest_input_serial: u32,
+    /// In surface coordinates.
+    drag_position: [2]f32,
     wheel_notches: [2]?i32,
     modifiers: zui.Modifiers,
     requests: zui.HostRequests,
     applied_cursor: ?zui.Cursor,
     key_repeat: KeyRepeat,
 
+    data_device: data_device.DataDevice,
+    file_watches: file_watch.Watches,
     desktop: desktop_bus.DesktopBus,
     desktop_settings: DesktopSettings,
     /// Null until `init` reports the whole environment.
@@ -104,6 +154,7 @@ pub const Host = struct {
 
     const event_capacity = 512;
     const text_capacity = 1024;
+    const path_capacity = 16 * 1024;
     const app_id = "zui";
     /// How long `init` waits for the desktop's settings, so the first frame
     /// has them; later answers arrive as changes.
@@ -146,6 +197,9 @@ pub const Host = struct {
         wm_base: ?*Proxy = null,
         seat: ?*Proxy = null,
         cursor_shape_manager: ?*Proxy = null,
+        data_device_manager: ?*Proxy = null,
+        viewporter: ?*Proxy = null,
+        fractional_scale_manager: ?*Proxy = null,
     };
 
     const Inbox = struct {
@@ -154,6 +208,8 @@ pub const Host = struct {
         event_count: usize = 0,
         text: [text_capacity]u8 = undefined,
         text_len: usize = 0,
+        paths: [path_capacity]u8 = undefined,
+        path_len: usize = 0,
         dropped_events: u32 = 0,
         dropped_bytes: u32 = 0,
 
@@ -185,6 +241,17 @@ pub const Host = struct {
             self.push(.{ .text = self.text[start..self.text_len] });
         }
 
+        /// One event for the local files a URI list names; none when it
+        /// names none that fit.
+        fn pushFilesDropped(self: *Inbox, position: [2]f32, uri_list: []const u8, at: zui.Instant) void {
+            const start = self.path_len;
+            const decoded = data_device.pathsFromUriList(uri_list, self.paths[start..]);
+            self.dropped_bytes +|= decoded.left_out_bytes;
+            if (decoded.len == 0) return;
+            self.path_len += decoded.len;
+            self.push(.{ .files_dropped = .{ .position = position, .path_list = self.paths[start..self.path_len], .at = at } });
+        }
+
         fn clear(self: *Inbox) void {
             self.* = .{};
         }
@@ -208,6 +275,8 @@ pub const Host = struct {
             .pointer = null,
             .keyboard = null,
             .cursor_shape_device = null,
+            .fractional_scale = null,
+            .viewport = null,
             .xkb_context = xkb.xkb_context_new(0) orelse return error.NoKeyboardContext,
             .keymap = null,
             .key_state = null,
@@ -219,14 +288,20 @@ pub const Host = struct {
             .surface_size = options.size,
             .configured_size = null,
             .buffer_scale = 1,
+            .preferred_fractional_scale = null,
+            .viewport_destination = null,
             .surface_coordinates_per_unit = 1,
             .pointer_position = .{ 0, 0 },
             .pointer_enter_serial = null,
+            .latest_input_serial = 0,
+            .drag_position = .{ 0, 0 },
             .wheel_notches = .{ null, null },
             .modifiers = .{},
             .requests = .{},
             .applied_cursor = null,
             .key_repeat = .{},
+            .data_device = .{ .io = io },
+            .file_watches = .{},
             .desktop = .{},
             .desktop_settings = .{},
             .reported_environment = null,
@@ -253,6 +328,8 @@ pub const Host = struct {
 
         self.surface = wayland.create(compositor, wayland.compositor_create_surface, &wayland.wl_surface_interface, wayland.wl_proxy_get_version(compositor), .{wayland.no_id}) orelse return error.NoSurface;
         wayland.addListener(self.surface, &surface_listener, self);
+        self.useFractionalScale();
+        self.openDataDevice();
         if (options.visible) {
             try self.giveToplevelRole(wm_base, options);
         } else {
@@ -292,11 +369,39 @@ pub const Host = struct {
         }
     }
 
+    fn useFractionalScale(self: *Host) void {
+        const manager = self.globals.fractional_scale_manager orelse return;
+        const viewporter = self.globals.viewporter orelse return;
+        const viewport = wayland.create(viewporter, wayland.viewporter_get_viewport, &wayland.viewport_interface, 1, .{ wayland.no_id, self.surface }) orelse return;
+        const fractional_scale = wayland.create(manager, wayland.fractional_scale_manager_get_fractional_scale, &wayland.fractional_scale_interface, 1, .{ wayland.no_id, self.surface }) orelse {
+            wayland.destroy(viewport, wayland.viewport_destroy);
+            return;
+        };
+        self.viewport = viewport;
+        self.fractional_scale = fractional_scale;
+        wayland.addListener(fractional_scale, &fractional_scale_listener, self);
+    }
+
+    fn openDataDevice(self: *Host) void {
+        const manager = self.globals.data_device_manager orelse return;
+        const seat = self.globals.seat orelse return;
+        const device = wayland.create(manager, wayland.data_device_manager_get_data_device, &wayland.wl_data_device_interface, wayland.wl_proxy_get_version(manager), .{ wayland.no_id, seat }) orelse return;
+        self.data_device.device = device;
+        wayland.addListener(device, &data_device_listener, self);
+    }
+
     /// Call after the renderer's `deinit`, whose EGL objects live on this
     /// display.
     pub fn deinit(self: *Host) void {
         self.restoreTerminationSignals();
         self.desktop.close();
+        self.file_watches.stopAll();
+        self.data_device.deinit();
+        if (self.globals.data_device_manager) |manager| wayland.wl_proxy_destroy(manager);
+        if (self.fractional_scale) |fractional_scale| wayland.destroy(fractional_scale, wayland.fractional_scale_destroy);
+        if (self.viewport) |viewport| wayland.destroy(viewport, wayland.viewport_destroy);
+        if (self.globals.fractional_scale_manager) |manager| wayland.destroy(manager, wayland.fractional_scale_manager_destroy);
+        if (self.globals.viewporter) |viewporter| wayland.destroy(viewporter, wayland.viewporter_destroy);
         self.releaseDevices(.{});
         if (self.toplevel) |toplevel| wayland.destroy(toplevel, wayland.xdg_toplevel_destroy);
         if (self.xdg_surface) |xdg_surface| wayland.destroy(xdg_surface, wayland.xdg_surface_destroy);
@@ -326,9 +431,11 @@ pub const Host = struct {
         self.readAvailableEvents();
         if (self.closed) return false;
 
-        const scale = self.forced_scale orelse @as(f32, @floatFromInt(self.buffer_scale));
-        const surface_coordinates_per_unit = scale * record.params.zoom / @as(f32, @floatFromInt(self.buffer_scale));
+        const pixels_per_surface_coordinate = self.pixelsPerSurfaceCoordinate();
+        const scale = self.forced_scale orelse pixels_per_surface_coordinate;
+        const surface_coordinates_per_unit = scale * record.params.zoom / pixels_per_surface_coordinate;
         self.surface_coordinates_per_unit = surface_coordinates_per_unit;
+        self.sizeViewport();
         record.begin(.{
             .now = self.now(),
             .viewport = .{ @as(f32, @floatFromInt(self.surface_size[0])) / surface_coordinates_per_unit, @as(f32, @floatFromInt(self.surface_size[1])) / surface_coordinates_per_unit },
@@ -339,6 +446,7 @@ pub const Host = struct {
             const converted = inLayoutUnits(queued, surface_coordinates_per_unit);
             switch (converted) {
                 .text => |text| record.appendText(text),
+                .files_dropped => |drop| record.appendFilesDropped(drop),
                 .lifecycle => |change| {
                     if (change == .terminate_requested) self.terminate_delivered = true;
                     record.append(converted);
@@ -359,6 +467,7 @@ pub const Host = struct {
             .pointer_down, .pointer_up => |*press| scalePosition(&press.pointer.position, surface_coordinates_per_unit),
             .pointer_move => |*move| scalePosition(&move.pointer.position, surface_coordinates_per_unit),
             .wheel => |*wheel| scalePosition(&wheel.position, surface_coordinates_per_unit),
+            .files_dropped => |*drop| scalePosition(&drop.position, surface_coordinates_per_unit),
             else => {},
         }
         return converted;
@@ -366,6 +475,26 @@ pub const Host = struct {
 
     fn scalePosition(position: *[2]f32, surface_coordinates_per_unit: f32) void {
         position.* = .{ position[0] / surface_coordinates_per_unit, position[1] / surface_coordinates_per_unit };
+    }
+
+    /// The buffer's physical pixels per surface coordinate: the fractional
+    /// scale once the compositor prefers one, the buffer scale until then.
+    /// The renderer sizes the buffer at the viewport times the scale,
+    /// which is the surface's size times this.
+    pub fn pixelsPerSurfaceCoordinate(self: *const Host) f32 {
+        if (self.preferred_fractional_scale) |scale_120ths| return @as(f32, @floatFromInt(scale_120ths)) / wayland.fractional_scale_denominator;
+        return @floatFromInt(self.buffer_scale);
+    }
+
+    /// At a fractional scale the buffer is drawn at physical pixels, so
+    /// the viewport gives the surface its size in surface coordinates; the
+    /// renderer's next commit applies it.
+    fn sizeViewport(self: *Host) void {
+        if (self.preferred_fractional_scale == null) return;
+        const viewport = self.viewport orelse return;
+        if (std.meta.eql(self.viewport_destination, @as(?[2]u32, self.surface_size))) return;
+        self.viewport_destination = self.surface_size;
+        wayland.send(viewport, wayland.viewport_set_destination, .{ @as(i32, @intCast(self.surface_size[0])), @as(i32, @intCast(self.surface_size[1])) });
     }
 
     /// Reads whatever the compositor and the desktop have sent, without
@@ -403,7 +532,8 @@ pub const Host = struct {
             if (self.input_arrived) return;
             const now_instant = self.now();
             if (frame_at) |instant| if (!now_instant.isBefore(instant)) return;
-            const timeout_ns: ?u64 = if (earlier(frame_at, self.nextRepeatAt())) |instant| instant.nanoseconds -| now_instant.nanoseconds else null;
+            const wake_at = earlier(earlier(frame_at, self.nextRepeatAt()), self.data_device.nextDeadline());
+            const timeout_ns: ?u64 = if (wake_at) |instant| instant.nanoseconds -| now_instant.nanoseconds else null;
             if (self.waitForEvents(timeout_ns) == .woken) return;
         }
     }
@@ -417,7 +547,8 @@ pub const Host = struct {
     const Waited = enum { events, woken, timed_out };
 
     /// Waits up to `timeout_ns` (forever for null) for the display, the
-    /// desktop's buses or a wake, then reads and dispatches what they sent.
+    /// desktop's buses, a transfer, a watch or a wake, then reads and
+    /// dispatches what they sent.
     fn waitForEvents(self: *Host, timeout_ns: ?u64) Waited {
         const display = self.display;
         while (wayland.wl_display_prepare_read(display) != 0) _ = wayland.wl_display_dispatch_pending(display);
@@ -427,12 +558,14 @@ pub const Host = struct {
         }
         _ = wayland.wl_display_flush(display);
         const bus_fds = self.desktop.descriptors();
+        const first_transfer = 5;
         var descriptors = [_]linux.pollfd{
             .{ .fd = wayland.wl_display_get_fd(display), .events = linux.POLL.IN, .revents = 0 },
             .{ .fd = self.wake_fd, .events = linux.POLL.IN, .revents = 0 },
             .{ .fd = bus_fds[0], .events = linux.POLL.IN, .revents = 0 },
             .{ .fd = bus_fds[1], .events = linux.POLL.IN, .revents = 0 },
-        };
+            .{ .fd = self.file_watches.descriptor(), .events = linux.POLL.IN, .revents = 0 },
+        } ++ self.data_device.descriptors();
         var timeout: linux.timespec = undefined;
         if (timeout_ns) |nanoseconds| {
             timeout = .{ .sec = @intCast(nanoseconds / std.time.ns_per_s), .nsec = @intCast(nanoseconds % std.time.ns_per_s) };
@@ -448,6 +581,16 @@ pub const Host = struct {
         }
         if (wayland.wl_display_dispatch_pending(display) < 0) self.closeAfterLostDisplay();
         if (polled and descriptors[2].revents | descriptors[3].revents != 0) self.desktop.receive(self);
+        if (polled and descriptors[4].revents != 0) self.file_watches.receive();
+        if (!polled) for (descriptors[first_transfer..]) |*descriptor| {
+            descriptor.revents = 0;
+        };
+        if (self.data_device.transfer(descriptors[first_transfer..])) |drop| {
+            self.inbox.dropped_bytes +|= drop.left_out_bytes;
+            self.inbox.pushFilesDropped(self.drag_position, drop.uri_list, self.now());
+            self.input_arrived = true;
+        }
+        _ = wayland.wl_display_flush(display);
         if (polled and descriptors[1].revents & linux.POLL.IN != 0) return .woken;
         return if (polled and ready > 0) .events else .timed_out;
     }
@@ -512,11 +655,53 @@ pub const Host = struct {
         self.input_arrived = true;
     }
 
+    /// Ignored once the compositor has preferred a fractional scale.
     pub fn onPreferredBufferScale(self: *Host, factor: i32) void {
+        if (self.preferred_fractional_scale != null) return;
         if (factor < 1 or factor == self.buffer_scale) return;
         self.buffer_scale = factor;
         if (wayland.wl_proxy_get_version(self.surface) >= 3) wayland.send(self.surface, wayland.surface_set_buffer_scale, .{factor});
         self.input_arrived = true;
+    }
+
+    /// In 120ths. The buffer scale returns to 1, since the buffer is then
+    /// drawn at physical pixels.
+    pub fn onPreferredFractionalScale(self: *Host, scale_120ths: u32) void {
+        if (scale_120ths == 0 or self.preferred_fractional_scale == scale_120ths) return;
+        if (self.buffer_scale != 1 and wayland.wl_proxy_get_version(self.surface) >= 3) wayland.send(self.surface, wayland.surface_set_buffer_scale, .{@as(i32, 1)});
+        self.buffer_scale = 1;
+        self.preferred_fractional_scale = scale_120ths;
+        self.input_arrived = true;
+    }
+
+    /// A drag entered the window, at `position` in surface coordinates;
+    /// one that offers a URI list is accepted.
+    pub fn onDragEnter(self: *Host, serial: u32, offer: ?*Proxy, position: [2]f32) void {
+        self.data_device.onDragEnter(serial, offer);
+        self.drag_position = position;
+    }
+
+    /// In surface coordinates.
+    pub fn onDragMotion(self: *Host, position: [2]f32) void {
+        self.drag_position = position;
+    }
+
+    /// The drag left without dropping.
+    pub fn onDragLeave(self: *Host) void {
+        self.data_device.onDragLeave();
+    }
+
+    /// The files arrive as `files_dropped`, at the drag's last position,
+    /// once the drag's source has written their URI list.
+    pub fn onDrop(self: *Host) void {
+        self.data_device.onDrop();
+    }
+
+    /// Reads a URI list from `read_fd` as if it had been dropped at the
+    /// drag's last position; a harness calls this as a drop's transfer
+    /// would. `read_fd` is then the host's to close.
+    pub fn receiveDropFrom(self: *Host, read_fd: i32) void {
+        self.data_device.receiveDropFrom(read_fd);
     }
 
     pub fn onPointerEnter(self: *Host, serial: u32, position: [2]f32) void {
@@ -577,6 +762,12 @@ pub const Host = struct {
         if (self.keymap) |old| xkb.xkb_keymap_unref(old);
         self.keymap = new_keymap;
         self.key_state = state;
+    }
+
+    /// The serial of the input event a clipboard write that follows
+    /// answers.
+    pub fn onInputSerial(self: *Host, serial: u32) void {
+        self.latest_input_serial = serial;
     }
 
     pub fn onKeyboardFocus(self: *Host, focused: bool) void {
@@ -864,6 +1055,9 @@ pub const Host = struct {
             .{ .interface = &wayland.xdg_wm_base_interface, .slot = &self.globals.wm_base, .highest_version = 1 },
             .{ .interface = &wayland.wl_seat_interface, .slot = &self.globals.seat, .highest_version = 5 },
             .{ .interface = &wayland.cursor_shape_manager_interface, .slot = &self.globals.cursor_shape_manager, .highest_version = 1 },
+            .{ .interface = &wayland.wl_data_device_manager_interface, .slot = &self.globals.data_device_manager, .highest_version = 3 },
+            .{ .interface = &wayland.viewporter_interface, .slot = &self.globals.viewporter, .highest_version = 1 },
+            .{ .interface = &wayland.fractional_scale_manager_interface, .slot = &self.globals.fractional_scale_manager, .highest_version = 1 },
         };
         for (wanted) |global| {
             if (global.slot.* != null or !std.mem.eql(u8, interface_name, std.mem.span(global.interface.name))) continue;
@@ -930,6 +1124,47 @@ pub const Host = struct {
 
     fn ignoreOutput(_: ?*anyopaque, _: ?*Proxy, _: ?*Proxy) callconv(.c) void {}
 
+    const fractional_scale_listener: wayland.FractionalScaleListener = .{
+        .preferred_scale = struct {
+            fn preferredScale(data: ?*anyopaque, _: ?*Proxy, scale_120ths: u32) callconv(.c) void {
+                hostFrom(data).onPreferredFractionalScale(scale_120ths);
+            }
+        }.preferredScale,
+    };
+
+    const data_device_listener: wayland.DataDeviceListener = .{
+        .data_offer = struct {
+            fn dataOffer(data: ?*anyopaque, _: ?*Proxy, offer: ?*Proxy) callconv(.c) void {
+                hostFrom(data).data_device.onDataOffer(offer.?);
+            }
+        }.dataOffer,
+        .enter = struct {
+            fn enter(data: ?*anyopaque, _: ?*Proxy, serial: u32, _: ?*Proxy, x: wayland.Fixed, y: wayland.Fixed, offer: ?*Proxy) callconv(.c) void {
+                hostFrom(data).onDragEnter(serial, offer, .{ wayland.fixedToFloat(x), wayland.fixedToFloat(y) });
+            }
+        }.enter,
+        .leave = struct {
+            fn leave(data: ?*anyopaque, _: ?*Proxy) callconv(.c) void {
+                hostFrom(data).onDragLeave();
+            }
+        }.leave,
+        .motion = struct {
+            fn motion(data: ?*anyopaque, _: ?*Proxy, _: u32, x: wayland.Fixed, y: wayland.Fixed) callconv(.c) void {
+                hostFrom(data).onDragMotion(.{ wayland.fixedToFloat(x), wayland.fixedToFloat(y) });
+            }
+        }.motion,
+        .drop = struct {
+            fn drop(data: ?*anyopaque, _: ?*Proxy) callconv(.c) void {
+                hostFrom(data).onDrop();
+            }
+        }.drop,
+        .selection = struct {
+            fn selection(data: ?*anyopaque, _: ?*Proxy, offer: ?*Proxy) callconv(.c) void {
+                hostFrom(data).data_device.onSelection(offer);
+            }
+        }.selection,
+    };
+
     const seat_listener: wayland.SeatListener = .{
         .capabilities = struct {
             fn capabilities(data: ?*anyopaque, seat: ?*Proxy, flags: u32) callconv(.c) void {
@@ -958,7 +1193,8 @@ pub const Host = struct {
             }
         }.motion,
         .button = struct {
-            fn button(data: ?*anyopaque, _: ?*Proxy, _: u32, _: u32, evdev_button: u32, state: u32) callconv(.c) void {
+            fn button(data: ?*anyopaque, _: ?*Proxy, serial: u32, _: u32, evdev_button: u32, state: u32) callconv(.c) void {
+                hostFrom(data).onInputSerial(serial);
                 hostFrom(data).onPointerButton(evdev_button, state == wayland.pointer_button_pressed);
             }
         }.button,
@@ -990,7 +1226,8 @@ pub const Host = struct {
             }
         }.keymap,
         .enter = struct {
-            fn enter(data: ?*anyopaque, _: ?*Proxy, _: u32, _: ?*Proxy, _: ?*wayland.Array) callconv(.c) void {
+            fn enter(data: ?*anyopaque, _: ?*Proxy, serial: u32, _: ?*Proxy, _: ?*wayland.Array) callconv(.c) void {
+                hostFrom(data).onInputSerial(serial);
                 hostFrom(data).onKeyboardFocus(true);
             }
         }.enter,
@@ -1000,7 +1237,8 @@ pub const Host = struct {
             }
         }.leave,
         .key = struct {
-            fn key(data: ?*anyopaque, _: ?*Proxy, _: u32, _: u32, evdev_code: u32, state: u32) callconv(.c) void {
+            fn key(data: ?*anyopaque, _: ?*Proxy, serial: u32, _: u32, evdev_code: u32, state: u32) callconv(.c) void {
+                hostFrom(data).onInputSerial(serial);
                 hostFrom(data).onKey(evdev_code, state == wayland.keyboard_key_pressed);
             }
         }.key,
@@ -1032,4 +1270,6 @@ test {
     _ = keys;
     _ = dbus;
     _ = desktop_bus;
+    _ = data_device;
+    _ = file_watch;
 }

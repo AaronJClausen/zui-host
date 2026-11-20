@@ -50,6 +50,7 @@ pub fn build(b: *std.Build) void {
     if (has_host) check_step.dependOn(&conformance_tests.step);
 
     if (has_host) addTour(b, target, optimize, host_module, zui_dependency, check_step);
+    if (has_host) addTheme(b, target, optimize, host_module, zui_dependency, check_step);
     if (windows) addWindowsExamples(b, target, optimize, host_module, zui_dependency, check_step);
 
     const formatted_paths: []const []const u8 = &.{ "build.zig", "build.zig.zon", "zui_host.zig", "windows", "linux", "examples" };
@@ -94,7 +95,32 @@ fn addTour(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builti
     check_step.dependOn(&tour.step);
 }
 
-/// The remote, material, HDR, theme, accessibility, services, title bar and many-windows examples, which run
+/// A window styled by a ZON file that the host's file watch reloads, on
+/// either host.
+fn addTheme(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, host_module: *std.Build.Module, zui_dependency: *std.Build.Dependency, check_step: *std.Build.Step) void {
+    const zui_sokol_dependency = b.lazyDependency("zui_sokol", .{ .target = target, .optimize = optimize }) orelse return;
+    const theme = b.addExecutable(.{
+        .name = "zui-host-theme",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("examples/theme.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "zui_host", .module = host_module },
+                .{ .name = "zui_async", .module = zui_dependency.module("zui_async") },
+                .{ .name = "zui_sokol", .module = zui_sokol_dependency.module("zui_sokol") },
+            },
+        }),
+    });
+    linkThroughLlvmOnLinux(theme);
+    b.installArtifact(theme);
+    const run_theme = b.addRunArtifact(theme);
+    if (b.args) |arguments| run_theme.addArgs(arguments);
+    b.step("theme", "Show a window styled by examples/theme.zon, restyled when the file changes (`-- --check` scripts it)").dependOn(&run_theme.step);
+    check_step.dependOn(&theme.step);
+}
+
+/// The remote, material, HDR, accessibility, services, title bar and many-windows examples, which run
 /// only on the Windows host so far.
 fn addWindowsExamples(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, host_module: *std.Build.Module, zui_dependency: *std.Build.Dependency, check_step: *std.Build.Step) void {
     const app_module = zui_dependency.module("zui_app");
@@ -156,25 +182,6 @@ fn addWindowsExamples(b: *std.Build, target: std.Build.ResolvedTarget, optimize:
     if (b.args) |arguments| run_hdr.addArgs(arguments);
     b.step("hdr", "Show HDR white beside SDR white (`-- --measure` reads them back off the desktop in scRGB)").dependOn(&run_hdr.step);
     check_step.dependOn(&hdr.step);
-
-    const theme = b.addExecutable(.{
-        .name = "zui-host-theme",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("examples/theme.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{
-                .{ .name = "zui_host", .module = host_module },
-                .{ .name = "zui_async", .module = zui_dependency.module("zui_async") },
-                .{ .name = "zui_sokol", .module = zui_sokol_dependency.module("zui_sokol") },
-            },
-        }),
-    });
-    b.installArtifact(theme);
-    const run_theme = b.addRunArtifact(theme);
-    if (b.args) |arguments| run_theme.addArgs(arguments);
-    b.step("theme", "Show a window styled by examples/theme.zon, restyled when the file changes (`-- --check` scripts it)").dependOn(&run_theme.step);
-    check_step.dependOn(&theme.step);
 
     const accessible = b.addExecutable(.{
         .name = "zui-host-accessible",

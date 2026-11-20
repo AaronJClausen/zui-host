@@ -1,8 +1,3 @@
-//! libwayland-client's calls and the interfaces the Linux host speaks:
-//! the core protocol's from libwayland itself, xdg-shell's and
-//! cursor-shape-v1's written out here as wayland-scanner would generate
-//! them, at the versions the host binds.
-
 pub const Proxy = opaque {};
 pub const Display = opaque {};
 
@@ -57,6 +52,10 @@ pub extern "wayland-client" const wl_seat_interface: Interface;
 pub extern "wayland-client" const wl_pointer_interface: Interface;
 pub extern "wayland-client" const wl_keyboard_interface: Interface;
 pub extern "wayland-client" const wl_output_interface: Interface;
+pub extern "wayland-client" const wl_data_device_manager_interface: Interface;
+pub extern "wayland-client" const wl_data_device_interface: Interface;
+pub extern "wayland-client" const wl_data_source_interface: Interface;
+pub extern "wayland-client" const wl_data_offer_interface: Interface;
 
 pub fn displayProxy(display: *Display) *Proxy {
     return @ptrCast(display);
@@ -99,6 +98,19 @@ pub const pointer_axis_vertical = 0;
 pub const pointer_axis_horizontal = 1;
 pub const keyboard_key_pressed = 1;
 pub const keymap_format_xkb_v1 = 1;
+
+pub const data_device_manager_create_data_source = 0;
+pub const data_device_manager_get_data_device = 1;
+pub const data_source_offer = 0;
+pub const data_source_destroy = 1;
+pub const data_device_set_selection = 1;
+pub const data_device_release = 2;
+pub const data_offer_accept = 0;
+pub const data_offer_receive = 1;
+pub const data_offer_destroy = 2;
+pub const data_offer_finish = 3;
+pub const data_offer_set_actions = 4;
+pub const data_device_manager_dnd_action_copy = 1;
 
 pub fn bind(registry: *Proxy, name: u32, interface: *const Interface, version: u32) ?*Proxy {
     return create(registry, registry_bind, interface, version, .{ name, interface.name, version, no_id });
@@ -207,6 +219,62 @@ pub const cursor_shape_device_interface: Interface = .{
     .events = null,
 };
 
+pub const viewporter_destroy = 0;
+pub const viewporter_get_viewport = 1;
+pub const viewporter_interface: Interface = .{
+    .name = "wp_viewporter",
+    .version = 1,
+    .method_count = 2,
+    .methods = &[_]Message{
+        message("destroy", "", &untyped),
+        message("get_viewport", "no", &.{ &viewport_interface, &wl_surface_interface }),
+    },
+    .event_count = 0,
+    .events = null,
+};
+
+pub const viewport_destroy = 0;
+pub const viewport_set_destination = 2;
+pub const viewport_interface: Interface = .{
+    .name = "wp_viewport",
+    .version = 1,
+    .method_count = 3,
+    .methods = &[_]Message{
+        message("destroy", "", &untyped),
+        message("set_source", "ffff", &untyped),
+        message("set_destination", "ii", &untyped),
+    },
+    .event_count = 0,
+    .events = null,
+};
+
+pub const fractional_scale_manager_destroy = 0;
+pub const fractional_scale_manager_get_fractional_scale = 1;
+pub const fractional_scale_manager_interface: Interface = .{
+    .name = "wp_fractional_scale_manager_v1",
+    .version = 1,
+    .method_count = 2,
+    .methods = &[_]Message{
+        message("destroy", "", &untyped),
+        message("get_fractional_scale", "no", &.{ &fractional_scale_interface, &wl_surface_interface }),
+    },
+    .event_count = 0,
+    .events = null,
+};
+
+pub const fractional_scale_destroy = 0;
+pub const fractional_scale_interface: Interface = .{
+    .name = "wp_fractional_scale_v1",
+    .version = 1,
+    .method_count = 1,
+    .methods = &[_]Message{message("destroy", "", &untyped)},
+    .event_count = 1,
+    .events = &[_]Message{message("preferred_scale", "u", &untyped)},
+};
+
+/// `wp_fractional_scale_v1.preferred_scale` is in 120ths.
+pub const fractional_scale_denominator = 120;
+
 pub const RegistryListener = extern struct {
     global: *const fn (?*anyopaque, ?*Proxy, u32, [*:0]const u8, u32) callconv(.c) void,
     global_remove: *const fn (?*anyopaque, ?*Proxy, u32) callconv(.c) void,
@@ -260,6 +328,36 @@ pub const KeyboardListener = extern struct {
     key: *const fn (?*anyopaque, ?*Proxy, u32, u32, u32, u32) callconv(.c) void,
     modifiers: *const fn (?*anyopaque, ?*Proxy, u32, u32, u32, u32, u32) callconv(.c) void,
     repeat_info: *const fn (?*anyopaque, ?*Proxy, i32, i32) callconv(.c) void,
+};
+
+pub const FractionalScaleListener = extern struct {
+    preferred_scale: *const fn (?*anyopaque, ?*Proxy, u32) callconv(.c) void,
+};
+
+pub const DataDeviceListener = extern struct {
+    data_offer: *const fn (?*anyopaque, ?*Proxy, ?*Proxy) callconv(.c) void,
+    enter: *const fn (?*anyopaque, ?*Proxy, u32, ?*Proxy, Fixed, Fixed, ?*Proxy) callconv(.c) void,
+    leave: *const fn (?*anyopaque, ?*Proxy) callconv(.c) void,
+    motion: *const fn (?*anyopaque, ?*Proxy, u32, Fixed, Fixed) callconv(.c) void,
+    drop: *const fn (?*anyopaque, ?*Proxy) callconv(.c) void,
+    selection: *const fn (?*anyopaque, ?*Proxy, ?*Proxy) callconv(.c) void,
+};
+
+/// Through version 3.
+pub const DataOfferListener = extern struct {
+    offer: *const fn (?*anyopaque, ?*Proxy, [*:0]const u8) callconv(.c) void,
+    source_actions: *const fn (?*anyopaque, ?*Proxy, u32) callconv(.c) void,
+    action: *const fn (?*anyopaque, ?*Proxy, u32) callconv(.c) void,
+};
+
+/// Through version 3.
+pub const DataSourceListener = extern struct {
+    target: *const fn (?*anyopaque, ?*Proxy, ?[*:0]const u8) callconv(.c) void,
+    send: *const fn (?*anyopaque, ?*Proxy, [*:0]const u8, i32) callconv(.c) void,
+    cancelled: *const fn (?*anyopaque, ?*Proxy) callconv(.c) void,
+    dnd_drop_performed: *const fn (?*anyopaque, ?*Proxy) callconv(.c) void,
+    dnd_finished: *const fn (?*anyopaque, ?*Proxy) callconv(.c) void,
+    action: *const fn (?*anyopaque, ?*Proxy, u32) callconv(.c) void,
 };
 
 pub fn addListener(proxy: *Proxy, listener: anytype, data: *anyopaque) void {

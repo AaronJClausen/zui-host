@@ -10,6 +10,7 @@
 //! ```
 
 const std = @import("std");
+const builtin = @import("builtin");
 const zui_host = @import("zui_host");
 const zui_async = @import("zui_async");
 const zui_sokol = @import("zui_sokol");
@@ -142,8 +143,14 @@ pub fn main(init: std.process.Init) !void {
     const host = try gpa.create(Host);
     defer gpa.destroy(host);
     host.forced_scale = null;
-    host.forced_display_color = null;
-    host.system_material_unavailable = false;
+    switch (builtin.os.tag) {
+        .windows => {
+            host.forced_display_color = null;
+            host.system_material_unavailable = false;
+        },
+        .linux => host.bus_addresses = null,
+        else => {},
+    }
     try host.init(io, .{ .title = "zui: a theme from a file", .size = .{ 720, 360 } });
     defer host.deinit();
     const waker = host.zuiWaker();

@@ -14,5 +14,5 @@
             .lazy = true,
         },
     },
-    .paths = .{ "build.zig", "build.zig.zon", "zui_host.zig", "windows", "examples", "README.md", "LICENSE" },
+    .paths = .{ "build.zig", "build.zig.zon", "zui_host.zig", "windows", "linux", "examples", "README.md", "LICENSE" },
 }

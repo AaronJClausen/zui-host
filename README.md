@@ -107,9 +107,12 @@ and `wl_surface`). It reads and dispatches the compositor's events on the
 thread that polls it, since a Wayland client has no modal loop to escape.
 So far it:
 
-- reports the buffer scale the compositor prefers
-  (`wl_surface.preferred_buffer_scale`), keeping the window's size in
-  layout units when it changes, and takes the size the compositor
+- reports the scale the compositor prefers: fractional
+  (`wp_fractional_scale_v1`, in 120ths) where it also offers
+  `wp_viewporter`, the buffer drawn at physical pixels and the viewport
+  giving the surface its size; otherwise the integer buffer scale
+  (`wl_surface.preferred_buffer_scale`). It keeps the window's size in
+  layout units when the scale changes, and takes the size the compositor
   configures, such as a tiling compositor's tile;
 - reports the mouse, the wheel (40 layout units a notch, a touchpad's
   distance as it is), keys through the compositor's keymap with their
@@ -131,13 +134,33 @@ So far it:
   closed, unless the application handles or ignores the signal itself (a
   second Ctrl+C ends the process); the system sleeping and waking
   (logind's `PrepareForSleep`) are `.suspend` and `.resume`;
+- reports files dropped onto the window (`wl_data_device`, an offer of
+  `text/uri-list` accepted for copying), each `file://` URI on this
+  machine percent-decoded to its path, at the drop's position;
 - closes when its close button or the compositor asks;
 - sets the cursor a frame asks for, where the compositor offers
   `wp_cursor_shape_v1`;
 - waits as `nextFrame` says: at once, until an instant, or until input,
   a key's repeat, a signal or a wake, which is sticky and works from any
   thread (an `eventfd`); the compositor's and the buses' other messages,
-  such as a buffer released after each frame, do not end a wait.
+  such as a buffer released after each frame, do not end a wait;
+- offers the clipboard as text, `Host.zuiClipboard.write(host, text)`
+  and `read(host, request, sink)`, through the seat's selection: `write`
+  offers up to 64 KiB of UTF-8 as `text/plain;charset=utf-8`,
+  `UTF8_STRING` and `text/plain`, and `read` publishes a
+  `zui.ServiceReply` once the selection's owner has written it, up to
+  64 KiB with the rest counted as left out, `""` when the clipboard
+  holds no text, or `.failed` after 2 s. Both directions go through
+  pipes the host's wait reads and writes, so the host can paste its own
+  text, and a reader that closes early does not raise SIGPIPE. The
+  compositor names the selection only to the window with keyboard
+  focus; until it names another, a read answers the last text written;
+- watches up to four directories, each with its subdirectories, through
+  `Host.zuiFileWatch.watch(host, directory, sink)`: one inotify
+  descriptor, read in the host's wait, with a watch for each directory,
+  added as subdirectories are created or moved in (up to 256 in all;
+  past them, or past a path of 255 bytes, a `.rescan`), publishing each
+  change, a `zui.FileChange`, into a source of the application's.
 
 It links libwayland-client and libxkbcommon, and speaks D-Bus itself: a
 client of its own, in `linux/dbus.zig`, reads the buses' sockets into
@@ -145,15 +168,18 @@ fixed buffers, beside the display in the same wait, so it needs no
 libdbus and allocates nothing. `init` waits up to 250 ms for the desktop's
 current settings, so the first frame has them. A window opened with
 `visible = false` is a surface with no role, which the compositor never
-shows. Low memory, reduced transparency, fractional scale, the clipboard,
-drops, file watching, the IME, a system material and X11 are still to
-come.
+shows. Low memory, reduced transparency, the IME, a system material and
+X11 are still to come.
 
 It passes zui's host suite (`zui_testing.expectHostConforms`) against a
 window the compositor never shows, whose harness delivers what a
 compositor would to the host's own handlers; without a compositor to
 connect to, the suite and the host's own tests are skipped with a
-message. The tests read no bus, but one: with
+message. A test with `ZUI_HOST_TEST_SHOWN_WINDOW` set shows a window for
+a moment, so the compositor gives it focus, and reads text written to the
+clipboard back through the compositor's own selection; without it, the
+clipboard's pipes are tested with the host at both ends. The tests read
+no bus, but one: with
 `ZUI_HOST_TEST_SESSION_BUS` set to a bus's address, a test plays the
 portal on it, and checks that its answer and signals reach the host and
 another sender's do not.
@@ -235,7 +261,7 @@ output scrgb_fp16, headroom 3.81; the desktop shows, in scRGB (1.0 is 80 nits):
 ## A theme from a file
 
 `zig build theme` draws a window in the colors of `examples/theme.zon`
-and restyles it when the file changes. The host's file watch publishes
+and restyles it when the file changes, on Windows and on Linux. The host's file watch publishes
 into a `zui_async.Stream(zui.FileChange, ...)` among the application's
 sources; declaration sees the theme's file among the changes, and the
 loader, between frames, reads and parses it into a `zui_async.Latest`
@@ -256,7 +282,8 @@ zig build theme -- --check               # rewrite a theme file, wait for the re
 opens the window, and once a frame draws it, writes a light one over it;
 it fails unless a frame draws the light background within 10 s. On the
 reference machine the restyled frame came 2 to 4 ms after the write, two
-frames after the first.
+frames after the first, on Windows; on Linux under Hyprland at 60 Hz, it
+came 18.7 ms after it, in the second frame.
 
 ## Host services
 
