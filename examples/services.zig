@@ -10,6 +10,7 @@
 //! ```
 
 const std = @import("std");
+const builtin = @import("builtin");
 const zui_host = @import("zui_host");
 const zui_sokol = @import("zui_sokol");
 const zui_app = @import("zui_app");
@@ -17,6 +18,7 @@ const zui_async = @import("zui_async");
 const zui_widgets = @import("zui_widgets");
 const zui = zui_host.zui;
 const win32 = zui_host.windows.win32;
+const host_services = if (builtin.os.tag == .windows) zui_host.windows.services else zui_host.linux.services;
 
 const ServiceReply = zui.ServiceReply(16 * 1024);
 const ServiceSources = struct {
@@ -63,6 +65,19 @@ const Action = enum {
         const index = @intFromEnum(item);
         if (index == 0 or index > std.enums.values(Action).len) return null;
         return @enumFromInt(index - 1);
+    }
+
+    /// Whether the host offers the service, so the check presses its
+    /// button. The check works a menu bar through Win32.
+    fn isOffered(action: Action) bool {
+        return switch (action) {
+            .pick_file, .save_file => services.has_file_dialogs,
+            .notify => services.has_notifications,
+            .popup_menu => services.has_menus,
+            .toggle_menu_bar => services.has_menu_bar and builtin.os.tag == .windows,
+            .copy, .paste => services.has_clipboard,
+            .open_url => services.has_open_url,
+        };
     }
 
     fn buttonId(action: Action) zui.Id {
@@ -141,6 +156,9 @@ pub fn main(init: std.process.Init) !void {
     try runner.start(.{ .gpa = init.gpa, .io = init.io, .process = init }, .{ .title = "zui: host services", .size = .{ 760, 560 }, .visible = !checking });
     defer runner.stop();
     if (checking) {
+        // A Wayland surface the compositor never shows gets no frame
+        // callbacks, and a swap waits for the last frame's.
+        if (builtin.os.tag == .linux) runner.renderer.draws = false;
         runner.host.fakeServices(&runner.app.service_fake);
         runner.app.check = .{ .deadline = runner.host.now().addNanoseconds(Check.deadline_ns) };
     }
@@ -164,7 +182,7 @@ const ServicesApp = struct {
     menu_bar_shown: bool = false,
     copies: u32 = 0,
     /// Set by `--check`, which answers every service through it.
-    service_fake: zui_host.windows.services.ServiceFake = .{},
+    service_fake: host_services.ServiceFake = .{},
     check: ?Check = null,
 
     const root_id: zui.Id = .of("root");
@@ -330,8 +348,8 @@ const Check = struct {
     pastes_retried: u32 = 0,
 
     const deadline_ns = 10 * std.time.ns_per_s;
-    const picked_path = "C:\\zui\\picked.zon";
-    const saved_path = "C:\\zui\\saved.txt";
+    const picked_path = if (builtin.os.tag == .windows) "C:\\zui\\picked.zon" else "/zui/picked.zon";
+    const saved_path = if (builtin.os.tag == .windows) "C:\\zui\\saved.txt" else "/zui/saved.txt";
 
     const Failure = enum { timed_out, url_not_opened };
 
@@ -345,7 +363,7 @@ const Check = struct {
         chooses_from_menu_bar: bool = false,
     };
 
-    const steps = [_]Step{
+    const steps = offeredSteps(&.{
         .{ .action = .copy, .shows = "copied \"zui copied this (1)\"" },
         .{ .action = .paste, .shows = "pasted \"zui copied this (1)\"" },
         .{ .action = .pick_file, .shows = picked_path },
@@ -356,7 +374,23 @@ const Check = struct {
         .{ .action = .toggle_menu_bar, .shows = "chose Pick a file", .chooses_from_menu_bar = true },
         .{ .action = .toggle_menu_bar, .shows = "removed", .menu_bar = .removed },
         .{ .action = .open_url, .shows = "handed " ++ url ++ " to the system" },
-    };
+    });
+
+    fn offeredSteps(comptime all: []const Step) [offeredCount(all)]Step {
+        var offered: [offeredCount(all)]Step = undefined;
+        var count: usize = 0;
+        for (all) |each| if (each.action.isOffered()) {
+            offered[count] = each;
+            count += 1;
+        };
+        return offered;
+    }
+
+    fn offeredCount(comptime all: []const Step) usize {
+        var count: usize = 0;
+        for (all) |each| count += @intFromBool(each.action.isOffered());
+        return count;
+    }
 
     fn result(self: Check) !void {
         if (self.failure) |failure| {
@@ -377,7 +411,7 @@ const Check = struct {
         }
         if (!self.started) {
             const current = steps[self.step_index];
-            if (current.chooses_from_menu_bar) {
+            if (builtin.os.tag == .windows and current.chooses_from_menu_bar) {
                 const bar = win32.GetMenu(app.host.hwnd) orelse return app.host.zuiWaker().wake();
                 const file_menu = win32.GetSubMenu(bar, 0) orelse return app.host.zuiWaker().wake();
                 _ = win32.SendMessageW(app.host.hwnd, win32.WM_COMMAND, win32.GetMenuItemID(file_menu, 0), 0);
@@ -390,7 +424,7 @@ const Check = struct {
                 .pick_file => fake.scriptFileDialog(picked_path ++ "\x00"),
                 .save_file => fake.scriptFileDialog(saved_path ++ "\x00"),
                 .notify => fake.scriptNotification(.activated),
-                .popup_menu => fake.scriptPopupMenu(Action.menuItem(.paste)),
+                .popup_menu => if (comptime services.has_menus) fake.scriptPopupMenu(Action.menuItem(.paste)),
                 else => {},
             }
             app.wanted.insert(current.action);
@@ -407,11 +441,11 @@ const Check = struct {
             return;
         }
         if (!shows(frame, current.shows)) return;
-        switch (current.menu_bar) {
+        if (builtin.os.tag == .windows) switch (current.menu_bar) {
             .untouched => {},
             .shown => if (win32.GetMenu(app.host.hwnd) == null) return,
             .removed => if (win32.GetMenu(app.host.hwnd) != null) return,
-        }
+        };
         if (current.action == .open_url) {
             const opened = app.service_fake.openedUrl() orelse return;
             if (!std.mem.eql(u8, opened, url)) {
@@ -438,9 +472,11 @@ const SokolRenderer = struct {
     pub const ImageHandle = zui_sokol.Renderer.ImageHandle;
 
     sokol: zui_sokol.Renderer,
+    /// False submits nothing, for a window that is never shown.
+    draws: bool = true,
 
     pub fn init(self: *SokolRenderer, surface: zui.Surface, text: *const zui_sokol.Text) !void {
-        self.sokol = try .initForSurface(text, surface);
+        self.* = .{ .sokol = try .initForSurface(text, surface) };
     }
 
     pub fn deinit(self: *SokolRenderer) void {
@@ -448,6 +484,6 @@ const SokolRenderer = struct {
     }
 
     pub fn zuiSubmit(self: *SokolRenderer, surface: zui.Surface, frame: anytype) !void {
-        try self.sokol.zuiSubmit(surface, frame);
+        if (self.draws) try self.sokol.zuiSubmit(surface, frame);
     }
 };

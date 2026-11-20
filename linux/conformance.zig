@@ -11,11 +11,16 @@ const zui_testing = @import("zui_testing");
 const Host = zui_host.Host;
 const keys = zui_host.linux.keys;
 const desktop_bus = zui_host.linux.desktop_bus;
+const services = zui_host.linux.services;
 
 const testing = std.testing;
 
 const UnshownWindow = struct {
     window_host: Host = undefined,
+    service_fake: services.ServiceFake = .{},
+    /// False hands services to the session bus, which the window reads
+    /// only through `openReading`.
+    fakes_services: bool = true,
 
     /// With `forced_scale` set, a surface coordinate is that many layout
     /// units at a zoom of 1 and a buffer scale of 1. The window reads no
@@ -28,6 +33,7 @@ const UnshownWindow = struct {
     fn openReading(self: *UnshownWindow, forced_scale: ?f32, bus_addresses: ?desktop_bus.Addresses) !void {
         self.window_host.forced_scale = forced_scale;
         self.window_host.bus_addresses = bus_addresses;
+        self.window_host.service_fake = if (self.fakes_services) &self.service_fake else null;
         self.window_host.init(testing.io, .{ .title = "zui host suite", .size = .{ 320, 240 }, .visible = false }) catch |err| switch (err) {
             error.NoWaylandDisplay => {
                 std.debug.print("skipped: no Wayland compositor to connect to (WAYLAND_DISPLAY and XDG_RUNTIME_DIR)\n", .{});
@@ -67,6 +73,18 @@ const CompositorHarness = struct {
             else => return false,
         }
         return true;
+    }
+
+    pub fn openedUrl(self: *CompositorHarness) ?[]const u8 {
+        return self.window.service_fake.openedUrl();
+    }
+
+    pub fn scriptServices(self: *CompositorHarness, script: zui_testing.ServiceScript) void {
+        self.window.service_fake.scriptFileDialog(script.chosen_paths);
+        self.window.service_fake.scriptNotification(switch (script.notification) {
+            .activated => .activated,
+            .dismissed => .dismissed,
+        });
     }
 
     pub fn close(self: *CompositorHarness) void {
@@ -755,4 +773,64 @@ test "with ZUI_HOST_TEST_SHOWN_WINDOW set, text written to the clipboard comes b
     try Host.zuiClipboard.read(&window_host, .of("paste"), .of(&replies));
     try waitUntil(&window_host, answered, &replies);
     try testing.expectEqualStrings(copied, replies.replies[0].text());
+}
+
+const Replies = struct {
+    replies: [4]Reply = undefined,
+    count: usize = 0,
+
+    const Reply = zui.ServiceReply(1024);
+
+    pub fn publish(self: *Replies, reply: Reply) zui.Wake {
+        self.replies[self.count] = reply;
+        self.count += 1;
+        return if (self.count == 1) .needed else .already_pending;
+    }
+};
+
+test "a service is answered by the wait after the call, which it ends, and never by the call" {
+    var window: UnshownWindow = .{};
+    try window.open(1);
+    defer window.close();
+    const window_host = window.host();
+    var polled: Polled = .{};
+    polled.init();
+    _ = polled.poll(window_host);
+
+    var replies: Replies = .{};
+    window.service_fake.scriptNotification(.dismissed);
+    try Host.zuiNotifications.show(window_host, .of("saved"), .{ .title = "Saved" }, .of(&replies));
+    window.service_fake.scriptFileDialog("/zui/picked.zon\x00");
+    try Host.zuiFileDialogs.show(window_host, .main, .of("open"), .{}, .of(&replies));
+    try testing.expectEqual(@as(usize, 0), replies.count);
+    const waited_from = window_host.now();
+    window_host.zuiWait(.{ .at = waited_from.addSeconds(2) });
+    try testing.expect(window_host.now().secondsSince(waited_from) < 1);
+    try testing.expectEqual(@as(usize, 2), replies.count);
+    try testing.expectEqual(.notification_dismissed, replies.replies[0].kind);
+    try testing.expectEqual(.files_chosen, replies.replies[1].kind);
+    var paths = replies.replies[1].paths();
+    try testing.expectEqualStrings("/zui/picked.zon", paths.next().?);
+}
+
+test "a file dialog over a window that is not open is unavailable" {
+    var window: UnshownWindow = .{};
+    try window.open(1);
+    defer window.close();
+    var replies: Replies = .{};
+    try testing.expectError(error.Unavailable, Host.zuiFileDialogs.show(window.host(), @enumFromInt(1), .of("open"), .{}, .of(&replies)));
+    window.host().onClose();
+    try testing.expectError(error.Unavailable, Host.zuiFileDialogs.show(window.host(), .main, .of("open"), .{}, .of(&replies)));
+    try testing.expectEqual(@as(u32, 0), window.service_fake.fileDialogsShown());
+}
+
+test "without a session bus, each service is unavailable at once" {
+    var window: UnshownWindow = .{ .fakes_services = false };
+    try window.openReading(1, .{ .session = "unix:path=/nonexistent/zui-host-session-bus", .system = null });
+    defer window.close();
+    const window_host = window.host();
+    var replies: Replies = .{};
+    try testing.expectError(error.Unavailable, Host.zuiNotifications.show(window_host, .of("saved"), .{ .title = "Saved" }, .of(&replies)));
+    try testing.expectError(error.Unavailable, Host.zuiFileDialogs.show(window_host, .main, .of("open"), .{}, .of(&replies)));
+    try testing.expectError(error.Unavailable, Host.zuiOpenUrl.open(window_host, "https://ziglang.org/"));
 }

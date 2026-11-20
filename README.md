@@ -140,6 +140,22 @@ So far it:
 - closes when its close button or the compositor asks;
 - sets the cursor a frame asks for, where the compositor offers
   `wp_cursor_shape_v1`;
+- offers zui's host services over the session bus, the Windows host's
+  shapes: `Host.zuiNotifications.show(host, request, notification,
+  sink)`, a notification from the desktop's notification daemon
+  (`org.freedesktop.Notifications`), one at a time and replaced by the
+  next, answering `.notification_activated` when clicked and
+  `.notification_dismissed` when it expires, is closed or is replaced;
+  `Host.zuiFileDialogs.show(host, window, request, dialog, sink)`, the XDG
+  desktop portal's open, save and folder dialogs (`FileChooser`), one at
+  a time, answering `.files_chosen` with the paths chosen or `.canceled`;
+  and `Host.zuiOpenUrl.open(host, url)`, which hands a URL to the
+  portal's `OpenURI` and refuses paths and `file:` URLs. Each call only
+  sends; the poll and the wait read the bus and publish every answer, a
+  `zui.ServiceReply`, into a source of the application's. Without a
+  session bus each call is `error.Unavailable`, and without a daemon or a
+  portal the answer is `.failed = .unavailable`. There are no menus,
+  which Wayland does not have;
 - waits as `nextFrame` says: at once, until an instant, or until input,
   a key's repeat, a signal or a wake, which is sticky and works from any
   thread (an `eventfd`); the compositor's and the buses' other messages,
@@ -168,21 +184,27 @@ fixed buffers, beside the display in the same wait, so it needs no
 libdbus and allocates nothing. `init` waits up to 250 ms for the desktop's
 current settings, so the first frame has them. A window opened with
 `visible = false` is a surface with no role, which the compositor never
-shows. Low memory, reduced transparency, the IME, a system material and
-X11 are still to come.
+shows. The services have a connection to the session bus of their own,
+which reads nothing while no call waits for an answer. Low memory,
+reduced transparency, the IME, a system material and X11 are still to
+come.
 
 It passes zui's host suite (`zui_testing.expectHostConforms`) against a
 window the compositor never shows, whose harness delivers what a
 compositor would to the host's own handlers; without a compositor to
 connect to, the suite and the host's own tests are skipped with a
-message. A test with `ZUI_HOST_TEST_SHOWN_WINDOW` set shows a window for
-a moment, so the compositor gives it focus, and reads text written to the
-clipboard back through the compositor's own selection; without it, the
-clipboard's pipes are tested with the host at both ends. The tests read
-no bus, but one: with
-`ZUI_HOST_TEST_SESSION_BUS` set to a bus's address, a test plays the
-portal on it, and checks that its answer and signals reach the host and
-another sender's do not.
+message. The services are answered there through the host's fake
+(`Host.fakeServices`), so nothing shows. A test with
+`ZUI_HOST_TEST_SHOWN_WINDOW` set shows a window for a moment, so the
+compositor gives it focus, and reads text written to the clipboard back
+through the compositor's own selection; without it, the clipboard's
+pipes are tested with the host at both ends. The tests read no bus but
+the ones named by `ZUI_HOST_TEST_SESSION_BUS`: set to a bus's address,
+tests play the portal and the notification daemon on it, and check that
+the settings, a notification's arguments and signals, a file chooser's
+options and its answer (paths or a cancel), and `OpenURI` reach the host
+or the played service, that another sender's signals do not, and that a
+notification with no daemon fails without blocking.
 
 ```sh
 dbus-daemon --session --nofork --address=unix:abstract=/zui-host-test --print-address
@@ -290,7 +312,8 @@ came 18.7 ms after it, in the second frame.
 `zig build services` has a button for each service, with its answer
 beside it: pick a file, save a file, show a notification, open a popup
 menu, set or clear the menu bar, copy, paste, and open
-<https://ziglang.org>. A right click anywhere opens the context menu,
+<https://ziglang.org>. It runs on both hosts; a service the host does not
+offer says so beside its button. A right click anywhere opens the context menu,
 and Ctrl+C, Ctrl+V, Ctrl+O and Ctrl+S do what the menus say. Declaration
 only notes what was asked for, and the loader makes the calls between
 frames through `zui_app.ServicesOf`, so every answer comes back through
@@ -320,7 +343,10 @@ It uses the real clipboard, and so replaces what it holds. A paste right
 after a copy often finds the clipboard held by clipboard history, and is
 answered `.failed = .unavailable`; the check presses Paste again, as a
 user would. Setting a menu bar shrinks the window's content by the bar's
-height.
+height. On Linux the check presses only the buttons of the services the
+host offers, the file dialogs, the notification and the URL, and draws
+nothing: a surface the compositor never shows gets no frame callbacks,
+which a renderer's swap waits for.
 
 ## A custom title bar
 
@@ -450,7 +476,7 @@ under a second: the first frame arrives about 3 ms after connecting.
 | `zig build remote` | run the tour in another process and draw it here, over `zui_wire` |
 | `zig build theme` | a window styled by a theme file, restyled when it changes |
 | `zig build accessible` | `zui_widgets` controls for Narrator and Accessibility Insights |
-| `zig build services` | every host service from buttons, each answer shown; `-- --check` runs it against the fake |
+| `zig build services` | every host service from buttons, each answer shown (Windows and Linux); `-- --check` runs it against the fake |
 | `zig build title-bar` | a title bar the application draws, which Windows still drags, snaps and resizes; `-- --check` hit-tests it hidden |
 | `zig build many-windows` | one application in two windows, each with its own UI; `-- --check` clicks and closes them hidden |
 | `zig build fmt` / `fmt-check` | format, or fail if a file is not formatted |

@@ -8,6 +8,7 @@ pub const dbus = @import("dbus.zig");
 pub const desktop_bus = @import("desktop_bus.zig");
 pub const data_device = @import("data_device.zig");
 pub const file_watch = @import("file_watch.zig");
+pub const services = @import("services.zig");
 
 const Proxy = wayland.Proxy;
 
@@ -24,7 +25,8 @@ const Proxy = wayland.Proxy;
 /// motion, power); and SIGINT, SIGTERM and SIGHUP as terminate requests
 /// and the system sleeping and waking as lifecycle events. It sets the
 /// cursor where the compositor offers cursor shapes, reads and writes the
-/// clipboard, watches directories, and waits for `nextFrame` on the
+/// clipboard, watches directories, offers notifications, file dialogs and
+/// opening URLs over the session bus, and waits for `nextFrame` on the
 /// display, the desktop's buses, its transfers and watches, a wake and a
 /// deadline.
 ///
@@ -72,6 +74,44 @@ pub const Host = struct {
         }
     };
 
+    /// Hands a URL to the XDG desktop portal's `OpenURI`, which opens it
+    /// with the handler for its scheme, refusing paths and `file:` URLs and
+    /// ones longer than `services.Services.url_capacity` bytes.
+    pub const zuiOpenUrl = struct {
+        pub fn open(host: *Host, url: []const u8) zui.ServiceError!void {
+            return host.services.openUrl(host.io, url);
+        }
+    };
+
+    /// A notification from the desktop's notification daemon, through
+    /// `org.freedesktop.Notifications`: its title cut at a character to
+    /// `services.Services.notification_title_capacity` bytes and its body
+    /// to `notification_body_capacity`. It answers `.notification_activated`
+    /// when clicked, `.notification_dismissed` when it expires, is closed,
+    /// or the next one replaces it, and `.failed = .unavailable` when no
+    /// daemon answers; one still showing at `deinit` is closed and not
+    /// answered. Until the daemon has taken one, the next is
+    /// `error.Busy`.
+    pub const zuiNotifications = struct {
+        pub fn show(host: *Host, request: zui.ServiceRequest, notification: zui.Notification, sink: zui.ServiceSink) zui.ServiceError!void {
+            return host.services.showNotification(host.io, request, notification, sink);
+        }
+    };
+
+    /// The XDG desktop portal's `FileChooser` dialogs, `OpenFile` and
+    /// `SaveFile`, one at a time. They answer `.files_chosen` with
+    /// file-system paths, up to `services.Services.chosen_paths_capacity`
+    /// bytes of them, `.canceled`, or `.failed = .unavailable` when no
+    /// portal answers, naming the window. One still open at `deinit` is
+    /// closed and not answered; a window that is not open is
+    /// `error.Unavailable`.
+    pub const zuiFileDialogs = struct {
+        pub fn show(host: *Host, window: zui.WindowId, request: zui.ServiceRequest, dialog: zui.FileDialog, sink: zui.ServiceSink) zui.ServiceError!void {
+            if (window != .main or host.closed) return error.Unavailable;
+            return host.services.showFileDialog(host.io, request, window, dialog, sink);
+        }
+    };
+
     /// Layout units scrolled per notch of the mouse wheel.
     pub const wheel_step = 40;
 
@@ -82,6 +122,9 @@ pub const Host = struct {
     /// The buses the environment is read from in place of the session's
     /// and the system's, for tests that must not depend on the desktop.
     bus_addresses: ?desktop_bus.Addresses = null,
+    /// Answers services as a test says instead of handing them to the
+    /// bus, so nothing shows or opens.
+    service_fake: ?*services.ServiceFake = null,
 
     display: *wayland.Display,
     registry: *Proxy,
@@ -139,6 +182,7 @@ pub const Host = struct {
     file_watches: file_watch.Watches,
     desktop: desktop_bus.DesktopBus,
     desktop_settings: DesktopSettings,
+    services: services.Services,
     /// Null until `init` reports the whole environment.
     reported_environment: ?ReportedEnvironment,
 
@@ -262,10 +306,12 @@ pub const Host = struct {
         errdefer wayland.wl_display_disconnect(display);
         const forced_scale = self.forced_scale;
         const bus_addresses = self.bus_addresses;
+        const service_fake = self.service_fake;
         self.* = .{
             .io = io,
             .forced_scale = forced_scale,
             .bus_addresses = bus_addresses,
+            .service_fake = service_fake,
             .display = display,
             .registry = undefined,
             .globals = .{},
@@ -304,6 +350,7 @@ pub const Host = struct {
             .file_watches = .{},
             .desktop = .{},
             .desktop_settings = .{},
+            .services = .{ .fake = service_fake },
             .reported_environment = null,
             .termination_signalled = .init(false),
             .terminate_delivered = false,
@@ -394,6 +441,7 @@ pub const Host = struct {
     /// display.
     pub fn deinit(self: *Host) void {
         self.restoreTerminationSignals();
+        self.services.close(self.io);
         self.desktop.close();
         self.file_watches.stopAll();
         self.data_device.deinit();
@@ -550,6 +598,7 @@ pub const Host = struct {
     /// desktop's buses, a transfer, a watch or a wake, then reads and
     /// dispatches what they sent.
     fn waitForEvents(self: *Host, timeout_ns: ?u64) Waited {
+        self.services.publishPending(self.io, self.zuiWaker());
         const display = self.display;
         while (wayland.wl_display_prepare_read(display) != 0) _ = wayland.wl_display_dispatch_pending(display);
         if (self.input_arrived and timeout_ns != 0) {
@@ -558,13 +607,14 @@ pub const Host = struct {
         }
         _ = wayland.wl_display_flush(display);
         const bus_fds = self.desktop.descriptors();
-        const first_transfer = 5;
+        const first_transfer = 6;
         var descriptors = [_]linux.pollfd{
             .{ .fd = wayland.wl_display_get_fd(display), .events = linux.POLL.IN, .revents = 0 },
             .{ .fd = self.wake_fd, .events = linux.POLL.IN, .revents = 0 },
             .{ .fd = bus_fds[0], .events = linux.POLL.IN, .revents = 0 },
             .{ .fd = bus_fds[1], .events = linux.POLL.IN, .revents = 0 },
             .{ .fd = self.file_watches.descriptor(), .events = linux.POLL.IN, .revents = 0 },
+            .{ .fd = self.services.descriptor(), .events = linux.POLL.IN, .revents = 0 },
         } ++ self.data_device.descriptors();
         var timeout: linux.timespec = undefined;
         if (timeout_ns) |nanoseconds| {
@@ -582,6 +632,7 @@ pub const Host = struct {
         if (wayland.wl_display_dispatch_pending(display) < 0) self.closeAfterLostDisplay();
         if (polled and descriptors[2].revents | descriptors[3].revents != 0) self.desktop.receive(self);
         if (polled and descriptors[4].revents != 0) self.file_watches.receive();
+        if (polled and descriptors[5].revents != 0) self.services.receive(self.io, self.zuiWaker());
         if (!polled) for (descriptors[first_transfer..]) |*descriptor| {
             descriptor.revents = 0;
         };
@@ -615,6 +666,13 @@ pub const Host = struct {
         self.requests = requests;
         self.applyCursor();
         _ = wayland.wl_display_flush(self.display);
+    }
+
+    /// Answers services through `fake` instead of the bus, from the next
+    /// call on.
+    pub fn fakeServices(self: *Host, fake: *services.ServiceFake) void {
+        self.service_fake = fake;
+        self.services.fake = fake;
     }
 
     /// Closes the window as its close button does: the next poll returns
@@ -899,6 +957,7 @@ pub const Host = struct {
         const addresses = self.bus_addresses orelse desktop_bus.DesktopBus.addressesFromEnvironment(&session_address);
         const deadline = self.now().addNanoseconds(desktop_answer_ns);
         self.desktop.open(self.io, addresses, deadline);
+        if (addresses.session) |session| self.services.open(self.io, session, deadline);
         while (self.desktop.awaitingReplies()) {
             const remaining_ns = deadline.nanoseconds -| self.now().nanoseconds;
             if (remaining_ns == 0) break;
@@ -1272,4 +1331,5 @@ test {
     _ = desktop_bus;
     _ = data_device;
     _ = file_watch;
+    _ = services;
 }

@@ -323,8 +323,6 @@ pub const DataDevice = struct {
         self.dropped_offer = null;
     }
 
-    // What the compositor reports of offers.
-
     /// An offer whose types follow, which a selection or a drag then
     /// names; one neither names is destroyed at the next.
     pub fn onDataOffer(self: *DataDevice, offer: *Proxy) void {

@@ -76,15 +76,49 @@ pub const Writer = struct {
         self.bytes(&encoded);
     }
 
+    /// `i`, which is aligned and written as a `u` is.
+    pub fn int32(self: *Writer, value: i32) void {
+        self.uint32(@bitCast(value));
+    }
+
     pub fn boolean(self: *Writer, value: bool) void {
         self.uint32(@intFromBool(value));
     }
 
     /// Also an object path, which is written as a string is.
     pub fn string(self: *Writer, text: []const u8) void {
-        self.uint32(@intCast(text.len));
-        self.bytes(text);
+        self.stringOfParts(&.{text});
+    }
+
+    /// One string made of `parts` one after another.
+    pub fn stringOfParts(self: *Writer, parts: []const []const u8) void {
+        var len: usize = 0;
+        for (parts) |part| len += part.len;
+        self.uint32(std.math.lossyCast(u32, len));
+        for (parts) |part| self.bytes(part);
         self.byte(0);
+    }
+
+    /// `as`.
+    pub fn stringArray(self: *Writer, texts: []const []const u8) void {
+        const array = self.beginArray(4);
+        for (texts) |text| self.string(text);
+        self.endArray(array);
+    }
+
+    /// `ay`.
+    pub fn byteArray(self: *Writer, data: []const u8) void {
+        const array = self.beginArray(1);
+        self.bytes(data);
+        self.endArray(array);
+    }
+
+    /// Begins one entry of an `a{sv}` dictionary: its key, and the
+    /// signature of the value written after it.
+    pub fn beginVariantEntry(self: *Writer, key: []const u8, value_signature: []const u8) void {
+        self.beginStruct();
+        self.string(key);
+        self.signature(value_signature);
     }
 
     pub fn signature(self: *Writer, text: []const u8) void {
@@ -194,6 +228,12 @@ pub const Reader = struct {
         const text = try self.take(len);
         if (try self.byte() != 0) return error.Malformed;
         return text;
+    }
+
+    /// `ay`.
+    pub fn byteArray(self: *Reader) Error![]const u8 {
+        const end = try self.beginArray(1);
+        return self.take(end - self.position);
     }
 
     pub fn signature(self: *Reader) Error![]const u8 {
@@ -319,20 +359,37 @@ pub fn messageLength(prefix: []const u8) error{Malformed}!?usize {
     if (prefix.len < fixed_header_len) return null;
     const endian = try endianOf(prefix[0]);
     const body_len = std.mem.readInt(u32, prefix[4..8], endian);
-    const fields_len = std.mem.readInt(u32, prefix[12..16], endian);
-    const total = std.mem.alignForward(u64, fixed_header_len + @as(u64, fields_len), 8) + body_len;
+    const total = (try headerLength(prefix)).? + @as(u64, body_len);
     if (total > max_message_len) return error.Malformed;
     return @intCast(total);
 }
 
-/// The message's header and a reader over its body; both point into
-/// `message`.
-pub fn decode(message: []const u8) error{Malformed}!Message {
-    const total = try messageLength(message) orelse return error.Malformed;
-    if (total != message.len or message[3] != protocol_version) return error.Malformed;
-    var reader: Reader = .{ .bytes = message, .position = 4, .endian = try endianOf(message[0]) };
+/// The length of the header `prefix` starts, its fields and the padding
+/// before the body included, or null until its fixed header has arrived.
+pub fn headerLength(prefix: []const u8) error{Malformed}!?usize {
+    if (prefix.len < fixed_header_len) return null;
+    const endian = try endianOf(prefix[0]);
+    const fields_len = std.mem.readInt(u32, prefix[12..16], endian);
+    const header_len = std.mem.alignForward(u64, fixed_header_len + @as(u64, fields_len), 8);
+    if (header_len > max_message_len) return error.Malformed;
+    return @intCast(header_len);
+}
+
+/// A message's header, and what reading its body takes.
+pub const DecodedHeader = struct {
+    header: Header,
+    body_len: u32,
+    endian: std.builtin.Endian,
+};
+
+/// The header of the message `prefix` starts, which must hold at least
+/// `headerLength(prefix)` bytes; its text points into `prefix`.
+pub fn decodeHeader(prefix: []const u8) error{Malformed}!DecodedHeader {
+    const header_len = try headerLength(prefix) orelse return error.Malformed;
+    if (prefix.len < header_len or prefix[3] != protocol_version) return error.Malformed;
+    var reader: Reader = .{ .bytes = prefix[0..header_len], .position = 4, .endian = try endianOf(prefix[0]) };
     const body_len = try reader.uint32();
-    var header: Header = .{ .type = @enumFromInt(message[1]), .flags = @bitCast(message[2]), .serial = try reader.uint32() };
+    var header: Header = .{ .type = @enumFromInt(prefix[1]), .flags = @bitCast(prefix[2]), .serial = try reader.uint32() };
     const fields_end = try reader.beginArray(8);
     while (reader.position < fields_end) {
         try reader.beginStruct();
@@ -351,9 +408,18 @@ pub fn decode(message: []const u8) error{Malformed}!Message {
             _ => try reader.skip(value_signature),
         }
     }
-    const body_start = std.mem.alignForward(usize, fields_end, 8);
-    if (body_start + body_len != message.len) return error.Malformed;
-    return .{ .header = header, .body = .{ .bytes = message[body_start..], .endian = reader.endian } };
+    if (reader.position > header_len) return error.Malformed;
+    return .{ .header = header, .body_len = body_len, .endian = reader.endian };
+}
+
+/// The message's header and a reader over its body; both point into
+/// `message`.
+pub fn decode(message: []const u8) error{Malformed}!Message {
+    const total = try messageLength(message) orelse return error.Malformed;
+    if (total != message.len) return error.Malformed;
+    const decoded = try decodeHeader(message);
+    const body_start = message.len - decoded.body_len;
+    return .{ .header = decoded.header, .body = .{ .bytes = message[body_start..], .endian = decoded.endian } };
 }
 
 /// Where a bus listens, from a D-Bus address list such as
@@ -400,167 +466,186 @@ fn unescape(value: []const u8, out: []u8) ?usize {
     return len;
 }
 
-/// One connection to a bus, read without blocking once it is open.
-pub const Connection = struct {
-    fd: i32 = -1,
-    next_serial: u32 = 1,
-    received: [receive_capacity]u8 = undefined,
-    received_len: usize = 0,
-    /// The rest of a message too large for `received`, still to be read
-    /// past.
-    bytes_to_discard: usize = 0,
+/// One connection to a bus that holds 16 KiB of what it receives.
+pub const Connection = ConnectionOf(16 * 1024);
 
-    pub const receive_capacity = 16 * 1024;
-    const send_capacity = 1024;
+/// One connection to a bus, read without blocking once it is open, that
+/// holds up to `receive_capacity_bytes` of what it receives.
+pub fn ConnectionOf(comptime receive_capacity_bytes: usize) type {
+    return struct {
+        const Self = @This();
 
-    pub const OpenError = error{ NoBusAddress, BusUnavailable, AuthenticationFailed };
-    pub const SendError = error{ MessageTooLarge, ConnectionLost };
+        fd: i32 = -1,
+        next_serial: u32 = 1,
+        received: [receive_capacity]u8 = undefined,
+        received_len: usize = 0,
+        /// The rest of a message too large for `received`, still to be read
+        /// past.
+        bytes_to_discard: usize = 0,
 
-    pub fn isOpen(self: *const Connection) bool {
-        return self.fd >= 0;
-    }
+        pub const receive_capacity = receive_capacity_bytes;
+        /// The largest message `send` encodes, its header included.
+        pub const send_capacity = 16 * 1024;
 
-    /// Connects to the bus at `address_list` and authenticates as this
-    /// process's user, giving up at `deadline`.
-    pub fn open(self: *Connection, io: std.Io, address_list: []const u8, deadline: zui.Instant) OpenError!void {
-        var socket_address: linux.sockaddr.un = undefined;
-        const address_len = unixSocketAddress(address_list, &socket_address) orelse return error.NoBusAddress;
-        const socket = linux.socket(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.CLOEXEC | linux.SOCK.NONBLOCK, 0);
-        if (linux.errno(socket) != .SUCCESS) return error.BusUnavailable;
-        self.* = .{ .fd = @intCast(socket) };
-        errdefer self.close();
-        switch (linux.errno(linux.connect(self.fd, &socket_address, address_len))) {
-            .SUCCESS => {},
-            .AGAIN, .INPROGRESS => if (!self.waitFor(io, linux.POLL.OUT, deadline)) return error.BusUnavailable,
-            else => return error.BusUnavailable,
+        pub const OpenError = error{ NoBusAddress, BusUnavailable, AuthenticationFailed };
+        pub const SendError = error{ MessageTooLarge, ConnectionLost };
+
+        pub fn isOpen(self: *const Self) bool {
+            return self.fd >= 0;
         }
-        self.authenticate(io, deadline) catch return error.AuthenticationFailed;
-    }
 
-    /// Takes a socket that is already connected and authenticated, as a
-    /// test's pair of sockets is.
-    pub fn adopt(self: *Connection, fd: i32) void {
-        self.* = .{ .fd = fd };
-    }
-
-    pub fn close(self: *Connection) void {
-        if (self.fd >= 0) _ = linux.close(self.fd);
-        self.fd = -1;
-    }
-
-    /// SASL's EXTERNAL mechanism: the bus checks the user id against the
-    /// socket's peer credentials.
-    fn authenticate(self: *Connection, io: std.Io, deadline: zui.Instant) !void {
-        var command_buffer: [64]u8 = undefined;
-        var uid_buffer: [16]u8 = undefined;
-        const uid = std.fmt.bufPrint(&uid_buffer, "{d}", .{linux.getuid()}) catch unreachable;
-        const command = std.fmt.bufPrint(&command_buffer, "\x00AUTH EXTERNAL {x}\r\n", .{uid}) catch unreachable;
-        try self.writeAll(io, command, deadline);
-        const line_end = while (true) {
-            if (std.mem.indexOf(u8, self.received[0..self.received_len], "\r\n")) |end| break end;
-            if (self.received_len == self.received.len) return error.AuthenticationFailed;
-            if (!self.waitFor(io, linux.POLL.IN, deadline)) return error.AuthenticationFailed;
-            const read = linux.read(self.fd, self.received[self.received_len..].ptr, self.received.len - self.received_len);
-            switch (linux.errno(read)) {
-                .SUCCESS => if (read == 0) return error.AuthenticationFailed else {
-                    self.received_len += read;
-                },
-                .AGAIN, .INTR => {},
-                else => return error.AuthenticationFailed,
+        /// Connects to the bus at `address_list` and authenticates as this
+        /// process's user, giving up at `deadline`.
+        pub fn open(self: *Self, io: std.Io, address_list: []const u8, deadline: zui.Instant) OpenError!void {
+            var socket_address: linux.sockaddr.un = undefined;
+            const address_len = unixSocketAddress(address_list, &socket_address) orelse return error.NoBusAddress;
+            const socket = linux.socket(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.CLOEXEC | linux.SOCK.NONBLOCK, 0);
+            if (linux.errno(socket) != .SUCCESS) return error.BusUnavailable;
+            self.* = .{ .fd = @intCast(socket) };
+            errdefer self.close();
+            switch (linux.errno(linux.connect(self.fd, &socket_address, address_len))) {
+                .SUCCESS => {},
+                .AGAIN, .INPROGRESS => if (!self.waitFor(io, linux.POLL.OUT, deadline)) return error.BusUnavailable,
+                else => return error.BusUnavailable,
             }
-        };
-        if (!std.mem.startsWith(u8, self.received[0..line_end], "OK ")) return error.AuthenticationFailed;
-        self.consume(line_end + 2);
-        try self.writeAll(io, "BEGIN\r\n", deadline);
-    }
-
-    /// Sends a message with the next serial, which it returns. A reply
-    /// carries the serial as its `reply_serial`.
-    pub fn send(self: *Connection, io: std.Io, header: Header, body: []const u8, deadline: zui.Instant) SendError!u32 {
-        var buffer: [send_capacity]u8 = undefined;
-        var numbered = header;
-        numbered.serial = self.next_serial;
-        self.next_serial = if (self.next_serial == std.math.maxInt(u32)) 1 else self.next_serial + 1;
-        const message = try encode(&buffer, numbered, body);
-        self.writeAll(io, message, deadline) catch return error.ConnectionLost;
-        return numbered.serial;
-    }
-
-    fn writeAll(self: *Connection, io: std.Io, data: []const u8, deadline: zui.Instant) error{ConnectionLost}!void {
-        var written: usize = 0;
-        while (written < data.len) {
-            const sent = linux.sendto(self.fd, data[written..].ptr, data.len - written, linux.MSG.NOSIGNAL, null, 0);
-            switch (linux.errno(sent)) {
-                .SUCCESS => written += sent,
-                .INTR => {},
-                .AGAIN => if (!self.waitFor(io, linux.POLL.OUT, deadline)) return error.ConnectionLost,
-                else => return error.ConnectionLost,
-            }
+            self.authenticate(io, deadline) catch return error.AuthenticationFailed;
         }
-    }
 
-    /// Waits until the socket is ready for `events` or the deadline passes.
-    pub fn waitFor(self: *const Connection, io: std.Io, events: i16, deadline: zui.Instant) bool {
-        while (true) {
-            const remaining_ns = deadline.nanoseconds -| zui.Instant.fromTimestamp(std.Io.Timestamp.now(io, .awake)).nanoseconds;
-            if (remaining_ns == 0) return false;
-            var descriptor = [_]linux.pollfd{.{ .fd = self.fd, .events = events, .revents = 0 }};
-            const timeout_ms: i32 = @intCast(@min(std.math.divCeil(u64, remaining_ns, std.time.ns_per_ms) catch unreachable, std.math.maxInt(i32)));
-            const ready = linux.poll(&descriptor, 1, timeout_ms);
-            switch (linux.errno(ready)) {
-                .SUCCESS => if (ready > 0) return descriptor[0].revents & events != 0,
-                .INTR => {},
-                else => return false,
+        /// Takes a socket that is already connected and authenticated, as a
+        /// test's pair of sockets is.
+        pub fn adopt(self: *Self, fd: i32) void {
+            self.* = .{ .fd = fd };
+        }
+
+        pub fn close(self: *Self) void {
+            if (self.fd >= 0) _ = linux.close(self.fd);
+            self.fd = -1;
+        }
+
+        /// SASL's EXTERNAL mechanism: the bus checks the user id against the
+        /// socket's peer credentials.
+        fn authenticate(self: *Self, io: std.Io, deadline: zui.Instant) !void {
+            var command_buffer: [64]u8 = undefined;
+            var uid_buffer: [16]u8 = undefined;
+            const uid = std.fmt.bufPrint(&uid_buffer, "{d}", .{linux.getuid()}) catch unreachable;
+            const command = std.fmt.bufPrint(&command_buffer, "\x00AUTH EXTERNAL {x}\r\n", .{uid}) catch unreachable;
+            try self.writeAll(io, command, deadline);
+            const line_end = while (true) {
+                if (std.mem.indexOf(u8, self.received[0..self.received_len], "\r\n")) |end| break end;
+                if (self.received_len == self.received.len) return error.AuthenticationFailed;
+                if (!self.waitFor(io, linux.POLL.IN, deadline)) return error.AuthenticationFailed;
+                const read = linux.read(self.fd, self.received[self.received_len..].ptr, self.received.len - self.received_len);
+                switch (linux.errno(read)) {
+                    .SUCCESS => if (read == 0) return error.AuthenticationFailed else {
+                        self.received_len += read;
+                    },
+                    .AGAIN, .INTR => {},
+                    else => return error.AuthenticationFailed,
+                }
+            };
+            if (!std.mem.startsWith(u8, self.received[0..line_end], "OK ")) return error.AuthenticationFailed;
+            self.consume(line_end + 2);
+            try self.writeAll(io, "BEGIN\r\n", deadline);
+        }
+
+        /// Sends a message with the next serial, which it returns. A reply
+        /// carries the serial as its `reply_serial`.
+        pub fn send(self: *Self, io: std.Io, header: Header, body: []const u8, deadline: zui.Instant) SendError!u32 {
+            var buffer: [send_capacity]u8 = undefined;
+            var numbered = header;
+            numbered.serial = self.next_serial;
+            self.next_serial = if (self.next_serial == std.math.maxInt(u32)) 1 else self.next_serial + 1;
+            const message = try encode(&buffer, numbered, body);
+            self.writeAll(io, message, deadline) catch return error.ConnectionLost;
+            return numbered.serial;
+        }
+
+        fn writeAll(self: *Self, io: std.Io, data: []const u8, deadline: zui.Instant) error{ConnectionLost}!void {
+            var written: usize = 0;
+            while (written < data.len) {
+                const sent = linux.sendto(self.fd, data[written..].ptr, data.len - written, linux.MSG.NOSIGNAL, null, 0);
+                switch (linux.errno(sent)) {
+                    .SUCCESS => written += sent,
+                    .INTR => {},
+                    .AGAIN => if (!self.waitFor(io, linux.POLL.OUT, deadline)) return error.ConnectionLost,
+                    else => return error.ConnectionLost,
+                }
             }
         }
-    }
 
-    /// Reads what the bus has sent, without waiting, and calls
-    /// `receiver.onMessage(message)` for each whole message. A message
-    /// too large to hold, or one that does not decode, is passed over.
-    pub fn receive(self: *Connection, receiver: anytype) error{ConnectionLost}!void {
-        while (true) {
-            const read = linux.read(self.fd, self.received[self.received_len..].ptr, self.received.len - self.received_len);
-            switch (linux.errno(read)) {
-                .SUCCESS => {
-                    if (read == 0) return error.ConnectionLost;
-                    self.received_len += read;
-                    try self.dispatchReceived(receiver);
-                },
-                .INTR => {},
-                .AGAIN => return,
-                else => return error.ConnectionLost,
+        /// Waits until the socket is ready for `events` or the deadline passes.
+        pub fn waitFor(self: *const Self, io: std.Io, events: i16, deadline: zui.Instant) bool {
+            while (true) {
+                const remaining_ns = deadline.nanoseconds -| zui.Instant.fromTimestamp(std.Io.Timestamp.now(io, .awake)).nanoseconds;
+                if (remaining_ns == 0) return false;
+                var descriptor = [_]linux.pollfd{.{ .fd = self.fd, .events = events, .revents = 0 }};
+                const timeout_ms: i32 = @intCast(@min(std.math.divCeil(u64, remaining_ns, std.time.ns_per_ms) catch unreachable, std.math.maxInt(i32)));
+                const ready = linux.poll(&descriptor, 1, timeout_ms);
+                switch (linux.errno(ready)) {
+                    .SUCCESS => if (ready > 0) return descriptor[0].revents & events != 0,
+                    .INTR => {},
+                    else => return false,
+                }
             }
         }
-    }
 
-    fn dispatchReceived(self: *Connection, receiver: anytype) error{ConnectionLost}!void {
-        var start: usize = 0;
-        while (start < self.received_len) {
-            if (self.bytes_to_discard > 0) {
-                const discarded = @min(self.bytes_to_discard, self.received_len - start);
-                self.bytes_to_discard -= discarded;
-                start += discarded;
-                continue;
+        /// Reads what the bus has sent, without waiting, and calls
+        /// `receiver.onMessage(message)` for each whole message. A message
+        /// that does not decode is passed over, as is one too large to
+        /// hold, after `receiver.onMessageTooLarge(header, len)` where the
+        /// receiver declares it.
+        pub fn receive(self: *Self, receiver: anytype) error{ConnectionLost}!void {
+            while (true) {
+                const read = linux.read(self.fd, self.received[self.received_len..].ptr, self.received.len - self.received_len);
+                switch (linux.errno(read)) {
+                    .SUCCESS => {
+                        if (read == 0) return error.ConnectionLost;
+                        self.received_len += read;
+                        try self.dispatchReceived(receiver);
+                    },
+                    .INTR => {},
+                    .AGAIN => return,
+                    else => return error.ConnectionLost,
+                }
             }
-            const available = self.received[start..self.received_len];
-            const total = (messageLength(available) catch return error.ConnectionLost) orelse break;
-            if (total > self.received.len) {
-                self.bytes_to_discard = total;
-                continue;
-            }
-            if (available.len < total) break;
-            if (decode(available[0..total])) |message| receiver.onMessage(message) else |_| {}
-            start += total;
         }
-        self.consume(start);
-    }
 
-    fn consume(self: *Connection, len: usize) void {
-        std.mem.copyForwards(u8, self.received[0 .. self.received_len - len], self.received[len..self.received_len]);
-        self.received_len -= len;
-    }
-};
+        fn dispatchReceived(self: *Self, receiver: anytype) error{ConnectionLost}!void {
+            var start: usize = 0;
+            while (start < self.received_len) {
+                if (self.bytes_to_discard > 0) {
+                    const discarded = @min(self.bytes_to_discard, self.received_len - start);
+                    self.bytes_to_discard -= discarded;
+                    start += discarded;
+                    continue;
+                }
+                const available = self.received[start..self.received_len];
+                const total = (messageLength(available) catch return error.ConnectionLost) orelse break;
+                if (total > self.received.len) {
+                    const Receiver = @typeInfo(@TypeOf(receiver)).pointer.child;
+                    if (@hasDecl(Receiver, "onMessageTooLarge")) {
+                        const header_len = (headerLength(available) catch return error.ConnectionLost).?;
+                        if (header_len <= self.received.len) {
+                            if (available.len < header_len) break;
+                            if (decodeHeader(available)) |decoded| receiver.onMessageTooLarge(decoded.header, total) else |_| {}
+                        }
+                    }
+                    self.bytes_to_discard = total;
+                    continue;
+                }
+                if (available.len < total) break;
+                if (decode(available[0..total])) |message| receiver.onMessage(message) else |_| {}
+                start += total;
+            }
+            self.consume(start);
+        }
+
+        fn consume(self: *Self, len: usize) void {
+            std.mem.copyForwards(u8, self.received[0 .. self.received_len - len], self.received[len..self.received_len]);
+            self.received_len -= len;
+        }
+    };
+}
 
 const testing = std.testing;
 
@@ -695,6 +780,122 @@ test "messages that arrive in pieces are dispatched once whole, and one too larg
     try connection.receive(&collected);
     try testing.expectEqual(@as(usize, 2), collected.count);
     try testing.expectEqualStrings("Last", collected.members[1][0..4]);
+}
+
+const TooLargeWatch = struct {
+    collected: Collected = .{},
+    too_large_member: [16]u8 = undefined,
+    too_large_member_len: usize = 0,
+    too_large_len: usize = 0,
+
+    pub fn onMessage(self: *TooLargeWatch, message: Message) void {
+        self.collected.onMessage(message);
+    }
+
+    pub fn onMessageTooLarge(self: *TooLargeWatch, header: Header, len: usize) void {
+        const member = header.member orelse return;
+        @memcpy(self.too_large_member[0..member.len], member);
+        self.too_large_member_len = member.len;
+        self.too_large_len = len;
+    }
+};
+
+test "a message too large to hold is reported by its header, once it has arrived, before it is passed over" {
+    const fds = try socketPair();
+    defer _ = linux.close(fds[1]);
+    var connection: ConnectionOf(256) = .{};
+    connection.adopt(fds[0]);
+    defer connection.close();
+
+    var body_buffer: [512]u8 = undefined;
+    var body: Writer = .{ .buffer = &body_buffer };
+    body.string(&@as([400]u8, @splat('x')));
+    var buffer: [1024]u8 = undefined;
+    const large = try encodeSignal(&buffer, "Large", "s", body_buffer[0..body.len]);
+    var watch: TooLargeWatch = .{};
+    const pieces_end_at = [_]usize{ 20, 60, large.len };
+    var sent: usize = 0;
+    for (pieces_end_at) |piece_end| {
+        _ = linux.write(fds[1], large[sent..].ptr, piece_end - sent);
+        sent = piece_end;
+        try connection.receive(&watch);
+        if (piece_end == 20) try testing.expectEqual(@as(usize, 0), watch.too_large_len);
+    }
+    try testing.expectEqualStrings("Large", watch.too_large_member[0..watch.too_large_member_len]);
+    try testing.expectEqual(large.len, watch.too_large_len);
+
+    var last_buffer: [128]u8 = undefined;
+    const last = try encodeSignal(&last_buffer, "Last", "", "");
+    _ = linux.write(fds[1], last.ptr, last.len);
+    try connection.receive(&watch);
+    try testing.expectEqual(@as(usize, 1), watch.collected.count);
+    try testing.expectEqualStrings("Last", watch.collected.members[0][0..4]);
+}
+
+test "an a{sv} of strings, booleans, numbers, byte arrays and filters, and an as, read back as written" {
+    var buffer: [512]u8 = undefined;
+    var writer: Writer = .{ .buffer = &buffer };
+    const options = writer.beginArray(8);
+    writer.beginVariantEntry("handle_token", "s");
+    writer.stringOfParts(&.{ "zui", "_", "7" });
+    writer.beginVariantEntry("multiple", "b");
+    writer.boolean(true);
+    writer.beginVariantEntry("timeout", "i");
+    writer.int32(-1);
+    writer.beginVariantEntry("current_folder", "ay");
+    writer.byteArray("/home/zui\x00");
+    writer.beginVariantEntry("filters", "a(sa(us))");
+    const filters = writer.beginArray(8);
+    writer.beginStruct();
+    writer.string("Themes");
+    const patterns = writer.beginArray(8);
+    writer.beginStruct();
+    writer.uint32(0);
+    writer.stringOfParts(&.{ "*.", "zon" });
+    writer.endArray(patterns);
+    writer.endArray(filters);
+    writer.endArray(options);
+    writer.stringArray(&.{ "file:///a", "file:///b" });
+    try testing.expect(!writer.overflowed);
+
+    var reader: Reader = .{ .bytes = buffer[0..writer.len] };
+    const options_end = try reader.beginArray(8);
+    try reader.beginStruct();
+    try testing.expectEqualStrings("handle_token", try reader.string());
+    try testing.expectEqualStrings("s", try reader.variantSignature());
+    try testing.expectEqualStrings("zui_7", try reader.string());
+    try reader.beginStruct();
+    try testing.expectEqualStrings("multiple", try reader.string());
+    try testing.expectEqualStrings("b", try reader.variantSignature());
+    try testing.expect(try reader.boolean());
+    try reader.beginStruct();
+    try testing.expectEqualStrings("timeout", try reader.string());
+    try testing.expectEqualStrings("i", try reader.variantSignature());
+    try testing.expectEqual(@as(u32, @bitCast(@as(i32, -1))), try reader.uint32());
+    try reader.beginStruct();
+    try testing.expectEqualStrings("current_folder", try reader.string());
+    try testing.expectEqualStrings("ay", try reader.variantSignature());
+    try testing.expectEqualStrings("/home/zui\x00", try reader.byteArray());
+    try reader.beginStruct();
+    try testing.expectEqualStrings("filters", try reader.string());
+    const filters_at = reader.position;
+    try reader.skip("v");
+    try testing.expectEqual(options_end, reader.position);
+    reader.position = filters_at;
+    try testing.expectEqualStrings("a(sa(us))", try reader.variantSignature());
+    _ = try reader.beginArray(8);
+    try reader.beginStruct();
+    try testing.expectEqualStrings("Themes", try reader.string());
+    _ = try reader.beginArray(8);
+    try reader.beginStruct();
+    try testing.expectEqual(@as(u32, 0), try reader.uint32());
+    try testing.expectEqualStrings("*.zon", try reader.string());
+    try testing.expectEqual(options_end, reader.position);
+
+    const uris_end = try reader.beginArray(4);
+    try testing.expectEqualStrings("file:///a", try reader.string());
+    try testing.expectEqualStrings("file:///b", try reader.string());
+    try testing.expectEqual(uris_end, reader.position);
 }
 
 test "authentication answers the bus's OK, then begins, and a refusal fails" {
