@@ -6,6 +6,7 @@ pub const file_watch = @import("file_watch.zig");
 pub const display = @import("display.zig");
 pub const uia = @import("uia.zig");
 pub const accessibility = @import("accessibility.zig");
+pub const services = @import("services.zig");
 
 const W = std.unicode.utf8ToUtf16LeStringLiteral;
 
@@ -16,8 +17,8 @@ const W = std.unicode.utf8ToUtf16LeStringLiteral;
 /// It reports per-monitor scale, input, the environment (dark mode, high
 /// contrast, animations, power, HDR headroom), lifecycle events from console control
 /// events, the session ending and the system sleeping, and dropped files;
-/// it sets the cursor and places the IME window; it watches directories
-/// for changes; it bridges `Frame.semantics()` to UI Automation, reporting
+/// it sets the cursor and places the IME window; it reads and writes the
+/// clipboard and opens URLs; it watches directories for changes; it bridges `Frame.semantics()` to UI Automation, reporting
 /// what an assistive technology asks for as `action` events; and it waits
 /// for `nextFrame` on its wake, its input and a high-resolution timer.
 ///
@@ -37,7 +38,57 @@ pub const Host = struct {
     /// `.scrgb_fp16` while the window's monitor runs in HDR, when the
     /// window was opened with it.
     pub const zui_output_formats: zui.OutputFormats = .initMany(&.{ .sdr, .scrgb_fp16 });
-    pub const zuiClipboard = Clipboard;
+
+    /// The clipboard, as text. `read` answers from the window thread with
+    /// up to `services.Services.clipboard_text_capacity` bytes, or
+    /// `.failed` while another application holds the clipboard open.
+    pub const zuiClipboard = struct {
+        pub fn write(host: *Host, text: []const u8) zui.ServiceError!void {
+            const units = std.unicode.calcUtf16LeLen(text) catch return error.InvalidUtf8;
+            const memory = win32.GlobalAlloc(win32.GMEM_MOVEABLE, (units + 1) * 2) orelse return error.Unavailable;
+            {
+                const locked = win32.GlobalLock(memory) orelse {
+                    _ = win32.GlobalFree(memory);
+                    return error.Unavailable;
+                };
+                defer _ = win32.GlobalUnlock(memory);
+                const destination: [*]u16 = @ptrCast(@alignCast(locked));
+                _ = std.unicode.utf8ToUtf16Le(destination[0..units], text) catch unreachable;
+                destination[units] = 0;
+            }
+            if (win32.OpenClipboard(host.hwnd) == 0) {
+                _ = win32.GlobalFree(memory);
+                return error.Unavailable;
+            }
+            defer _ = win32.CloseClipboard();
+            _ = win32.EmptyClipboard();
+            // On success the memory is the clipboard's, not ours to free.
+            if (win32.SetClipboardData(win32.CF_UNICODETEXT, memory) == null) {
+                _ = win32.GlobalFree(memory);
+                return error.Unavailable;
+            }
+        }
+
+        pub fn read(host: *Host, request: zui.ServiceRequest, sink: zui.ServiceSink) zui.ServiceError!void {
+            try host.services.claimClipboardRead(request, sink);
+            if (win32.PostMessageW(host.hwnd, wm_read_clipboard, 0, 0) == 0) {
+                host.services.releaseClipboardRead();
+                return error.Unavailable;
+            }
+        }
+    };
+
+    /// Hands a URL to the system's handler for its scheme, from the window
+    /// thread, refusing paths and `file:` URLs.
+    pub const zuiOpenUrl = struct {
+        pub fn open(host: *Host, url: []const u8) zui.ServiceError!void {
+            try host.services.claimUrl(url);
+            if (win32.PostMessageW(host.hwnd, wm_open_url, 0, 0) == 0) {
+                host.services.releaseUrl();
+                return error.Unavailable;
+            }
+        }
+    };
 
     /// Watches up to `file_watch.Watches.capacity` directories, each with
     /// its subdirectories, until `deinit`.
@@ -60,6 +111,9 @@ pub const Host = struct {
     /// Every monitor shows color this way, for tests that must not depend
     /// on the display.
     forced_display_color: ?display.DisplayColor = null,
+    /// Answers services as a test says instead of handing them to the
+    /// system, so nothing opens or shows.
+    service_fake: ?*services.ServiceFake = null,
     hwnd: win32.HWND,
     window_thread: std.Thread,
     window_created: win32.HANDLE,
@@ -86,6 +140,8 @@ pub const Host = struct {
 
     accessibility: accessibility.Bridge,
 
+    services: services.Services,
+
     const event_capacity = 512;
     const text_capacity = 1024;
     const path_capacity = 16 * 1024;
@@ -93,6 +149,8 @@ pub const Host = struct {
     const wm_apply_requests = win32.WM_APP + 1;
     const wm_close_window = win32.WM_APP + 2;
     const wm_semantics_changed = win32.WM_APP + 3;
+    const wm_read_clipboard = win32.WM_APP + 4;
+    const wm_open_url = win32.WM_APP + 5;
 
     const Inbox = struct {
         /// Positions are in physical pixels until a poll converts them.
@@ -166,11 +224,13 @@ pub const Host = struct {
         const forced_scale = self.forced_scale;
         const system_material_unavailable = self.system_material_unavailable;
         const forced_display_color = self.forced_display_color;
+        const service_fake = self.service_fake;
         self.* = .{
             .io = io,
             .forced_scale = forced_scale,
             .system_material_unavailable = system_material_unavailable,
             .forced_display_color = forced_display_color,
+            .service_fake = service_fake,
             .hwnd = undefined,
             .window_thread = undefined,
             .window_created = try manualResetEvent(),
@@ -188,6 +248,7 @@ pub const Host = struct {
             .window = .{ .options = options },
             .file_watches = .{},
             .accessibility = undefined,
+            .services = .{ .fake = service_fake },
         };
         try self.accessibility.init(options.semantics, .{ .context = self, .deliverFn = deliverAction }, wheel_step);
         errdefer self.accessibility.deinit();
@@ -577,6 +638,14 @@ pub const Host = struct {
                 self.accessibility.announceChanges();
                 return 0;
             },
+            wm_read_clipboard => {
+                self.services.answerClipboardRead(hwnd, self.zuiWaker());
+                return 0;
+            },
+            wm_open_url => {
+                self.services.openUrl(hwnd);
+                return 0;
+            },
             win32.WM_GETOBJECT => if (self.accessibility.answerGetObject(hwnd, wparam, lparam)) |answered| return answered,
             win32.WM_DROPFILES => {
                 self.receiveDrop(@ptrFromInt(wparam), at);
@@ -852,53 +921,10 @@ pub fn onConsoleControl(control: win32.DWORD) callconv(.winapi) win32.BOOL {
     }
 }
 
-/// The clipboard, as text. Both calls may fail while another application
-/// holds the clipboard open.
-pub const Clipboard = struct {
-    /// The clipboard's text as UTF-8 in `buffer`, or null when it holds no
-    /// text or the text does not fit.
-    pub fn read(host: *Host, buffer: []u8) ?[]u8 {
-        if (win32.OpenClipboard(host.hwnd) == 0) return null;
-        defer _ = win32.CloseClipboard();
-        const memory = win32.GetClipboardData(win32.CF_UNICODETEXT) orelse return null;
-        const locked = win32.GlobalLock(memory) orelse return null;
-        defer _ = win32.GlobalUnlock(memory);
-        const units: [*]const u16 = @ptrCast(@alignCast(locked));
-        const capacity = win32.GlobalSize(memory) / 2;
-        const text = units[0 .. std.mem.indexOfScalar(u16, units[0..capacity], 0) orelse capacity];
-        if (std.unicode.calcWtf8Len(text) > buffer.len) return null;
-        return buffer[0..std.unicode.wtf16LeToWtf8(buffer, text)];
-    }
-
-    pub fn write(host: *Host, text: []const u8) error{ InvalidUtf8, ClipboardUnavailable, OutOfMemory }!void {
-        const units = std.unicode.calcUtf16LeLen(text) catch return error.InvalidUtf8;
-        const memory = win32.GlobalAlloc(win32.GMEM_MOVEABLE, (units + 1) * 2) orelse return error.OutOfMemory;
-        {
-            const locked = win32.GlobalLock(memory) orelse {
-                _ = win32.GlobalFree(memory);
-                return error.OutOfMemory;
-            };
-            defer _ = win32.GlobalUnlock(memory);
-            const destination: [*]u16 = @ptrCast(@alignCast(locked));
-            _ = std.unicode.utf8ToUtf16Le(destination[0..units], text) catch unreachable;
-            destination[units] = 0;
-        }
-        if (win32.OpenClipboard(host.hwnd) == 0) {
-            _ = win32.GlobalFree(memory);
-            return error.ClipboardUnavailable;
-        }
-        defer _ = win32.CloseClipboard();
-        _ = win32.EmptyClipboard();
-        if (win32.SetClipboardData(win32.CF_UNICODETEXT, memory) == null) {
-            _ = win32.GlobalFree(memory);
-            return error.ClipboardUnavailable;
-        }
-    }
-};
-
 test {
     _ = keys;
     _ = file_watch;
     _ = display;
     _ = accessibility;
+    _ = services;
 }

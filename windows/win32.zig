@@ -330,6 +330,7 @@ pub extern "shell32" fn DragAcceptFiles(hwnd: HWND, accept: BOOL) callconv(.wina
 pub extern "shell32" fn DragQueryFileW(drop: HDROP, index: UINT, file: ?[*]u16, capacity: UINT) callconv(.winapi) UINT;
 pub extern "shell32" fn DragQueryPoint(drop: HDROP, point: *POINT) callconv(.winapi) BOOL;
 pub extern "shell32" fn DragFinish(drop: HDROP) callconv(.winapi) void;
+pub extern "shell32" fn ShellExecuteW(hwnd: ?HWND, operation: ?[*:0]const u16, file: [*:0]const u16, parameters: ?[*:0]const u16, directory: ?[*:0]const u16, show: c_int) callconv(.winapi) ?HINSTANCE;
 
 pub extern "imm32" fn ImmGetContext(hwnd: HWND) callconv(.winapi) ?HIMC;
 pub extern "imm32" fn ImmReleaseContext(hwnd: HWND, context: HIMC) callconv(.winapi) BOOL;

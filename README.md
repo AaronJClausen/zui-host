@@ -37,8 +37,14 @@ window keeps drawing while the user drags its edges or moves it. It:
 - waits as `nextFrame` says: at once, until an instant on a
   high-resolution timer, or until input or a wake, which is sticky and
   works from any thread;
-- offers the clipboard as text through `Host.zuiClipboard.read(host,
-  buffer)` and `write(host, text)`;
+- offers zui's host services: the clipboard as text,
+  `Host.zuiClipboard.write(host, text)` and `read(host, request, sink)`,
+  and `Host.zuiOpenUrl.open(host, url)`, which hands a URL to the
+  system's handler for its scheme and refuses paths and `file:` URLs.
+  Each call returns at once; the window thread does the work and
+  publishes every answer, a `zui.ServiceReply`, into a source of the
+  application's, so answers never come from two threads. Notifications,
+  file dialogs and menus come next;
 - watches up to four directories, each with its subdirectories, through
   `Host.zuiFileWatch.watch(host, directory, sink)`: a thread per
   directory waits on `ReadDirectoryChangesW` and publishes each change, a

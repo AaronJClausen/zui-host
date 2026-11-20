@@ -18,6 +18,7 @@ const testing = std.testing;
 
 const HiddenWindow = struct {
     window_host: Host = undefined,
+    service_fake: zui_host.windows.services.ServiceFake = .{},
 
     /// With `forced_scale` set, a pixel is that many layout units at a zoom of 1.
     fn open(self: *HiddenWindow, forced_scale: ?f32) !void {
@@ -26,6 +27,7 @@ const HiddenWindow = struct {
 
     fn openWithSemantics(self: *HiddenWindow, forced_scale: ?f32, semantics: zui.SemanticsCapacity) !void {
         self.window_host.forced_scale = forced_scale;
+        self.window_host.service_fake = &self.service_fake;
         try self.window_host.init(testing.io, .{ .title = "zui host suite", .size = .{ 320, 240 }, .visible = false, .semantics = semantics });
     }
 
@@ -75,6 +77,10 @@ const MessageHarness = struct {
         const element = try client.findByName(window, label) orelse return error.ElementNotFound;
         defer element.release();
         if (!try element.invoke()) return error.NotInvokable;
+    }
+
+    pub fn openedUrl(self: *MessageHarness) ?[]const u8 {
+        return self.window.service_fake.openedUrl();
     }
 
     pub fn close(self: *MessageHarness) void {
@@ -229,15 +235,54 @@ test "the session ending is a terminate request, after which the window reports 
     try testing.expect(!polled.poll(&window.window_host));
 }
 
-test "the clipboard round-trips text" {
+const Replies = zui_async.Stream(zui.ServiceReply(64), .{ .capacity = 4 });
+
+/// Waits, a wake at a time and for at most two seconds, for the host's
+/// next answer.
+fn awaitReply(host: *Host, replies: *Replies) !zui.ServiceReply(64) {
+    const deadline = host.now().addNanoseconds(2 * std.time.ns_per_s);
+    while (host.now().isBefore(deadline)) {
+        host.zuiWait(.{ .at = deadline });
+        replies.zuiSwap();
+        var items = replies.zuiView().items();
+        if (items.next()) |reply| return reply.*;
+    }
+    return error.NotAnswered;
+}
+
+test "the clipboard round-trips text, answered from the window thread for its request" {
     var window: HiddenWindow = .{};
     try window.open(1);
     defer window.close();
     const host = &window.window_host;
     try Host.zuiClipboard.write(host, "zui → clipboard ✓");
-    var buffer: [64]u8 = undefined;
-    try testing.expectEqualStrings("zui → clipboard ✓", Host.zuiClipboard.read(host, &buffer).?);
-    try testing.expectEqual(@as(?[]u8, null), Host.zuiClipboard.read(host, buffer[0..4]));
+    var replies: Replies = .{};
+    const paste: zui.ServiceRequest = .of("paste");
+    try Host.zuiClipboard.read(host, paste, .of(&replies));
+    const reply = try awaitReply(host, &replies);
+    try testing.expectEqual(paste, reply.request);
+    try testing.expectEqual(.clipboard_text, reply.kind);
+    try testing.expectEqualStrings("zui → clipboard ✓", reply.text());
+    try testing.expectError(error.InvalidUtf8, Host.zuiClipboard.write(host, "\xff"));
+}
+
+test "a URL reaches the system from the window thread, and what is not one never does" {
+    var window: HiddenWindow = .{};
+    try window.open(1);
+    defer window.close();
+    const host = &window.window_host;
+    for ([_][]const u8{ "C:\\Windows\\System32\\calc.exe", "file:///C:/Windows/System32/calc.exe", "\\\\server\\share\\run.bat", "calc" }) |not_a_url| {
+        try testing.expectError(error.InvalidUrl, Host.zuiOpenUrl.open(host, not_a_url));
+    }
+    try testing.expectError(error.TooLarge, Host.zuiOpenUrl.open(host, "https://example.com/" ++ "a" ** zui_host.windows.services.Services.url_capacity));
+    try testing.expectError(error.InvalidUtf8, Host.zuiOpenUrl.open(host, "https://example.com/\xff"));
+    try testing.expectEqual(@as(?[]const u8, null), window.service_fake.openedUrl());
+
+    const url = "https://ziglang.org/documentation/0.16.0/#✓";
+    try Host.zuiOpenUrl.open(host, url);
+    const deadline = host.now().addNanoseconds(2 * std.time.ns_per_s);
+    while (window.service_fake.openedUrl() == null and host.now().isBefore(deadline)) try testing.io.sleep(.fromMilliseconds(5), .awake);
+    try testing.expectEqualStrings(url, window.service_fake.openedUrl() orelse "");
 }
 
 test "requests reach the window: the cursor it shows, and an IME only while text input is asked for" {
