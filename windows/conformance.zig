@@ -57,6 +57,10 @@ const HiddenWindow = struct {
     fn send(self: *HiddenWindow, message: win32.UINT, wparam: win32.WPARAM, lparam: win32.LPARAM) void {
         _ = win32.SendMessageW(self.window_host.hwnd, message, wparam, lparam);
     }
+
+    fn main(self: *HiddenWindow) *Host.Window {
+        return self.window_host.windowById(.main).?;
+    }
 };
 
 /// Turns each event the suite posts into the messages Windows would send
@@ -69,17 +73,27 @@ const MessageHarness = struct {
     }
 
     pub fn post(self: *MessageHarness, event: zui.Event) bool {
-        const pixels_per_unit = self.window.window_host.pixels_per_unit;
+        return self.postTo(.main, event);
+    }
+
+    pub fn postTo(self: *MessageHarness, id: zui.WindowId, event: zui.Event) bool {
+        const target = self.window.window_host.windowById(id) orelse return false;
+        const hwnd = target.hwnd;
+        const pixels_per_unit = target.pixels_per_unit;
         switch (event) {
-            .pointer_move => |move| self.window.send(win32.WM_MOUSEMOVE, 0, pixels(move.pointer.position, pixels_per_unit)),
-            .pointer_down => |press| self.window.send(win32.WM_LBUTTONDOWN, win32.MK_LBUTTON, pixels(press.pointer.position, pixels_per_unit)),
-            .pointer_up => |release| self.window.send(win32.WM_LBUTTONUP, 0, pixels(release.pointer.position, pixels_per_unit)),
-            .key_down => |key| self.window.send(win32.WM_KEYDOWN, keys.virtualKeyFromKey(key.key).?, 1),
-            .key_up => |key| self.window.send(win32.WM_KEYUP, keys.virtualKeyFromKey(key.key).?, @bitCast(@as(usize, 0xC0000001))),
-            .text => |text| for (text) |byte| self.window.send(win32.WM_CHAR, byte, 1),
+            .pointer_move => |move| sendTo(hwnd, win32.WM_MOUSEMOVE, 0, pixels(move.pointer.position, pixels_per_unit)),
+            .pointer_down => |press| sendTo(hwnd, win32.WM_LBUTTONDOWN, win32.MK_LBUTTON, pixels(press.pointer.position, pixels_per_unit)),
+            .pointer_up => |release| sendTo(hwnd, win32.WM_LBUTTONUP, 0, pixels(release.pointer.position, pixels_per_unit)),
+            .key_down => |key| sendTo(hwnd, win32.WM_KEYDOWN, keys.virtualKeyFromKey(key.key).?, 1),
+            .key_up => |key| sendTo(hwnd, win32.WM_KEYUP, keys.virtualKeyFromKey(key.key).?, @bitCast(@as(usize, 0xC0000001))),
+            .text => |text| for (text) |byte| sendTo(hwnd, win32.WM_CHAR, byte, 1),
             else => return false,
         }
         return true;
+    }
+
+    fn sendTo(hwnd: win32.HWND, message: win32.UINT, wparam: win32.WPARAM, lparam: win32.LPARAM) void {
+        _ = win32.SendMessageW(hwnd, message, wparam, lparam);
     }
 
     /// Through UI Automation, from this thread, which owns no window.
@@ -324,7 +338,7 @@ fn awaitNotifyIconCalls(window: *HiddenWindow, message: win32.DWORD, count: u32)
 }
 
 fn sendNotifyIconEvent(window: *HiddenWindow, event: win32.UINT) void {
-    window.send(Host.wm_notify_icon, 0, zui_host.windows.services.notifyIconEventLparam(event));
+    _ = win32.SendMessageW(window.window_host.anchor, Host.wm_notify_icon, 0, zui_host.windows.services.notifyIconEventLparam(event));
 }
 
 test "a notification shows as a balloon of the window's icon, its title cut at a character, and answers activated when clicked" {
@@ -711,15 +725,15 @@ test "requests reach the window: the cursor it shows, and an IME only while text
     const requests: zui.HostRequests = .{ .cursor = .text, .text_input = .{ .caret = .{ .x = 10, .y = 10, .width = 2, .height = 16 } } };
     host.zuiApply(.main, requests);
     try expectAppliedWithin(host, requests);
-    try testing.expect(host.window.ime_enabled);
+    try testing.expect(window.main().thread_state.ime_enabled);
     host.zuiApply(.main, .{});
     try expectAppliedWithin(host, .{});
-    try testing.expect(!host.window.ime_enabled);
+    try testing.expect(!window.main().thread_state.ime_enabled);
 }
 
 fn expectAppliedWithin(host: *Host, requests: zui.HostRequests) !void {
     for (0..200) |_| {
-        if (std.meta.eql(host.window.applied, requests)) return;
+        if (std.meta.eql(host.windowById(.main).?.thread_state.applied, requests)) return;
         try testing.io.sleep(.fromMilliseconds(5), .awake);
     }
     return error.RequestsNotApplied;
@@ -1336,7 +1350,7 @@ test "a native title bar is reported as the system's, keeps no chrome, and its h
 
     var regions = [_]zui.ChromeRegion{.{ .id = 1, .bounds = .{ .width = 320, .height = 240 }, .kind = .close_button }};
     window.window_host.zuiChromeRegions(.main, &regions);
-    try testing.expectEqual(@as(usize, 0), window.window_host.chrome_snapshot.count);
+    try testing.expectEqual(@as(usize, 0), window.main().chrome_snapshot.count);
     try testing.expectEqual(@as(win32.LRESULT, win32.HTCAPTION), window.hitTest(.{ 100, -10 }));
     try testing.expectEqual(@as(win32.LRESULT, win32.HTCLIENT), window.hitTest(.{ 100, 100 }));
 }
@@ -1455,9 +1469,10 @@ test "a press on the drawn close button reaches zui and its release cancels it, 
 }
 
 fn queuedEvent(host: *Host, comptime tag: std.meta.Tag(zui.Event)) bool {
+    const inbox = &host.windowById(.main).?.inbox;
     win32.AcquireSRWLockExclusive(&host.lock);
     defer win32.ReleaseSRWLockExclusive(&host.lock);
-    for (host.inbox.events[0..host.inbox.event_count]) |event| if (event == tag) return true;
+    for (inbox.events[0..inbox.event_count]) |event| if (event == tag) return true;
     return false;
 }
 
@@ -1480,4 +1495,109 @@ test "under a custom title bar a native menu bar is unavailable, since the drawn
     defer window.close();
     var replies: Replies = .{};
     try testing.expectError(error.Unavailable, Host.zuiMenus.setBar(&window.window_host, .main, .of("file menu"), &.{.{ .id = @enumFromInt(1), .label = "File" }}, .of(&replies)));
+}
+
+const second_window_options: zui.WindowOptions = .{ .title = "zui host suite, second window", .size = .{ 320, 240 }, .visible = false };
+
+fn pollWindow(polled: *Polled, host: *Host, id: zui.WindowId) bool {
+    return host.zuiPoll(id, &polled.builder);
+}
+
+test "closing one window by its close button closes it alone" {
+    var window: HiddenWindow = .{};
+    try window.open(1);
+    defer window.close();
+    const host = &window.window_host;
+    const second = try host.zuiOpenWindow(second_window_options);
+    var polled: Polled = .{};
+    polled.init();
+    try testing.expect(pollWindow(&polled, host, second));
+
+    _ = win32.SendMessageW(host.windowById(second).?.hwnd, win32.WM_CLOSE, 0, 0);
+    try testing.expect(!pollWindow(&polled, host, second));
+    try testing.expect(polled.poll(host));
+    host.zuiCloseWindow(second);
+    try testing.expectEqual(null, host.windowById(second));
+    try testing.expect(polled.poll(host));
+}
+
+test "a DPI change in one window moves that window's scale alone" {
+    var window: HiddenWindow = .{};
+    try window.open(null);
+    defer window.close();
+    const host = &window.window_host;
+    const second = try host.zuiOpenWindow(second_window_options);
+    var polled: Polled = .{};
+    polled.init();
+    _ = polled.poll(host);
+    const main_scale = polled.builder.params.scale;
+    _ = pollWindow(&polled, host, second);
+
+    const hwnd = host.windowById(second).?.hwnd;
+    var frame: win32.RECT = .{};
+    _ = win32.GetWindowRect(hwnd, &frame);
+    const doubled_dpi = 2 * win32.GetDpiForWindow(hwnd);
+    _ = win32.SendMessageW(hwnd, win32.WM_DPICHANGED, doubled_dpi * 0x10001, @bitCast(@intFromPtr(&frame)));
+
+    try testing.expect(pollWindow(&polled, host, second));
+    try testing.expectEqual(@as(f32, @floatFromInt(doubled_dpi)) / win32.USER_DEFAULT_SCREEN_DPI, polled.builder.params.scale);
+    try testing.expect(polled.poll(host));
+    try testing.expectEqual(main_scale, polled.builder.params.scale);
+}
+
+test "Ctrl+C reaches every window, and each then reports itself closed" {
+    var window: HiddenWindow = .{};
+    try window.open(1);
+    defer window.close();
+    const host = &window.window_host;
+    const second = try host.zuiOpenWindow(second_window_options);
+    var polled: Polled = .{};
+    polled.init();
+    _ = polled.poll(host);
+    _ = pollWindow(&polled, host, second);
+
+    try testing.expectEqual(@as(win32.BOOL, 1), zui_host.windows.onConsoleControl(win32.CTRL_C_EVENT));
+    for ([_]zui.WindowId{ .main, second }) |id| {
+        try testing.expect(pollWindow(&polled, host, id));
+        try testing.expectEqual(zui.Lifecycle.terminate_requested, polled.find(.lifecycle).?);
+        try testing.expect(!pollWindow(&polled, host, id));
+    }
+}
+
+test "past the windows the host holds, one more is refused, and after one closes a new one opens with a new id" {
+    var window: HiddenWindow = .{};
+    try window.open(1);
+    defer window.close();
+    const host = &window.window_host;
+    var opened: [Host.max_windows - 1]zui.WindowId = undefined;
+    for (&opened) |*id| id.* = try host.zuiOpenWindow(second_window_options);
+    try testing.expectError(error.TooManyWindows, host.zuiOpenWindow(second_window_options));
+
+    host.zuiCloseWindow(opened[1]);
+    const reopened = try host.zuiOpenWindow(second_window_options);
+    for (opened) |id| try testing.expect(reopened != id);
+    try testing.expect(reopened != .main);
+}
+
+test "with the main window closed, the clipboard still round-trips, and a dialog over another window answers naming it" {
+    var window: HiddenWindow = .{};
+    try window.open(1);
+    defer window.close();
+    const host = &window.window_host;
+    const second = try host.zuiOpenWindow(second_window_options);
+    host.zuiCloseWindow(.main);
+    try testing.expectEqual(null, host.windowById(.main));
+
+    try Host.zuiClipboard.write(host, "still here");
+    var replies: Replies = .{};
+    try Host.zuiClipboard.read(host, .of("paste"), .of(&replies));
+    const pasted = try awaitReply(host, &replies);
+    try testing.expectEqualStrings("still here", pasted.text());
+
+    try testing.expectError(error.Unavailable, Host.zuiFileDialogs.show(host, .main, .of("open"), .{}, .of(&replies)));
+    window.service_fake.scriptFileDialog("C:\\theme.zon\x00");
+    try Host.zuiFileDialogs.show(host, second, .of("open"), .{}, .of(&replies));
+    const chosen = try awaitReply(host, &replies);
+    try testing.expectEqual(second, chosen.window);
+    try testing.expectEqual(.files_chosen, chosen.kind);
 }

@@ -13,9 +13,19 @@ const Host = zui_host.Host; // zui_host.windows.Host on Windows, zui_host.linux.
 
 ## The Windows host
 
-`zui_host.Host` opens a Win32 window and gives renderers its `win32`
-surface (the `HWND`). Its message loop runs on a thread of its own, so the
+`zui_host.Host` opens Win32 windows and gives renderers each one's `win32`
+surface (the `HWND`). Its message loop runs on a thread of its own, so a
 window keeps drawing while the user drags its edges or moves it. It:
+
+- opens many windows (`zui_capabilities.windows = .many`): `init` opens
+  `.main`, and `zuiOpenWindow(options)` up to `Host.max_windows - 1` more,
+  each with an id never given twice, its own events, scale, requests,
+  chrome regions, accessibility bridge and menu bar, polled by its id;
+  `zuiCloseWindow(window)` closes any of them, `.main` included. One wait
+  covers them all. A message-only window anchors the window thread and
+  owns the clipboard and the notification icon, so every service keeps
+  working whichever windows are open, and the console's terminate and
+  low memory reach every window;
 
 - reports per-monitor scale (per-monitor DPI awareness v2), keeping the
   window's size in layout units when it moves to a monitor of another DPI;
@@ -85,8 +95,9 @@ window keeps drawing while the user drags its edges or moves it. It:
   Windows from the frame's chrome regions, which `zui_app` hands to
   `zuiChromeRegions`; see *A custom title bar* below.
 
-It passes zui's host suite (`zui_testing.expectHostConforms`) against a
-hidden window, whose harness sends the messages Windows would.
+It passes zui's host suite (`zui_testing.expectHostConforms`) against
+hidden windows, two of them for its many-windows steps, whose harness
+sends each window the messages Windows would.
 
 ## The Linux host
 

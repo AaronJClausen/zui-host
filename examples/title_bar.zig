@@ -193,9 +193,10 @@ const Check = struct {
                 check.failures += 1;
                 continue;
             };
+            const pixels_per_unit = host.pixelsPerUnit(.main);
             var point: win32.POINT = .{
-                .x = @intFromFloat(at[0] * host.pixels_per_unit),
-                .y = @intFromFloat(at[1] * host.pixels_per_unit),
+                .x = @intFromFloat(at[0] * pixels_per_unit),
+                .y = @intFromFloat(at[1] * pixels_per_unit),
             };
             _ = win32.ClientToScreen(host.hwnd, &point);
             const answered = win32.SendMessageW(host.hwnd, win32.WM_NCHITTEST, 0, win32.lparamFromPoint(@intCast(point.x), @intCast(point.y)));

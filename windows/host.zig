@@ -13,9 +13,9 @@ pub const chrome = @import("chrome.zig");
 
 const W = std.unicode.utf8ToUtf16LeStringLiteral;
 
-/// zui's host contract on a Win32 window, with its message loop on a thread
-/// of its own, so the window keeps drawing while the user drags its edges
-/// or moves it: Windows runs those drags in a loop of its own.
+/// zui's host contract on Win32 windows, with their message loop on a
+/// thread of its own, so a window keeps drawing while the user drags its
+/// edges or moves it: Windows runs those drags in a loop of its own.
 ///
 /// It reports per-monitor scale, input, the environment (dark mode, high
 /// contrast, animations, power, HDR headroom), lifecycle events from console control
@@ -28,8 +28,12 @@ const W = std.unicode.utf8ToUtf16LeStringLiteral;
 /// what an assistive technology asks for as `action` events; and it waits
 /// for `nextFrame` on its wake, its input and a high-resolution timer.
 ///
-/// `init` opens the window and `deinit` closes it; the host must not move
-/// in between, since its window thread holds a pointer to it.
+/// `init` opens `.main`, and `zuiOpenWindow` up to `max_windows - 1` more,
+/// each with its own events, scale, requests, chrome, accessibility and
+/// menu bar. A message-only window anchors the window thread and owns the
+/// clipboard and the notification icon, so every service works whichever
+/// windows are open. `deinit` closes them all; the host must not move in
+/// between, since its window thread holds pointers into it.
 ///
 /// ```zig
 /// const App = struct {
@@ -40,10 +44,13 @@ const W = std.unicode.utf8ToUtf16LeStringLiteral;
 /// ```
 pub const Host = struct {
     pub const zui_surfaces: zui.SurfaceKinds = .initOne(.win32);
-    pub const zui_capabilities: zui.HostCapabilities = .{ .windows = .one, .system_material = true, .custom_title_bar = true };
+    pub const zui_capabilities: zui.HostCapabilities = .{ .windows = .many, .system_material = true, .custom_title_bar = true };
     /// `.scrgb_fp16` while the window's monitor runs in HDR, when the
     /// window was opened with it.
     pub const zui_output_formats: zui.OutputFormats = .initMany(&.{ .sdr, .scrgb_fp16 });
+
+    /// The windows open at once, `.main` among them.
+    pub const max_windows = 4;
 
     /// The clipboard, as text. `read` answers from the window thread with
     /// up to `services.Services.clipboard_text_capacity` bytes, or
@@ -62,7 +69,7 @@ pub const Host = struct {
                 _ = std.unicode.utf8ToUtf16Le(destination[0..units], text) catch unreachable;
                 destination[units] = 0;
             }
-            if (win32.OpenClipboard(host.hwnd) == 0) {
+            if (win32.OpenClipboard(host.anchor) == 0) {
                 _ = win32.GlobalFree(memory);
                 return error.Unavailable;
             }
@@ -77,7 +84,7 @@ pub const Host = struct {
 
         pub fn read(host: *Host, request: zui.ServiceRequest, sink: zui.ServiceSink) zui.ServiceError!void {
             try host.services.claimClipboardRead(request, sink);
-            if (win32.PostMessageW(host.hwnd, wm_read_clipboard, 0, 0) == 0) {
+            if (win32.PostMessageW(host.anchor, wm_read_clipboard, 0, 0) == 0) {
                 host.services.releaseClipboardRead();
                 return error.Unavailable;
             }
@@ -89,23 +96,23 @@ pub const Host = struct {
     pub const zuiOpenUrl = struct {
         pub fn open(host: *Host, url: []const u8) zui.ServiceError!void {
             try host.services.claimUrl(url);
-            if (win32.PostMessageW(host.hwnd, wm_open_url, 0, 0) == 0) {
+            if (win32.PostMessageW(host.anchor, wm_open_url, 0, 0) == 0) {
                 host.services.releaseUrl();
                 return error.Unavailable;
             }
         }
     };
 
-    /// A balloon of the window's notification-area icon, which Windows 10
-    /// and 11 show as a toast: its title cut at a character to 63 UTF-16
-    /// units and its body to 255. It answers `.notification_activated` when
-    /// clicked and `.notification_dismissed` when it times out, is closed,
-    /// or the next one replaces it; one still showing at `deinit` is not
-    /// answered.
+    /// A balloon of the application's notification-area icon, which
+    /// Windows 10 and 11 show as a toast: its title cut at a character to
+    /// 63 UTF-16 units and its body to 255. It answers
+    /// `.notification_activated` when clicked and `.notification_dismissed`
+    /// when it times out, is closed, or the next one replaces it; one still
+    /// showing at `deinit` is not answered.
     pub const zuiNotifications = struct {
         pub fn show(host: *Host, request: zui.ServiceRequest, notification: zui.Notification, sink: zui.ServiceSink) zui.ServiceError!void {
             try host.services.claimNotification(request, notification, sink);
-            if (win32.PostMessageW(host.hwnd, wm_show_notification, 0, 0) == 0) {
+            if (win32.PostMessageW(host.anchor, wm_show_notification, 0, 0) == 0) {
                 host.services.releaseNotification();
                 return error.Unavailable;
             }
@@ -113,15 +120,17 @@ pub const Host = struct {
     };
 
     /// The shell's dialogs, `IFileOpenDialog` and `IFileSaveDialog`, shown
-    /// on the window thread and owned by the window, one at a time. They
-    /// answer `.files_chosen` with file-system paths, up to
-    /// `services.Services.chosen_paths_capacity` bytes of them, or
-    /// `.canceled`. One still open at `deinit` is closed and not answered.
+    /// on the window thread and owned by the window named, one at a time
+    /// over all windows. They answer `.files_chosen` with file-system
+    /// paths, up to `services.Services.chosen_paths_capacity` bytes of
+    /// them, or `.canceled`, naming the window. One still open when its
+    /// window closes is closed and not answered; a window that is not open
+    /// is `error.Unavailable`.
     pub const zuiFileDialogs = struct {
         pub fn show(host: *Host, window: zui.WindowId, request: zui.ServiceRequest, dialog: zui.FileDialog, sink: zui.ServiceSink) zui.ServiceError!void {
-            std.debug.assert(window == .main);
-            try host.services.claimFileDialog(request, dialog, sink);
-            if (win32.PostMessageW(host.hwnd, wm_show_file_dialog, 0, 0) == 0) {
+            const target = host.windowById(window) orelse return error.Unavailable;
+            try host.services.claimFileDialog(request, window, dialog, sink);
+            if (win32.PostMessageW(target.hwnd, wm_show_file_dialog, 0, 0) == 0) {
                 host.services.releaseFileDialog();
                 return error.Unavailable;
             }
@@ -130,35 +139,37 @@ pub const Host = struct {
 
     /// Windows' own menus, built on the window thread from up to
     /// `menu.CopiedMenu.entry_capacity` items with labels shown as written
-    /// and shortcuts after them. `popup` shows a context menu at a position
-    /// in layout units with `TrackPopupMenuEx`, one at a time with a file
-    /// dialog, and answers the item chosen or `.canceled`; one still open at
-    /// `deinit` is closed and not answered. `setBar` replaces the window's
-    /// menu bar, or removes it given no items, and answers each item chosen
-    /// from it; the client area shrinks by the bar's height. A window with a
-    /// custom title bar has no room for a native bar, which would sit
-    /// hidden under the drawn one, so there `setBar` is `error.Unavailable`
-    /// and the application draws its menus in its title bar.
+    /// and shortcuts after them. `popup` shows a context menu over the
+    /// window named at a position in its layout units with
+    /// `TrackPopupMenuEx`, one at a time with a file dialog over all
+    /// windows, and answers the item chosen or `.canceled`; one still open
+    /// when its window closes is closed and not answered. `setBar` replaces
+    /// the window's menu bar, or removes it given no items, and answers
+    /// each item chosen from it; the client area shrinks by the bar's
+    /// height. A window with a custom title bar has no room for a native
+    /// bar, which would sit hidden under the drawn one, so there `setBar`
+    /// is `error.Unavailable` and the application draws its menus in its
+    /// title bar. A window that is not open is `error.Unavailable`.
     pub const zuiMenus = struct {
         pub fn popup(host: *Host, window: zui.WindowId, request: zui.ServiceRequest, items: []const zui.MenuItem, position: [2]f32, sink: zui.ServiceSink) zui.ServiceError!void {
-            std.debug.assert(window == .main);
+            const target = host.windowById(window) orelse return error.Unavailable;
             const in_client_pixels: win32.POINT = .{
-                .x = std.math.lossyCast(i32, @round(position[0] * host.pixels_per_unit)),
-                .y = std.math.lossyCast(i32, @round(position[1] * host.pixels_per_unit)),
+                .x = std.math.lossyCast(i32, @round(position[0] * target.pixels_per_unit)),
+                .y = std.math.lossyCast(i32, @round(position[1] * target.pixels_per_unit)),
             };
-            try host.services.claimPopupMenu(request, items, in_client_pixels, sink);
-            if (win32.PostMessageW(host.hwnd, wm_show_popup_menu, 0, 0) == 0) {
+            try host.services.claimPopupMenu(request, window, items, in_client_pixels, sink);
+            if (win32.PostMessageW(target.hwnd, wm_show_popup_menu, 0, 0) == 0) {
                 host.services.releasePopupMenu();
                 return error.Unavailable;
             }
         }
 
         pub fn setBar(host: *Host, window: zui.WindowId, request: zui.ServiceRequest, items: []const zui.MenuItem, sink: zui.ServiceSink) zui.ServiceError!void {
-            std.debug.assert(window == .main);
-            if (host.custom_title_bar) return error.Unavailable;
-            try host.services.claimMenuBar(request, items, sink);
-            if (win32.PostMessageW(host.hwnd, wm_set_menu_bar, 0, 0) == 0) {
-                host.services.releaseMenuBar();
+            const target = host.windowById(window) orelse return error.Unavailable;
+            if (target.custom_title_bar) return error.Unavailable;
+            try target.menu_bar.claim(request, window, items, sink);
+            if (win32.PostMessageW(target.hwnd, wm_set_menu_bar, 0, 0) == 0) {
+                target.menu_bar.release();
                 return error.Unavailable;
             }
         }
@@ -188,34 +199,34 @@ pub const Host = struct {
     /// Answers services as a test says instead of handing them to the
     /// system, so nothing opens or shows.
     service_fake: ?*services.ServiceFake = null,
+    /// The main window's handle, while it is open.
     hwnd: win32.HWND,
+    /// The message-only window that anchors the window thread: it opens and
+    /// closes the others, and owns the clipboard and the notification icon.
+    anchor: win32.HWND,
     window_thread: std.Thread,
     window_created: win32.HANDLE,
     woken: win32.HANDLE,
     input_arrived: win32.HANDLE,
     timer: win32.HANDLE,
     low_memory: ?win32.HANDLE,
-    was_low_on_memory: bool,
-    /// The poll after the one that delivered a terminate request reports
-    /// the window closed.
-    terminate_delivered: bool,
-    /// What the last poll converted pixels to layout units by.
-    pixels_per_unit: f32,
-    /// The window was opened with `title_bar = .custom`.
-    custom_title_bar: bool,
-    chrome_snapshot: chrome.ChromeSnapshot,
+    /// The id the next window opened takes; ids are never given twice.
+    next_window_id: u32,
+    /// The main window's title, which the notification icon shows.
+    notification_tip: [128]u16,
+    notification_tip_len: usize,
 
+    /// Guards each window's inbox, requests and `in_use`.
     lock: win32.SRWLOCK,
-    /// Shared with the window thread, under `lock`.
-    inbox: Inbox,
-    requests: zui.HostRequests,
+    windows: [max_windows]Window,
 
     /// Only the window thread reads and writes these.
-    window: WindowThreadState,
+    dropped_path_utf16: [longest_path]u16,
+    anchor_init_error: ?anyerror,
+    closing: bool,
+    anchor_destroyed: bool,
 
     file_watches: file_watch.Watches,
-
-    accessibility: accessibility.Bridge,
 
     services: services.Services,
 
@@ -229,12 +240,16 @@ pub const Host = struct {
     const wm_read_clipboard = win32.WM_APP + 4;
     const wm_open_url = win32.WM_APP + 5;
     const wm_show_notification = win32.WM_APP + 6;
-    /// What the notification-area icon sends the window when its balloon
-    /// is shown, clicked, timed out or closed.
+    /// What the notification-area icon sends the anchor when its balloon is
+    /// shown, clicked, timed out or closed.
     pub const wm_notify_icon = win32.WM_APP + 7;
     const wm_show_file_dialog = win32.WM_APP + 8;
     const wm_show_popup_menu = win32.WM_APP + 9;
     const wm_set_menu_bar = win32.WM_APP + 10;
+    /// To the anchor, sent: `wparam` is the slot to create a window in.
+    const wm_open_window = win32.WM_APP + 11;
+    /// To the anchor: close every window, then the anchor.
+    const wm_close_host = win32.WM_APP + 12;
 
     const Inbox = struct {
         /// Positions are in physical pixels until a poll converts them.
@@ -296,7 +311,6 @@ pub const Host = struct {
         cursors: std.EnumArray(zui.Cursor, ?win32.HCURSOR) = .initFill(null),
         applied: zui.HostRequests = .{},
         ime_enabled: bool = true,
-        path_utf16: [longest_path]u16 = undefined,
         init_error: ?anyerror = null,
         options: zui.WindowOptions = .{},
         /// Windows took the backdrop the window asked for.
@@ -308,6 +322,466 @@ pub const Host = struct {
         /// The caption button a press began on, as its hit-test code; its
         /// release on the same button works it.
         pressed_caption_button: ?usize = null,
+    };
+
+    /// One of the host's windows: what it shares with the UI thread under
+    /// the host's `lock`, what only the window thread touches, and its
+    /// chrome, accessibility bridge and menu bar, each with a lock of its
+    /// own.
+    pub const Window = struct {
+        host: *Host,
+        id: zui.WindowId = .main,
+        /// Holds an open window. Set under the host's `lock`; the window
+        /// thread clears it once the window is destroyed.
+        in_use: bool = false,
+        hwnd: win32.HWND = undefined,
+        /// What the last poll converted pixels to layout units by.
+        pixels_per_unit: f32 = 1,
+        was_low_on_memory: bool = false,
+        /// The poll after the one that delivered a terminate request reports
+        /// the window closed.
+        terminate_delivered: bool = false,
+        /// The window was opened with `title_bar = .custom`.
+        custom_title_bar: bool = false,
+        chrome_snapshot: chrome.ChromeSnapshot = .{},
+        inbox: Inbox = .{},
+        requests: zui.HostRequests = .{},
+        thread_state: WindowThreadState = .{},
+        accessibility: accessibility.Bridge = undefined,
+        menu_bar: services.MenuBar = .{},
+
+        fn deliver(self: *Window, event_to_queue: zui.Event) void {
+            win32.AcquireSRWLockExclusive(&self.host.lock);
+            defer win32.ReleaseSRWLockExclusive(&self.host.lock);
+            self.inbox.push(event_to_queue);
+            _ = win32.SetEvent(self.host.input_arrived);
+        }
+
+        fn deliverText(self: *Window, utf8: []const u8) void {
+            win32.AcquireSRWLockExclusive(&self.host.lock);
+            defer win32.ReleaseSRWLockExclusive(&self.host.lock);
+            self.inbox.pushText(utf8);
+            _ = win32.SetEvent(self.host.input_arrived);
+        }
+
+        fn deliverAction(context: *anyopaque, action: zui.ActionEvent) void {
+            const self: *Window = @ptrCast(@alignCast(context));
+            self.deliver(.{ .action = action });
+        }
+
+        /// Something changed that needs a frame but carries no event, such as
+        /// the window's size.
+        fn signalInput(self: *Window) void {
+            _ = win32.SetEvent(self.host.input_arrived);
+        }
+
+        fn recordClientSize(self: *Window, hwnd: win32.HWND, dpi: u32) void {
+            var client: win32.RECT = .{};
+            _ = win32.GetClientRect(hwnd, &client);
+            win32.AcquireSRWLockExclusive(&self.host.lock);
+            defer win32.ReleaseSRWLockExclusive(&self.host.lock);
+            self.inbox.client_size = .{ @intCast(@max(client.right - client.left, 0)), @intCast(@max(client.bottom - client.top, 0)) };
+            self.inbox.dpi = dpi;
+            _ = win32.SetEvent(self.host.input_arrived);
+        }
+
+        fn handleMessage(self: *Window, hwnd: win32.HWND, message: win32.UINT, wparam: win32.WPARAM, lparam: win32.LPARAM) win32.LRESULT {
+            const host = self.host;
+            const at = host.now();
+            const state = &self.thread_state;
+            switch (message) {
+                win32.WM_CLOSE => {
+                    win32.AcquireSRWLockExclusive(&host.lock);
+                    self.inbox.closed = true;
+                    _ = win32.SetEvent(host.input_arrived);
+                    win32.ReleaseSRWLockExclusive(&host.lock);
+                    return 0;
+                },
+                wm_close_window => {
+                    if (host.services.closeDialogOrMenuFirst(hwnd)) return 0;
+                    _ = win32.DestroyWindow(hwnd);
+                    return 0;
+                },
+                win32.WM_DESTROY => {
+                    self.accessibility.disconnect(hwnd);
+                    return 0;
+                },
+                win32.WM_NCDESTROY => {
+                    host.freeWindow(self);
+                    return 0;
+                },
+                win32.WM_SIZE => {
+                    self.recordClientSize(hwnd, win32.GetDpiForWindow(hwnd));
+                    if (wparam == win32.SIZE_MAXIMIZED or wparam == win32.SIZE_RESTORED) self.reportMaximized(wparam == win32.SIZE_MAXIMIZED);
+                },
+                win32.WM_NCCALCSIZE => if (self.custom_title_bar and wparam != 0) return calculateClientWithoutCaption(hwnd, lparam),
+                win32.WM_NCHITTEST => if (self.custom_title_bar) return self.hitTestNonClient(hwnd, lparam),
+                win32.WM_NCMOUSEMOVE => if (self.custom_title_bar and !chrome.isResizeCode(@bitCast(wparam))) {
+                    if (!state.tracking_non_client) {
+                        var track: win32.TRACKMOUSEEVENT = .{ .dwFlags = win32.TME_LEAVE | win32.TME_NONCLIENT, .hwndTrack = hwnd };
+                        state.tracking_non_client = win32.TrackMouseEvent(&track) != 0;
+                    }
+                    self.deliver(.{ .pointer_move = .{ .pointer = nonClientMouse(hwnd, lparam, at) } });
+                },
+                win32.WM_NCMOUSELEAVE => if (self.custom_title_bar) {
+                    state.tracking_non_client = false;
+                    if (state.pressed_caption_button != null) {
+                        state.pressed_caption_button = null;
+                        self.deliver(.{ .pointer_cancel = .mouse });
+                    }
+                    if (!state.tracking_mouse) self.deliver(.{ .pointer_leave = .mouse });
+                },
+                win32.WM_NCLBUTTONDOWN, win32.WM_NCLBUTTONDBLCLK => if (self.custom_title_bar and chrome.isCaptionButtonCode(wparam)) {
+                    state.pressed_caption_button = wparam;
+                    self.deliver(.{ .pointer_down = .{ .pointer = nonClientMouse(hwnd, lparam, at), .button = .primary } });
+                    return 0;
+                },
+                // The press ends as a cancel, not a release: the host works the
+                // button, so zui shows the press but reports no click, and an
+                // application acting on `clicked` for the keyboard and assistive
+                // technologies never works it twice.
+                win32.WM_NCLBUTTONUP => if (self.custom_title_bar and chrome.isCaptionButtonCode(wparam)) {
+                    self.deliver(.{ .pointer_cancel = .mouse });
+                    const pressed = state.pressed_caption_button;
+                    state.pressed_caption_button = null;
+                    if (pressed == wparam) workCaptionButton(hwnd, wparam);
+                    return 0;
+                },
+                win32.WM_MOVE => if (win32.MonitorFromWindow(hwnd, win32.MONITOR_DEFAULTTONEAREST) != state.monitor) self.reportDisplayColor(hwnd, false),
+                win32.WM_DISPLAYCHANGE => self.reportDisplayColor(hwnd, false),
+                win32.WM_DPICHANGED => {
+                    const suggested: *const win32.RECT = @ptrFromInt(@as(usize, @bitCast(lparam)));
+                    _ = win32.SetWindowPos(hwnd, null, suggested.left, suggested.top, suggested.right - suggested.left, suggested.bottom - suggested.top, win32.SWP_NOZORDER | win32.SWP_NOACTIVATE);
+                    self.recordClientSize(hwnd, win32.hiword(wparam));
+                    return 0;
+                },
+                win32.WM_PAINT => {
+                    var paint: win32.PAINTSTRUCT = undefined;
+                    const hdc = win32.BeginPaint(hwnd, &paint);
+                    // Black is fully transparent where the frame is extended, so
+                    // a renderer's composed swapchain shows over the backdrop
+                    // rather than over the white of a window never painted.
+                    if (state.backdrop_applied) if (hdc) |painted| if (win32.GetStockObject(win32.BLACK_BRUSH)) |black| {
+                        _ = win32.FillRect(painted, &paint.rcPaint, black);
+                    };
+                    _ = win32.EndPaint(hwnd, &paint);
+                    self.signalInput();
+                    return 0;
+                },
+                win32.WM_ERASEBKGND => return 1,
+                win32.WM_MOUSEMOVE => {
+                    if (!state.tracking_mouse) {
+                        var track: win32.TRACKMOUSEEVENT = .{ .dwFlags = win32.TME_LEAVE, .hwndTrack = hwnd };
+                        state.tracking_mouse = win32.TrackMouseEvent(&track) != 0;
+                    }
+                    self.deliver(.{ .pointer_move = .{ .pointer = mouse(lparam, at) } });
+                    return 0;
+                },
+                win32.WM_MOUSELEAVE => {
+                    state.tracking_mouse = false;
+                    self.deliver(.{ .pointer_leave = .mouse });
+                    return 0;
+                },
+                win32.WM_LBUTTONDOWN, win32.WM_RBUTTONDOWN, win32.WM_MBUTTONDOWN => {
+                    if (state.buttons_down == 0) _ = win32.SetCapture(hwnd);
+                    state.buttons_down += 1;
+                    self.deliver(.{ .pointer_down = .{ .pointer = mouse(lparam, at), .button = buttonOf(message) } });
+                    return 0;
+                },
+                win32.WM_LBUTTONUP, win32.WM_RBUTTONUP, win32.WM_MBUTTONUP => {
+                    state.buttons_down -|= 1;
+                    if (state.buttons_down == 0) _ = win32.ReleaseCapture();
+                    self.deliver(.{ .pointer_up = .{ .pointer = mouse(lparam, at), .button = buttonOf(message) } });
+                    return 0;
+                },
+                win32.WM_MOUSEWHEEL, win32.WM_MOUSEHWHEEL => {
+                    const screen = win32.pointFromLparam(lparam);
+                    var point: win32.POINT = .{ .x = screen[0], .y = screen[1] };
+                    _ = win32.ScreenToClient(hwnd, &point);
+                    const notches = @as(f32, @floatFromInt(@as(i16, @bitCast(win32.hiword(wparam))))) / 120;
+                    // Windows' vertical wheel is positive away from the user,
+                    // toward the start of the content; its horizontal one is
+                    // positive to the right, toward the end.
+                    const delta: [2]f32 = if (message == win32.WM_MOUSEWHEEL) .{ 0, -notches * wheel_step } else .{ notches * wheel_step, 0 };
+                    self.deliver(.{ .wheel = .{ .position = .{ @floatFromInt(point.x), @floatFromInt(point.y) }, .delta = delta, .at = at } });
+                    return 0;
+                },
+                win32.WM_KEYDOWN, win32.WM_SYSKEYDOWN, win32.WM_KEYUP, win32.WM_SYSKEYUP => {
+                    const key_event: zui.KeyEvent = .{
+                        .key = keys.keyFromVirtualKey(wparam),
+                        .modifiers = heldModifiers(),
+                        .repeat = (message == win32.WM_KEYDOWN or message == win32.WM_SYSKEYDOWN) and lparam & (1 << 30) != 0,
+                        .scancode = @intCast((@as(usize, @bitCast(lparam)) >> 16) & 0x1FF),
+                        .at = at,
+                    };
+                    const down = message == win32.WM_KEYDOWN or message == win32.WM_SYSKEYDOWN;
+                    self.deliver(if (down) .{ .key_down = key_event } else .{ .key_up = key_event });
+                    // Alt+F4 and the system menu still work.
+                    if (message == win32.WM_SYSKEYDOWN or message == win32.WM_SYSKEYUP) return win32.DefWindowProcW(hwnd, message, wparam, lparam);
+                    return 0;
+                },
+                win32.WM_CHAR => {
+                    self.typeCharacter(@truncate(wparam));
+                    return 0;
+                },
+                win32.WM_SETFOCUS, win32.WM_KILLFOCUS => {
+                    self.deliver(.{ .environment = .{ .window_focused = message == win32.WM_SETFOCUS } });
+                    return 0;
+                },
+                win32.WM_SETCURSOR => if (win32.loword(lparam) == win32.HTCLIENT) {
+                    _ = win32.SetCursor(state.cursors.get(state.applied.cursor));
+                    return 1;
+                },
+                wm_apply_requests => {
+                    self.applyRequests(hwnd);
+                    return 0;
+                },
+                wm_semantics_changed => {
+                    self.accessibility.announceChanges();
+                    return 0;
+                },
+                wm_show_file_dialog => {
+                    host.services.showFileDialog(hwnd, wm_close_window, host.zuiWaker());
+                    return 0;
+                },
+                wm_show_popup_menu => {
+                    host.services.showPopupMenu(hwnd, wm_close_window, host.anyMenuBarOpen(), host.zuiWaker());
+                    return 0;
+                },
+                wm_set_menu_bar => {
+                    self.menu_bar.set(hwnd, host.zuiWaker());
+                    return 0;
+                },
+                win32.WM_COMMAND => {
+                    const from_a_menu = win32.hiword(wparam) == 0 and lparam == 0;
+                    if (from_a_menu) self.menu_bar.answerCommand(win32.loword(wparam), host.zuiWaker());
+                    return 0;
+                },
+                win32.WM_ENTERMENULOOP => self.menu_bar.beginMenuLoop(wparam != 0),
+                win32.WM_EXITMENULOOP => self.menu_bar.endMenuLoop(hwnd, wm_set_menu_bar),
+                win32.WM_GETOBJECT => if (self.accessibility.answerGetObject(hwnd, wparam, lparam)) |answered| return answered,
+                win32.WM_DROPFILES => {
+                    self.receiveDrop(@ptrFromInt(wparam), at);
+                    return 0;
+                },
+                win32.WM_QUERYENDSESSION => {
+                    self.deliver(.{ .lifecycle = .terminate_requested });
+                    return 1;
+                },
+                win32.WM_POWERBROADCAST => switch (wparam) {
+                    win32.PBT_APMSUSPEND => self.deliver(.{ .lifecycle = .@"suspend" }),
+                    win32.PBT_APMRESUMEAUTOMATIC => self.deliver(.{ .lifecycle = .@"resume" }),
+                    win32.PBT_APMPOWERSTATUSCHANGE => self.reportEnvironment(hwnd, false),
+                    else => {},
+                },
+                win32.WM_SETTINGCHANGE, win32.WM_THEMECHANGED => self.reportEnvironment(hwnd, false),
+                else => {},
+            }
+            return win32.DefWindowProcW(hwnd, message, wparam, lparam);
+        }
+
+        /// The system's own borders first, then the top resize band the caption
+        /// left behind, then the frame's chrome regions, the last on top.
+        fn hitTestNonClient(self: *Window, hwnd: win32.HWND, lparam: win32.LPARAM) win32.LRESULT {
+            const system_answer = win32.DefWindowProcW(hwnd, win32.WM_NCHITTEST, 0, lparam);
+            if (chrome.isResizeCode(system_answer)) return system_answer;
+            const screen = win32.pointFromLparam(lparam);
+            var point: win32.POINT = .{ .x = screen[0], .y = screen[1] };
+            _ = win32.ScreenToClient(hwnd, &point);
+            const resizable = self.thread_state.options.resizable;
+            if (resizable and win32.IsZoomed(hwnd) == 0) {
+                const band = resizeBandThickness(win32.GetDpiForWindow(hwnd));
+                if (point.y >= 0 and point.y < band) {
+                    var client: win32.RECT = .{};
+                    _ = win32.GetClientRect(hwnd, &client);
+                    if (point.x < band) return win32.HTTOPLEFT;
+                    if (point.x >= client.right - band) return win32.HTTOPRIGHT;
+                    return win32.HTTOP;
+                }
+            }
+            const kind = self.chrome_snapshot.kindAt(point) orelse return win32.HTCLIENT;
+            const code = chrome.hitTestCode(kind);
+            if (!resizable and chrome.isResizeCode(code)) return win32.HTCLIENT;
+            return code;
+        }
+
+        fn reportMaximized(self: *Window, maximized: bool) void {
+            const environment = &self.thread_state.environment;
+            if (maximized == environment.window_maximized) return;
+            environment.window_maximized = maximized;
+            self.deliver(.{ .environment = .{ .window_maximized = maximized } });
+        }
+
+        /// One UTF-16 unit of typed text; a surrogate pair arrives as two.
+        fn typeCharacter(self: *Window, unit: u16) void {
+            const state = &self.thread_state;
+            if (std.unicode.utf16IsHighSurrogate(unit)) {
+                state.high_surrogate = unit;
+                return;
+            }
+            const high = state.high_surrogate;
+            state.high_surrogate = null;
+            // Control characters are keys: Enter, Backspace, Escape, Ctrl+letters.
+            if (unit < 0x20 or unit == 0x7F) return;
+            const codepoint: u21 = if (std.unicode.utf16IsLowSurrogate(unit))
+                std.unicode.utf16DecodeSurrogatePair(&.{ high orelse return, unit }) catch return
+            else
+                unit;
+            var utf8: [4]u8 = undefined;
+            const len = std.unicode.utf8Encode(codepoint, &utf8) catch return;
+            self.deliverText(utf8[0..len]);
+        }
+
+        fn receiveDrop(self: *Window, drop: win32.HDROP, at: zui.Instant) void {
+            defer win32.DragFinish(drop);
+            var point: win32.POINT = .{};
+            _ = win32.DragQueryPoint(drop, &point);
+            const count = win32.DragQueryFileW(drop, 0xFFFFFFFF, null, 0);
+
+            const host = self.host;
+            win32.AcquireSRWLockExclusive(&host.lock);
+            defer win32.ReleaseSRWLockExclusive(&host.lock);
+            const inbox = &self.inbox;
+            const start = inbox.path_len;
+            for (0..count) |index| {
+                const path_utf16 = &host.dropped_path_utf16;
+                const len = win32.DragQueryFileW(drop, @intCast(index), path_utf16, path_utf16.len);
+                const needed = std.unicode.calcWtf8Len(path_utf16[0..len]) + 1;
+                if (len == 0 or needed > path_capacity - inbox.path_len) {
+                    inbox.dropped_bytes +|= @intCast(needed);
+                    continue;
+                }
+                inbox.path_len += std.unicode.wtf16LeToWtf8(inbox.paths[inbox.path_len..], path_utf16[0..len]);
+                inbox.paths[inbox.path_len] = 0;
+                inbox.path_len += 1;
+            }
+            if (inbox.path_len == start) return;
+            inbox.push(.{ .files_dropped = .{
+                .position = .{ @floatFromInt(point.x), @floatFromInt(point.y) },
+                .path_list = inbox.paths[start..inbox.path_len],
+                .at = at,
+            } });
+            _ = win32.SetEvent(host.input_arrived);
+        }
+
+        fn applyRequests(self: *Window, hwnd: win32.HWND) void {
+            const state = &self.thread_state;
+            win32.AcquireSRWLockExclusive(&self.host.lock);
+            const requests = self.requests;
+            const pixels_per_unit = self.pixels_per_unit;
+            win32.ReleaseSRWLockExclusive(&self.host.lock);
+
+            if (requests.cursor != state.applied.cursor and state.tracking_mouse) {
+                _ = win32.SetCursor(state.cursors.get(requests.cursor));
+            }
+            state.applied = requests;
+
+            const area = requests.text_input orelse return self.setImeEnabled(hwnd, false);
+            self.setImeEnabled(hwnd, true);
+            const context = win32.ImmGetContext(hwnd) orelse return;
+            defer _ = win32.ImmReleaseContext(hwnd, context);
+            const caret: win32.RECT = .{
+                .left = @intFromFloat(area.caret.x * pixels_per_unit),
+                .top = @intFromFloat(area.caret.y * pixels_per_unit),
+                .right = @intFromFloat((area.caret.x + area.caret.width) * pixels_per_unit),
+                .bottom = @intFromFloat((area.caret.y + area.caret.height) * pixels_per_unit),
+            };
+            _ = win32.ImmSetCompositionWindow(context, &.{ .dwStyle = win32.CFS_FORCE_POSITION, .ptCurrentPos = .{ .x = caret.left, .y = caret.top } });
+            _ = win32.ImmSetCandidateWindow(context, &.{ .dwStyle = win32.CFS_EXCLUDE, .ptCurrentPos = .{ .x = caret.left, .y = caret.bottom }, .rcArea = caret });
+        }
+
+        /// Without an editable focused, keys go to the application rather than
+        /// to an IME composing text nobody asked for.
+        fn setImeEnabled(self: *Window, hwnd: win32.HWND, enabled: bool) void {
+            if (self.thread_state.ime_enabled == enabled) return;
+            self.thread_state.ime_enabled = enabled;
+            _ = win32.ImmAssociateContextEx(hwnd, null, if (enabled) win32.IACE_DEFAULT else 0);
+        }
+
+        /// Asks DWM for the backdrop, which it draws wherever the client area is
+        /// transparent. Windows 10 and Windows 11 before 22H2 refuse the
+        /// attribute, and the window keeps its own background.
+        fn applyMaterial(self: *const Window, hwnd: win32.HWND, material: zui.SystemMaterial) bool {
+            if (material == .none or self.host.system_material_unavailable) return false;
+            const backdrop: win32.DWORD = switch (material) {
+                .none => unreachable,
+                .window => win32.DWMSBT_MAINWINDOW,
+                .transient => win32.DWMSBT_TRANSIENTWINDOW,
+            };
+            if (win32.DwmSetWindowAttribute(hwnd, win32.DWMWA_SYSTEMBACKDROP_TYPE, &backdrop, @sizeOf(win32.DWORD)) != 0) return false;
+            const whole_window: win32.MARGINS = .{ .left = -1, .right = -1, .top = -1, .bottom = -1 };
+            return win32.DwmExtendFrameIntoClientArea(hwnd, &whole_window) == 0;
+        }
+
+        /// Reports each setting that differs from what was last reported, or
+        /// every one on the first call.
+        fn reportEnvironment(self: *Window, hwnd: win32.HWND, first: bool) void {
+            const reported = &self.thread_state.environment;
+            const theme = readTheme();
+            if (first or theme != reported.theme) {
+                reported.theme = theme;
+                self.deliver(.{ .environment = .{ .theme = theme } });
+                const dark: win32.BOOL = @intFromBool(theme == .dark);
+                _ = win32.DwmSetWindowAttribute(hwnd, win32.DWMWA_USE_IMMERSIVE_DARK_MODE, &dark, @sizeOf(win32.BOOL));
+            }
+            const contrast = readContrast();
+            if (first or contrast != reported.contrast) {
+                reported.contrast = contrast;
+                self.deliver(.{ .environment = .{ .contrast = contrast } });
+            }
+            const reduced_motion = readReducedMotion();
+            if (first or reduced_motion != reported.reduced_motion) {
+                reported.reduced_motion = reduced_motion;
+                self.deliver(.{ .environment = .{ .reduced_motion = reduced_motion } });
+            }
+            const power = readPower();
+            if (first or power != reported.power) {
+                reported.power = power;
+                self.deliver(.{ .environment = .{ .power = power } });
+            }
+            const reduced_transparency = !readTransparencyEnabled();
+            if (first or reduced_transparency != reported.reduced_transparency) {
+                reported.reduced_transparency = reduced_transparency;
+                self.deliver(.{ .environment = .{ .reduced_transparency = reduced_transparency } });
+            }
+            const system_material = self.thread_state.backdrop_applied and !reduced_transparency;
+            if (first or system_material != reported.system_material) {
+                reported.system_material = system_material;
+                self.deliver(.{ .environment = .{ .system_material = system_material } });
+            }
+            if (first) {
+                reported.custom_title_bar = self.custom_title_bar;
+                self.deliver(.{ .environment = .{ .custom_title_bar = self.custom_title_bar } });
+                reported.window_maximized = win32.IsZoomed(hwnd) != 0;
+                self.deliver(.{ .environment = .{ .window_maximized = reported.window_maximized } });
+            }
+            self.reportDisplayColor(hwnd, first);
+        }
+
+        /// Picks the surface's format for the monitor the window is on, and
+        /// reports the headroom the window can show: 1 in `.sdr`. Read again
+        /// when the window moves to another monitor, the displays change, or a
+        /// setting does.
+        fn reportDisplayColor(self: *Window, hwnd: win32.HWND, first: bool) void {
+            const state = &self.thread_state;
+            const monitor = win32.MonitorFromWindow(hwnd, win32.MONITOR_DEFAULTTONEAREST);
+            state.monitor = monitor;
+            const color: display.DisplayColor = self.host.forced_display_color orelse if (monitor) |shown_on| .read(shown_on) else .sdr;
+            const format: zui.OutputFormat = if (color.hdr and state.options.output_formats.contains(.scrgb_fp16)) .scrgb_fp16 else .sdr;
+            win32.AcquireSRWLockExclusive(&self.host.lock);
+            const format_changed = format != self.inbox.output_format;
+            self.inbox.output_format = format;
+            win32.ReleaseSRWLockExclusive(&self.host.lock);
+
+            const reported = &state.environment;
+            const headroom = if (format == .scrgb_fp16) color.headroom() else 1;
+            if (first or headroom != reported.hdr_headroom) {
+                reported.hdr_headroom = headroom;
+                self.deliver(.{ .environment = .{ .hdr_headroom = headroom } });
+            } else if (format_changed) {
+                self.signalInput();
+            }
+        }
     };
 
     pub fn init(self: *Host, io: std.Io, options: zui.WindowOptions) !void {
@@ -322,6 +796,7 @@ pub const Host = struct {
             .forced_display_color = forced_display_color,
             .service_fake = service_fake,
             .hwnd = undefined,
+            .anchor = undefined,
             .window_thread = undefined,
             .window_created = try manualResetEvent(),
             .woken = try manualResetEvent(),
@@ -329,28 +804,31 @@ pub const Host = struct {
             .timer = win32.CreateWaitableTimerExW(null, null, win32.CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, win32.TIMER_ALL_ACCESS) orelse
                 win32.CreateWaitableTimerExW(null, null, 0, win32.TIMER_ALL_ACCESS) orelse return error.NoTimer,
             .low_memory = win32.CreateMemoryResourceNotification(0),
-            .was_low_on_memory = false,
-            .terminate_delivered = false,
-            .pixels_per_unit = 1,
-            .custom_title_bar = options.title_bar == .custom,
-            .chrome_snapshot = .{},
+            .next_window_id = 1,
+            .notification_tip = @splat(0),
+            .notification_tip_len = 0,
             .lock = .{},
-            .inbox = .{},
-            .requests = .{},
-            .window = .{ .options = options },
+            .windows = undefined,
+            .dropped_path_utf16 = undefined,
+            .anchor_init_error = null,
+            .closing = false,
+            .anchor_destroyed = false,
             .file_watches = .{},
-            .accessibility = undefined,
             .services = .{ .fake = service_fake },
         };
-        try self.accessibility.init(options.semantics, .{ .context = self, .deliverFn = deliverAction }, wheel_step);
-        errdefer self.accessibility.deinit();
+        for (&self.windows) |*window| window.* = .{ .host = self };
+        self.notification_tip_len = std.unicode.utf8ToUtf16Le(self.notification_tip[0 .. self.notification_tip.len - 1], options.title[0..@min(options.title.len, self.notification_tip.len - 1)]) catch 0;
+        try self.prepareWindow(&self.windows[0], .main, options);
+        errdefer self.windows[0].accessibility.deinit();
         _ = win32.SetProcessDpiAwarenessContext(win32.DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
         self.window_thread = try std.Thread.spawn(.{}, runWindowThread, .{self});
         if (win32.WaitForSingleObject(self.window_created, 10 * std.time.ms_per_s) != win32.WAIT_OBJECT_0) return error.WindowThreadDidNotStart;
-        if (self.window.init_error) |err| {
+        const init_error: ?anyerror = if (self.anchor_init_error != null) self.anchor_init_error else self.windows[0].thread_state.init_error;
+        if (init_error) |err| {
             self.window_thread.join();
             return err;
         }
+        self.hwnd = self.windows[0].hwnd;
         _ = console_host.cmpxchgStrong(null, self, .acq_rel, .monotonic);
         _ = win32.SetConsoleCtrlHandler(onConsoleControl, 1);
     }
@@ -358,12 +836,61 @@ pub const Host = struct {
     pub fn deinit(self: *Host) void {
         if (console_host.cmpxchgStrong(self, null, .acq_rel, .monotonic) == null) _ = win32.SetConsoleCtrlHandler(onConsoleControl, 0);
         self.file_watches.stopAll();
-        _ = win32.PostMessageW(self.hwnd, wm_close_window, 0, 0);
+        _ = win32.PostMessageW(self.anchor, wm_close_host, 0, 0);
         self.window_thread.join();
-        self.accessibility.deinit();
         for ([_]?win32.HANDLE{ self.window_created, self.woken, self.input_arrived, self.timer, self.low_memory }) |handle| {
             if (handle) |open| _ = win32.CloseHandle(open);
         }
+    }
+
+    /// Opens a window as `init` opens `.main`, hidden or shown as `options`
+    /// say, and returns once it exists.
+    pub fn zuiOpenWindow(self: *Host, options: zui.WindowOptions) zui.OpenWindowError!zui.WindowId {
+        const slot = self.freeSlot() orelse return error.TooManyWindows;
+        const window = &self.windows[slot];
+        const id: zui.WindowId = @enumFromInt(self.next_window_id);
+        self.prepareWindow(window, id, options) catch return error.WindowNotCreated;
+        _ = win32.SendMessageW(self.anchor, wm_open_window, slot, 0);
+        if (window.thread_state.init_error != null) {
+            window.accessibility.deinit();
+            return error.WindowNotCreated;
+        }
+        self.next_window_id += 1;
+        return id;
+    }
+
+    /// Closes `window` and frees its slot, once a file dialog or popup menu
+    /// open over it has closed; its id polls false from now on.
+    pub fn zuiCloseWindow(self: *Host, id: zui.WindowId) void {
+        const window = self.windowById(id) orelse return;
+        win32.AcquireSRWLockExclusive(&self.lock);
+        window.inbox.closed = true;
+        win32.ReleaseSRWLockExclusive(&self.lock);
+        _ = win32.SendMessageW(window.hwnd, wm_close_window, 0, 0);
+    }
+
+    fn freeSlot(self: *Host) ?usize {
+        win32.AcquireSRWLockExclusive(&self.lock);
+        defer win32.ReleaseSRWLockExclusive(&self.lock);
+        for (self.windows, 0..) |window, slot| if (!window.in_use) return slot;
+        return null;
+    }
+
+    fn prepareWindow(self: *Host, window: *Window, id: zui.WindowId, options: zui.WindowOptions) !void {
+        window.* = .{ .host = self, .id = id, .custom_title_bar = options.title_bar == .custom, .thread_state = .{ .options = options } };
+        try window.accessibility.init(options.semantics, .{ .context = window, .deliverFn = Window.deliverAction }, wheel_step);
+    }
+
+    /// The open window `id` names, or null.
+    pub fn windowById(self: *Host, id: zui.WindowId) ?*Window {
+        win32.AcquireSRWLockExclusive(&self.lock);
+        defer win32.ReleaseSRWLockExclusive(&self.lock);
+        for (&self.windows) |*window| if (window.in_use and window.id == id) return window;
+        return null;
+    }
+
+    fn openWindowOrPanic(self: *Host, id: zui.WindowId) *Window {
+        return self.windowById(id) orelse std.debug.panic("zui_host: window {d} is not open", .{@intFromEnum(id)});
     }
 
     /// `service_fake` set after `init`, for an application under
@@ -391,18 +918,18 @@ pub const Host = struct {
         return .fromTimestamp(std.Io.Timestamp.now(self.io, .awake));
     }
 
-    pub fn zuiPoll(self: *Host, window: zui.WindowId, record: *zui.RecordBuilder) bool {
-        std.debug.assert(window == .main);
-        if (self.terminate_delivered) return false;
+    pub fn zuiPoll(self: *Host, id: zui.WindowId, record: *zui.RecordBuilder) bool {
+        const window = self.windowById(id) orelse return false;
+        if (window.terminate_delivered) return false;
         win32.AcquireSRWLockExclusive(&self.lock);
         defer win32.ReleaseSRWLockExclusive(&self.lock);
         _ = win32.ResetEvent(self.input_arrived);
-        const inbox = &self.inbox;
+        const inbox = &window.inbox;
         if (inbox.closed) return false;
 
         const scale = self.forced_scale orelse @as(f32, @floatFromInt(inbox.dpi)) / win32.USER_DEFAULT_SCREEN_DPI;
         const pixels_per_unit = scale * record.params.zoom;
-        self.pixels_per_unit = pixels_per_unit;
+        window.pixels_per_unit = pixels_per_unit;
         record.begin(.{
             .now = self.now(),
             .viewport = .{ @as(f32, @floatFromInt(inbox.client_size[0])) / pixels_per_unit, @as(f32, @floatFromInt(inbox.client_size[1])) / pixels_per_unit },
@@ -414,7 +941,7 @@ pub const Host = struct {
                 .text => |text| record.appendText(text),
                 .files_dropped => |drop| record.appendFilesDropped(drop),
                 .lifecycle => |change| {
-                    if (change == .terminate_requested) self.terminate_delivered = true;
+                    if (change == .terminate_requested) window.terminate_delivered = true;
                     record.append(converted);
                 },
                 else => record.append(converted),
@@ -427,8 +954,8 @@ pub const Host = struct {
         if (self.low_memory) |notification| {
             var low: win32.BOOL = 0;
             _ = win32.QueryMemoryResourceNotification(notification, &low);
-            if (low != 0 and !self.was_low_on_memory) record.append(.{ .lifecycle = .low_memory });
-            self.was_low_on_memory = low != 0;
+            if (low != 0 and !window.was_low_on_memory) record.append(.{ .lifecycle = .low_memory });
+            window.was_low_on_memory = low != 0;
         }
         return true;
     }
@@ -458,8 +985,9 @@ pub const Host = struct {
         _ = win32.SetEvent(self.woken);
     }
 
-    /// Returns on a wake or input, and for `.at` also at the instant. The
-    /// wake is cleared after the wait, so one that came before it ends it.
+    /// Returns on a wake or input in any window, and for `.at` also at the
+    /// instant. The wake is cleared after the wait, so one that came before
+    /// it ends it.
     pub fn zuiWait(self: *Host, next: zui.NextFrame) void {
         defer _ = win32.ResetEvent(self.woken);
         const handles = [_]win32.HANDLE{ self.woken, self.input_arrived, self.timer };
@@ -484,29 +1012,30 @@ pub const Host = struct {
     }
 
     /// In `.scrgb_fp16` while the window's monitor runs in HDR, if the
-    /// window was opened with it, and in `.sdr` otherwise.
-    pub fn zuiSurface(self: *Host, window: zui.WindowId) zui.Surface {
-        std.debug.assert(window == .main);
+    /// window was opened with it, and in `.sdr` otherwise. Asking for a
+    /// window that is not open panics.
+    pub fn zuiSurface(self: *Host, id: zui.WindowId) zui.Surface {
+        const window = self.openWindowOrPanic(id);
         win32.AcquireSRWLockExclusive(&self.lock);
         defer win32.ReleaseSRWLockExclusive(&self.lock);
-        return .{ .win32 = .{ .hwnd = self.hwnd, .format = self.inbox.output_format } };
+        return .{ .win32 = .{ .hwnd = window.hwnd, .format = window.inbox.output_format } };
     }
 
-    pub fn zuiApply(self: *Host, window: zui.WindowId, requests: zui.HostRequests) void {
-        std.debug.assert(window == .main);
+    pub fn zuiApply(self: *Host, id: zui.WindowId, requests: zui.HostRequests) void {
+        const window = self.windowById(id) orelse return;
         win32.AcquireSRWLockExclusive(&self.lock);
-        const changed = !std.meta.eql(self.requests, requests);
-        self.requests = requests;
+        const changed = !std.meta.eql(window.requests, requests);
+        window.requests = requests;
         win32.ReleaseSRWLockExclusive(&self.lock);
-        if (changed) _ = win32.PostMessageW(self.hwnd, wm_apply_requests, 0, 0);
+        if (changed) _ = win32.PostMessageW(window.hwnd, wm_apply_requests, 0, 0);
     }
 
     /// Keeps what fits of the frame's semantics for UI Automation, and has
     /// the window thread tell listening clients what changed.
-    pub fn zuiSemantics(self: *Host, window: zui.WindowId, nodes: []const zui.SemanticNode) zui.SemanticsDropped {
-        std.debug.assert(window == .main);
-        const dropped = self.accessibility.publish(nodes, self.pixels_per_unit);
-        if (self.accessibility.hasRoom() and uia.UiaClientsAreListening() != 0) _ = win32.PostMessageW(self.hwnd, wm_semantics_changed, 0, 0);
+    pub fn zuiSemantics(self: *Host, id: zui.WindowId, nodes: []const zui.SemanticNode) zui.SemanticsDropped {
+        const window = self.windowById(id) orelse return .{};
+        const dropped = window.accessibility.publish(nodes, window.pixels_per_unit);
+        if (window.accessibility.hasRoom() and uia.UiaClientsAreListening() != 0) _ = win32.PostMessageW(window.hwnd, wm_semantics_changed, 0, 0);
         return dropped;
     }
 
@@ -514,59 +1043,48 @@ pub const Host = struct {
     /// physical pixels, for the window thread to answer `WM_NCHITTEST` from;
     /// the rest are cut from the end and counted in `chrome_snapshot.dropped`.
     /// A window opened with a native title bar keeps none.
-    pub fn zuiChromeRegions(self: *Host, window: zui.WindowId, regions: []const zui.ChromeRegion) void {
-        std.debug.assert(window == .main);
-        if (!self.custom_title_bar) return;
-        self.chrome_snapshot.publish(regions, self.pixels_per_unit);
+    pub fn zuiChromeRegions(self: *Host, id: zui.WindowId, regions: []const zui.ChromeRegion) void {
+        const window = self.windowById(id) orelse return;
+        if (!window.custom_title_bar) return;
+        window.chrome_snapshot.publish(regions, window.pixels_per_unit);
     }
 
-    /// Closes the window as its close button does: the next poll returns
-    /// false.
+    /// Closes the main window as its close button does: the next poll
+    /// returns false.
     pub fn close(self: *Host) void {
         _ = win32.SendMessageW(self.hwnd, win32.WM_CLOSE, 0, 0);
     }
 
-    /// Minimizes the window as its minimize button does, for an application
-    /// that works its drawn caption buttons from `clicked`, as the keyboard
-    /// and Narrator press them.
+    /// Minimizes the main window as its minimize button does, for an
+    /// application that works its drawn caption buttons from `clicked`, as
+    /// the keyboard and Narrator press them.
     pub fn minimize(self: *Host) void {
         _ = win32.PostMessageW(self.hwnd, win32.WM_SYSCOMMAND, win32.SC_MINIMIZE, 0);
     }
 
-    /// Maximizes the window, or restores it when it is maximized.
+    /// Maximizes the main window, or restores it when it is maximized.
     pub fn toggleMaximized(self: *Host) void {
         _ = win32.PostMessageW(self.hwnd, win32.WM_SYSCOMMAND, if (win32.IsZoomed(self.hwnd) != 0) win32.SC_RESTORE else win32.SC_MAXIMIZE, 0);
     }
 
-    /// The window's client area, in physical pixels.
+    /// The main window's client area, in physical pixels.
     pub fn clientSize(self: *Host) [2]u32 {
+        const window = self.windowById(.main) orelse return .{ 0, 0 };
         win32.AcquireSRWLockExclusive(&self.lock);
         defer win32.ReleaseSRWLockExclusive(&self.lock);
-        return self.inbox.client_size;
+        return window.inbox.client_size;
     }
 
-    fn deliver(self: *Host, event_to_queue: zui.Event) void {
+    /// What the last poll of `window` converted pixels to layout units by.
+    pub fn pixelsPerUnit(self: *Host, id: zui.WindowId) f32 {
+        const window = self.windowById(id) orelse return 1;
+        return window.pixels_per_unit;
+    }
+
+    fn deliverToEveryWindow(self: *Host, event: zui.Event) void {
         win32.AcquireSRWLockExclusive(&self.lock);
         defer win32.ReleaseSRWLockExclusive(&self.lock);
-        self.inbox.push(event_to_queue);
-        _ = win32.SetEvent(self.input_arrived);
-    }
-
-    fn deliverText(self: *Host, utf8: []const u8) void {
-        win32.AcquireSRWLockExclusive(&self.lock);
-        defer win32.ReleaseSRWLockExclusive(&self.lock);
-        self.inbox.pushText(utf8);
-        _ = win32.SetEvent(self.input_arrived);
-    }
-
-    fn deliverAction(context: *anyopaque, action: zui.ActionEvent) void {
-        const self: *Host = @ptrCast(@alignCast(context));
-        self.deliver(.{ .action = action });
-    }
-
-    /// Something changed that needs a frame but carries no event, such as
-    /// the window's size.
-    fn signalInput(self: *Host) void {
+        for (&self.windows) |*window| if (window.in_use) window.inbox.push(event);
         _ = win32.SetEvent(self.input_arrived);
     }
 
@@ -575,17 +1093,19 @@ pub const Host = struct {
     // =================================================================
 
     const class_name = W("zui_host_window");
+    const anchor_class_name = W("zui_host_anchor");
 
     fn runWindowThread(self: *Host) void {
         // A single-threaded apartment, as the shell's modal dialogs need.
         const com_initialized = win32.succeeded(win32.CoInitializeEx(null, win32.COINIT_APARTMENTTHREADED));
         defer if (com_initialized) win32.CoUninitialize();
-        const hwnd = self.createWindow() catch |err| {
-            self.window.init_error = err;
+        self.anchor = self.createAnchor() catch |err| {
+            self.anchor_init_error = err;
             _ = win32.SetEvent(self.window_created);
             return;
         };
-        self.hwnd = hwnd;
+        self.createWindow(&self.windows[0]);
+        if (self.windows[0].thread_state.init_error != null) _ = win32.DestroyWindow(self.anchor);
         _ = win32.SetEvent(self.window_created);
 
         var message: win32.MSG = undefined;
@@ -595,28 +1115,122 @@ pub const Host = struct {
         }
     }
 
-    fn createWindow(self: *Host) !win32.HWND {
+    fn createAnchor(self: *Host) !win32.HWND {
         const instance = win32.GetModuleHandleW(null);
-        for (std.enums.values(zui.Cursor)) |cursor| self.window.cursors.set(cursor, win32.LoadCursorW(null, cursorResource(cursor)));
+        const class: win32.WNDCLASSEXW = .{ .lpfnWndProc = anchorProcedure, .hInstance = instance, .lpszClassName = anchor_class_name };
+        // Fails harmlessly when an earlier host registered it.
+        _ = win32.RegisterClassExW(&class);
+        const anchor = win32.CreateWindowExW(0, anchor_class_name, W("zui host"), 0, 0, 0, 0, 0, win32.HWND_MESSAGE, null, instance, null) orelse return error.WindowNotCreated;
+        _ = win32.SetWindowLongPtrW(anchor, win32.GWLP_USERDATA, @bitCast(@intFromPtr(self)));
+        return anchor;
+    }
+
+    fn anchorProcedure(hwnd: win32.HWND, message: win32.UINT, wparam: win32.WPARAM, lparam: win32.LPARAM) callconv(.winapi) win32.LRESULT {
+        const address: usize = @bitCast(win32.GetWindowLongPtrW(hwnd, win32.GWLP_USERDATA));
+        if (address == 0) return win32.DefWindowProcW(hwnd, message, wparam, lparam);
+        const self: *Host = @ptrFromInt(address);
+        return self.handleAnchorMessage(hwnd, message, wparam, lparam);
+    }
+
+    fn handleAnchorMessage(self: *Host, hwnd: win32.HWND, message: win32.UINT, wparam: win32.WPARAM, lparam: win32.LPARAM) win32.LRESULT {
+        switch (message) {
+            wm_open_window => {
+                self.createWindow(&self.windows[wparam]);
+                return 0;
+            },
+            wm_close_host => {
+                self.closing = true;
+                for (&self.windows) |*window| if (window.in_use) {
+                    _ = win32.SendMessageW(window.hwnd, wm_close_window, 0, 0);
+                };
+                self.destroyAnchorOnceEveryWindowIs();
+                return 0;
+            },
+            win32.WM_DESTROY => {
+                self.services.removeNotifyIcon(hwnd);
+                win32.PostQuitMessage(0);
+                return 0;
+            },
+            wm_read_clipboard => {
+                self.services.answerClipboardRead(hwnd, self.zuiWaker());
+                return 0;
+            },
+            wm_open_url => {
+                self.services.openUrl(hwnd);
+                return 0;
+            },
+            wm_show_notification => {
+                self.services.showNotification(hwnd, wm_notify_icon, self.notification_tip[0..self.notification_tip_len], self.zuiWaker());
+                return 0;
+            },
+            wm_notify_icon => {
+                self.services.answerNotifyIconEvent(hwnd, lparam, self.zuiWaker());
+                return 0;
+            },
+            else => {},
+        }
+        return win32.DefWindowProcW(hwnd, message, wparam, lparam);
+    }
+
+    /// On the window thread, as a window's last message arrives.
+    fn freeWindow(self: *Host, window: *Window) void {
+        window.accessibility.deinit();
+        win32.AcquireSRWLockExclusive(&self.lock);
+        window.in_use = false;
+        win32.ReleaseSRWLockExclusive(&self.lock);
+        if (self.closing) self.destroyAnchorOnceEveryWindowIs();
+    }
+
+    fn destroyAnchorOnceEveryWindowIs(self: *Host) void {
+        if (self.anchor_destroyed) return;
+        for (self.windows) |window| if (window.in_use) return;
+        self.anchor_destroyed = true;
+        _ = win32.DestroyWindow(self.anchor);
+    }
+
+    /// Whether the user is in any window's menu bar, while no other menu
+    /// can show.
+    fn anyMenuBarOpen(self: *const Host) bool {
+        for (self.windows) |window| if (window.in_use and window.menu_bar.menus_open) return true;
+        return false;
+    }
+
+    /// Creates `window`'s Win32 window, which takes the slot, or leaves
+    /// why it could not in `init_error`.
+    fn createWindow(self: *Host, window: *Window) void {
+        const hwnd = createWin32Window(window) catch |err| {
+            window.thread_state.init_error = err;
+            return;
+        };
+        window.hwnd = hwnd;
+        win32.AcquireSRWLockExclusive(&self.lock);
+        window.in_use = true;
+        win32.ReleaseSRWLockExclusive(&self.lock);
+    }
+
+    fn createWin32Window(window: *Window) !win32.HWND {
+        const instance = win32.GetModuleHandleW(null);
+        const state = &window.thread_state;
+        for (std.enums.values(zui.Cursor)) |cursor| state.cursors.set(cursor, win32.LoadCursorW(null, cursorResource(cursor)));
         const class: win32.WNDCLASSEXW = .{
             .style = win32.CS_OWNDC | win32.CS_HREDRAW | win32.CS_VREDRAW,
             .lpfnWndProc = windowProcedure,
             .hInstance = instance,
-            .hCursor = self.window.cursors.get(.default),
+            .hCursor = state.cursors.get(.default),
             .lpszClassName = class_name,
         };
         // Fails harmlessly when an earlier host registered it.
         _ = win32.RegisterClassExW(&class);
 
-        const options = self.window.options;
-        const title = &self.window.title;
-        self.window.title_len = std.unicode.utf8ToUtf16Le(title[0 .. title.len - 1], options.title[0..@min(options.title.len, 255)]) catch 0;
-        title[self.window.title_len] = 0;
+        const options = state.options;
+        const title = &state.title;
+        state.title_len = std.unicode.utf8ToUtf16Le(title[0 .. title.len - 1], options.title[0..@min(options.title.len, 255)]) catch 0;
+        title[state.title_len] = 0;
         const style = windowStyle(options);
 
         const hwnd = win32.CreateWindowExW(0, class_name, title, style, win32.CW_USEDEFAULT, win32.CW_USEDEFAULT, win32.CW_USEDEFAULT, win32.CW_USEDEFAULT, null, null, instance, null) orelse return error.WindowNotCreated;
-        self.accessibility.hwnd = hwnd;
-        _ = win32.SetWindowLongPtrW(hwnd, win32.GWLP_USERDATA, @bitCast(@intFromPtr(self)));
+        window.accessibility.hwnd = hwnd;
+        _ = win32.SetWindowLongPtrW(hwnd, win32.GWLP_USERDATA, @bitCast(@intFromPtr(window)));
 
         const dpi = win32.GetDpiForWindow(hwnd);
         var frame: win32.RECT = .{
@@ -625,13 +1239,13 @@ pub const Host = struct {
         };
         _ = win32.AdjustWindowRectExForDpi(&frame, style, 0, 0, dpi);
         _ = win32.SetWindowPos(hwnd, null, 0, 0, frame.right - frame.left, frame.bottom - frame.top, win32.SWP_NOMOVE | win32.SWP_NOZORDER | win32.SWP_NOACTIVATE);
-        if (self.custom_title_bar) dropCaption(hwnd, .{ frame.right - frame.left, frame.bottom - frame.top }, options.size, dpi);
-        self.recordClientSize(hwnd, dpi);
+        if (window.custom_title_bar) dropCaption(hwnd, .{ frame.right - frame.left, frame.bottom - frame.top }, options.size, dpi);
+        window.recordClientSize(hwnd, dpi);
 
         win32.DragAcceptFiles(hwnd, 1);
-        self.window.backdrop_applied = self.applyMaterial(hwnd, options.material);
-        self.setImeEnabled(hwnd, false);
-        self.reportEnvironment(hwnd, true);
+        state.backdrop_applied = window.applyMaterial(hwnd, options.material);
+        window.setImeEnabled(hwnd, false);
+        window.reportEnvironment(hwnd, true);
         if (options.visible) _ = win32.ShowWindow(hwnd, win32.SW_SHOWNORMAL);
         return hwnd;
     }
@@ -657,228 +1271,11 @@ pub const Host = struct {
         return if (options.resizable) win32.WS_OVERLAPPEDWINDOW else win32.WS_OVERLAPPEDWINDOW & ~(win32.WS_THICKFRAME | win32.WS_MAXIMIZEBOX);
     }
 
-    fn recordClientSize(self: *Host, hwnd: win32.HWND, dpi: u32) void {
-        var client: win32.RECT = .{};
-        _ = win32.GetClientRect(hwnd, &client);
-        win32.AcquireSRWLockExclusive(&self.lock);
-        defer win32.ReleaseSRWLockExclusive(&self.lock);
-        self.inbox.client_size = .{ @intCast(@max(client.right - client.left, 0)), @intCast(@max(client.bottom - client.top, 0)) };
-        self.inbox.dpi = dpi;
-        _ = win32.SetEvent(self.input_arrived);
-    }
-
     fn windowProcedure(hwnd: win32.HWND, message: win32.UINT, wparam: win32.WPARAM, lparam: win32.LPARAM) callconv(.winapi) win32.LRESULT {
         const address: usize = @bitCast(win32.GetWindowLongPtrW(hwnd, win32.GWLP_USERDATA));
         if (address == 0) return win32.DefWindowProcW(hwnd, message, wparam, lparam);
-        const self: *Host = @ptrFromInt(address);
-        return self.handleMessage(hwnd, message, wparam, lparam);
-    }
-
-    fn handleMessage(self: *Host, hwnd: win32.HWND, message: win32.UINT, wparam: win32.WPARAM, lparam: win32.LPARAM) win32.LRESULT {
-        const at = self.now();
-        switch (message) {
-            win32.WM_CLOSE => {
-                win32.AcquireSRWLockExclusive(&self.lock);
-                self.inbox.closed = true;
-                _ = win32.SetEvent(self.input_arrived);
-                win32.ReleaseSRWLockExclusive(&self.lock);
-                return 0;
-            },
-            wm_close_window => {
-                if (self.services.closeDialogOrMenuFirst()) return 0;
-                _ = win32.DestroyWindow(hwnd);
-                return 0;
-            },
-            win32.WM_DESTROY => {
-                self.accessibility.disconnect(hwnd);
-                self.services.removeNotifyIcon(hwnd);
-                win32.PostQuitMessage(0);
-                return 0;
-            },
-            win32.WM_SIZE => {
-                self.recordClientSize(hwnd, win32.GetDpiForWindow(hwnd));
-                if (wparam == win32.SIZE_MAXIMIZED or wparam == win32.SIZE_RESTORED) self.reportMaximized(wparam == win32.SIZE_MAXIMIZED);
-            },
-            win32.WM_NCCALCSIZE => if (self.custom_title_bar and wparam != 0) return calculateClientWithoutCaption(hwnd, lparam),
-            win32.WM_NCHITTEST => if (self.custom_title_bar) return self.hitTestNonClient(hwnd, lparam),
-            win32.WM_NCMOUSEMOVE => if (self.custom_title_bar and !chrome.isResizeCode(@bitCast(wparam))) {
-                if (!self.window.tracking_non_client) {
-                    var track: win32.TRACKMOUSEEVENT = .{ .dwFlags = win32.TME_LEAVE | win32.TME_NONCLIENT, .hwndTrack = hwnd };
-                    self.window.tracking_non_client = win32.TrackMouseEvent(&track) != 0;
-                }
-                self.deliver(.{ .pointer_move = .{ .pointer = nonClientMouse(hwnd, lparam, at) } });
-            },
-            win32.WM_NCMOUSELEAVE => if (self.custom_title_bar) {
-                self.window.tracking_non_client = false;
-                if (self.window.pressed_caption_button != null) {
-                    self.window.pressed_caption_button = null;
-                    self.deliver(.{ .pointer_cancel = .mouse });
-                }
-                if (!self.window.tracking_mouse) self.deliver(.{ .pointer_leave = .mouse });
-            },
-            win32.WM_NCLBUTTONDOWN, win32.WM_NCLBUTTONDBLCLK => if (self.custom_title_bar and chrome.isCaptionButtonCode(wparam)) {
-                self.window.pressed_caption_button = wparam;
-                self.deliver(.{ .pointer_down = .{ .pointer = nonClientMouse(hwnd, lparam, at), .button = .primary } });
-                return 0;
-            },
-            // The press ends as a cancel, not a release: the host works the
-            // button, so zui shows the press but reports no click, and an
-            // application acting on `clicked` for the keyboard and assistive
-            // technologies never works it twice.
-            win32.WM_NCLBUTTONUP => if (self.custom_title_bar and chrome.isCaptionButtonCode(wparam)) {
-                self.deliver(.{ .pointer_cancel = .mouse });
-                const pressed = self.window.pressed_caption_button;
-                self.window.pressed_caption_button = null;
-                if (pressed == wparam) workCaptionButton(hwnd, wparam);
-                return 0;
-            },
-            win32.WM_MOVE => if (win32.MonitorFromWindow(hwnd, win32.MONITOR_DEFAULTTONEAREST) != self.window.monitor) self.reportDisplayColor(hwnd, false),
-            win32.WM_DISPLAYCHANGE => self.reportDisplayColor(hwnd, false),
-            win32.WM_DPICHANGED => {
-                const suggested: *const win32.RECT = @ptrFromInt(@as(usize, @bitCast(lparam)));
-                _ = win32.SetWindowPos(hwnd, null, suggested.left, suggested.top, suggested.right - suggested.left, suggested.bottom - suggested.top, win32.SWP_NOZORDER | win32.SWP_NOACTIVATE);
-                self.recordClientSize(hwnd, win32.hiword(wparam));
-                return 0;
-            },
-            win32.WM_PAINT => {
-                var paint: win32.PAINTSTRUCT = undefined;
-                const hdc = win32.BeginPaint(hwnd, &paint);
-                // Black is fully transparent where the frame is extended, so
-                // a renderer's composed swapchain shows over the backdrop
-                // rather than over the white of a window never painted.
-                if (self.window.backdrop_applied) if (hdc) |painted| if (win32.GetStockObject(win32.BLACK_BRUSH)) |black| {
-                    _ = win32.FillRect(painted, &paint.rcPaint, black);
-                };
-                _ = win32.EndPaint(hwnd, &paint);
-                self.signalInput();
-                return 0;
-            },
-            win32.WM_ERASEBKGND => return 1,
-            win32.WM_MOUSEMOVE => {
-                if (!self.window.tracking_mouse) {
-                    var track: win32.TRACKMOUSEEVENT = .{ .dwFlags = win32.TME_LEAVE, .hwndTrack = hwnd };
-                    self.window.tracking_mouse = win32.TrackMouseEvent(&track) != 0;
-                }
-                self.deliver(.{ .pointer_move = .{ .pointer = mouse(lparam, at) } });
-                return 0;
-            },
-            win32.WM_MOUSELEAVE => {
-                self.window.tracking_mouse = false;
-                self.deliver(.{ .pointer_leave = .mouse });
-                return 0;
-            },
-            win32.WM_LBUTTONDOWN, win32.WM_RBUTTONDOWN, win32.WM_MBUTTONDOWN => {
-                if (self.window.buttons_down == 0) _ = win32.SetCapture(hwnd);
-                self.window.buttons_down += 1;
-                self.deliver(.{ .pointer_down = .{ .pointer = mouse(lparam, at), .button = buttonOf(message) } });
-                return 0;
-            },
-            win32.WM_LBUTTONUP, win32.WM_RBUTTONUP, win32.WM_MBUTTONUP => {
-                self.window.buttons_down -|= 1;
-                if (self.window.buttons_down == 0) _ = win32.ReleaseCapture();
-                self.deliver(.{ .pointer_up = .{ .pointer = mouse(lparam, at), .button = buttonOf(message) } });
-                return 0;
-            },
-            win32.WM_MOUSEWHEEL, win32.WM_MOUSEHWHEEL => {
-                const screen = win32.pointFromLparam(lparam);
-                var point: win32.POINT = .{ .x = screen[0], .y = screen[1] };
-                _ = win32.ScreenToClient(hwnd, &point);
-                const notches = @as(f32, @floatFromInt(@as(i16, @bitCast(win32.hiword(wparam))))) / 120;
-                // Windows' vertical wheel is positive away from the user,
-                // toward the start of the content; its horizontal one is
-                // positive to the right, toward the end.
-                const delta: [2]f32 = if (message == win32.WM_MOUSEWHEEL) .{ 0, -notches * wheel_step } else .{ notches * wheel_step, 0 };
-                self.deliver(.{ .wheel = .{ .position = .{ @floatFromInt(point.x), @floatFromInt(point.y) }, .delta = delta, .at = at } });
-                return 0;
-            },
-            win32.WM_KEYDOWN, win32.WM_SYSKEYDOWN, win32.WM_KEYUP, win32.WM_SYSKEYUP => {
-                const key_event: zui.KeyEvent = .{
-                    .key = keys.keyFromVirtualKey(wparam),
-                    .modifiers = heldModifiers(),
-                    .repeat = (message == win32.WM_KEYDOWN or message == win32.WM_SYSKEYDOWN) and lparam & (1 << 30) != 0,
-                    .scancode = @intCast((@as(usize, @bitCast(lparam)) >> 16) & 0x1FF),
-                    .at = at,
-                };
-                const down = message == win32.WM_KEYDOWN or message == win32.WM_SYSKEYDOWN;
-                self.deliver(if (down) .{ .key_down = key_event } else .{ .key_up = key_event });
-                // Alt+F4 and the system menu still work.
-                if (message == win32.WM_SYSKEYDOWN or message == win32.WM_SYSKEYUP) return win32.DefWindowProcW(hwnd, message, wparam, lparam);
-                return 0;
-            },
-            win32.WM_CHAR => {
-                self.typeCharacter(@truncate(wparam));
-                return 0;
-            },
-            win32.WM_SETFOCUS, win32.WM_KILLFOCUS => {
-                self.deliver(.{ .environment = .{ .window_focused = message == win32.WM_SETFOCUS } });
-                return 0;
-            },
-            win32.WM_SETCURSOR => if (win32.loword(lparam) == win32.HTCLIENT) {
-                _ = win32.SetCursor(self.window.cursors.get(self.window.applied.cursor));
-                return 1;
-            },
-            wm_apply_requests => {
-                self.applyRequests(hwnd);
-                return 0;
-            },
-            wm_semantics_changed => {
-                self.accessibility.announceChanges();
-                return 0;
-            },
-            wm_read_clipboard => {
-                self.services.answerClipboardRead(hwnd, self.zuiWaker());
-                return 0;
-            },
-            wm_open_url => {
-                self.services.openUrl(hwnd);
-                return 0;
-            },
-            wm_show_notification => {
-                self.services.showNotification(hwnd, wm_notify_icon, self.window.title[0..self.window.title_len], self.zuiWaker());
-                return 0;
-            },
-            wm_notify_icon => {
-                self.services.answerNotifyIconEvent(hwnd, lparam, self.zuiWaker());
-                return 0;
-            },
-            wm_show_file_dialog => {
-                self.services.showFileDialog(hwnd, wm_close_window, self.zuiWaker());
-                return 0;
-            },
-            wm_show_popup_menu => {
-                self.services.showPopupMenu(hwnd, wm_close_window, self.zuiWaker());
-                return 0;
-            },
-            wm_set_menu_bar => {
-                self.services.setMenuBar(hwnd, self.zuiWaker());
-                return 0;
-            },
-            win32.WM_COMMAND => {
-                const from_a_menu = win32.hiword(wparam) == 0 and lparam == 0;
-                if (from_a_menu) self.services.answerMenuBarCommand(win32.loword(wparam), self.zuiWaker());
-                return 0;
-            },
-            win32.WM_ENTERMENULOOP => self.services.beginMenuLoop(wparam != 0),
-            win32.WM_EXITMENULOOP => self.services.endMenuLoop(hwnd, wm_set_menu_bar),
-            win32.WM_GETOBJECT => if (self.accessibility.answerGetObject(hwnd, wparam, lparam)) |answered| return answered,
-            win32.WM_DROPFILES => {
-                self.receiveDrop(@ptrFromInt(wparam), at);
-                return 0;
-            },
-            win32.WM_QUERYENDSESSION => {
-                self.deliver(.{ .lifecycle = .terminate_requested });
-                return 1;
-            },
-            win32.WM_POWERBROADCAST => switch (wparam) {
-                win32.PBT_APMSUSPEND => self.deliver(.{ .lifecycle = .@"suspend" }),
-                win32.PBT_APMRESUMEAUTOMATIC => self.deliver(.{ .lifecycle = .@"resume" }),
-                win32.PBT_APMPOWERSTATUSCHANGE => self.reportEnvironment(hwnd, false),
-                else => {},
-            },
-            win32.WM_SETTINGCHANGE, win32.WM_THEMECHANGED => self.reportEnvironment(hwnd, false),
-            else => {},
-        }
-        return win32.DefWindowProcW(hwnd, message, wparam, lparam);
+        const window: *Window = @ptrFromInt(address);
+        return window.handleMessage(hwnd, message, wparam, lparam);
     }
 
     fn mouse(lparam: win32.LPARAM, at: zui.Instant) zui.Pointer {
@@ -909,31 +1306,6 @@ pub const Host = struct {
         return 0;
     }
 
-    /// The system's own borders first, then the top resize band the caption
-    /// left behind, then the frame's chrome regions, the last on top.
-    fn hitTestNonClient(self: *Host, hwnd: win32.HWND, lparam: win32.LPARAM) win32.LRESULT {
-        const system_answer = win32.DefWindowProcW(hwnd, win32.WM_NCHITTEST, 0, lparam);
-        if (chrome.isResizeCode(system_answer)) return system_answer;
-        const screen = win32.pointFromLparam(lparam);
-        var point: win32.POINT = .{ .x = screen[0], .y = screen[1] };
-        _ = win32.ScreenToClient(hwnd, &point);
-        const resizable = self.window.options.resizable;
-        if (resizable and win32.IsZoomed(hwnd) == 0) {
-            const band = resizeBandThickness(win32.GetDpiForWindow(hwnd));
-            if (point.y >= 0 and point.y < band) {
-                var client: win32.RECT = .{};
-                _ = win32.GetClientRect(hwnd, &client);
-                if (point.x < band) return win32.HTTOPLEFT;
-                if (point.x >= client.right - band) return win32.HTTOPRIGHT;
-                return win32.HTTOP;
-            }
-        }
-        const kind = self.chrome_snapshot.kindAt(point) orelse return win32.HTCLIENT;
-        const code = chrome.hitTestCode(kind);
-        if (!resizable and chrome.isResizeCode(code)) return win32.HTCLIENT;
-        return code;
-    }
-
     /// Through `WM_SYSCOMMAND`, as the system's own buttons, so Windows
     /// animates it and a close arrives as `WM_CLOSE`.
     fn workCaptionButton(hwnd: win32.HWND, code: usize) void {
@@ -944,12 +1316,6 @@ pub const Host = struct {
             else => return,
         };
         _ = win32.PostMessageW(hwnd, win32.WM_SYSCOMMAND, command, 0);
-    }
-
-    fn reportMaximized(self: *Host, maximized: bool) void {
-        if (maximized == self.window.environment.window_maximized) return;
-        self.window.environment.window_maximized = maximized;
-        self.deliver(.{ .environment = .{ .window_maximized = maximized } });
     }
 
     fn buttonOf(message: win32.UINT) zui.Button {
@@ -967,173 +1333,6 @@ pub const Host = struct {
             }
         }.key;
         return .{ .shift = held(0x10), .control = held(0x11), .alt = held(0x12), .super = held(0x5B) or held(0x5C) };
-    }
-
-    /// One UTF-16 unit of typed text; a surrogate pair arrives as two.
-    fn typeCharacter(self: *Host, unit: u16) void {
-        if (std.unicode.utf16IsHighSurrogate(unit)) {
-            self.window.high_surrogate = unit;
-            return;
-        }
-        const high = self.window.high_surrogate;
-        self.window.high_surrogate = null;
-        // Control characters are keys: Enter, Backspace, Escape, Ctrl+letters.
-        if (unit < 0x20 or unit == 0x7F) return;
-        const codepoint: u21 = if (std.unicode.utf16IsLowSurrogate(unit))
-            std.unicode.utf16DecodeSurrogatePair(&.{ high orelse return, unit }) catch return
-        else
-            unit;
-        var utf8: [4]u8 = undefined;
-        const len = std.unicode.utf8Encode(codepoint, &utf8) catch return;
-        self.deliverText(utf8[0..len]);
-    }
-
-    fn receiveDrop(self: *Host, drop: win32.HDROP, at: zui.Instant) void {
-        defer win32.DragFinish(drop);
-        var point: win32.POINT = .{};
-        _ = win32.DragQueryPoint(drop, &point);
-        const count = win32.DragQueryFileW(drop, 0xFFFFFFFF, null, 0);
-
-        win32.AcquireSRWLockExclusive(&self.lock);
-        defer win32.ReleaseSRWLockExclusive(&self.lock);
-        const inbox = &self.inbox;
-        const start = inbox.path_len;
-        for (0..count) |index| {
-            const path_utf16 = &self.window.path_utf16;
-            const len = win32.DragQueryFileW(drop, @intCast(index), path_utf16, path_utf16.len);
-            const needed = std.unicode.calcWtf8Len(path_utf16[0..len]) + 1;
-            if (len == 0 or needed > path_capacity - inbox.path_len) {
-                inbox.dropped_bytes +|= @intCast(needed);
-                continue;
-            }
-            inbox.path_len += std.unicode.wtf16LeToWtf8(inbox.paths[inbox.path_len..], path_utf16[0..len]);
-            inbox.paths[inbox.path_len] = 0;
-            inbox.path_len += 1;
-        }
-        if (inbox.path_len == start) return;
-        inbox.push(.{ .files_dropped = .{
-            .position = .{ @floatFromInt(point.x), @floatFromInt(point.y) },
-            .path_list = inbox.paths[start..inbox.path_len],
-            .at = at,
-        } });
-        _ = win32.SetEvent(self.input_arrived);
-    }
-
-    fn applyRequests(self: *Host, hwnd: win32.HWND) void {
-        win32.AcquireSRWLockExclusive(&self.lock);
-        const requests = self.requests;
-        const pixels_per_unit = self.pixels_per_unit;
-        win32.ReleaseSRWLockExclusive(&self.lock);
-
-        if (requests.cursor != self.window.applied.cursor and self.window.tracking_mouse) {
-            _ = win32.SetCursor(self.window.cursors.get(requests.cursor));
-        }
-        self.window.applied = requests;
-
-        const area = requests.text_input orelse return self.setImeEnabled(hwnd, false);
-        self.setImeEnabled(hwnd, true);
-        const context = win32.ImmGetContext(hwnd) orelse return;
-        defer _ = win32.ImmReleaseContext(hwnd, context);
-        const caret: win32.RECT = .{
-            .left = @intFromFloat(area.caret.x * pixels_per_unit),
-            .top = @intFromFloat(area.caret.y * pixels_per_unit),
-            .right = @intFromFloat((area.caret.x + area.caret.width) * pixels_per_unit),
-            .bottom = @intFromFloat((area.caret.y + area.caret.height) * pixels_per_unit),
-        };
-        _ = win32.ImmSetCompositionWindow(context, &.{ .dwStyle = win32.CFS_FORCE_POSITION, .ptCurrentPos = .{ .x = caret.left, .y = caret.top } });
-        _ = win32.ImmSetCandidateWindow(context, &.{ .dwStyle = win32.CFS_EXCLUDE, .ptCurrentPos = .{ .x = caret.left, .y = caret.bottom }, .rcArea = caret });
-    }
-
-    /// Without an editable focused, keys go to the application rather than
-    /// to an IME composing text nobody asked for.
-    fn setImeEnabled(self: *Host, hwnd: win32.HWND, enabled: bool) void {
-        if (self.window.ime_enabled == enabled) return;
-        self.window.ime_enabled = enabled;
-        _ = win32.ImmAssociateContextEx(hwnd, null, if (enabled) win32.IACE_DEFAULT else 0);
-    }
-
-    /// Asks DWM for the backdrop, which it draws wherever the client area is
-    /// transparent. Windows 10 and Windows 11 before 22H2 refuse the
-    /// attribute, and the window keeps its own background.
-    fn applyMaterial(self: *const Host, hwnd: win32.HWND, material: zui.SystemMaterial) bool {
-        if (material == .none or self.system_material_unavailable) return false;
-        const backdrop: win32.DWORD = switch (material) {
-            .none => unreachable,
-            .window => win32.DWMSBT_MAINWINDOW,
-            .transient => win32.DWMSBT_TRANSIENTWINDOW,
-        };
-        if (win32.DwmSetWindowAttribute(hwnd, win32.DWMWA_SYSTEMBACKDROP_TYPE, &backdrop, @sizeOf(win32.DWORD)) != 0) return false;
-        const whole_window: win32.MARGINS = .{ .left = -1, .right = -1, .top = -1, .bottom = -1 };
-        return win32.DwmExtendFrameIntoClientArea(hwnd, &whole_window) == 0;
-    }
-
-    /// Reports each setting that differs from what was last reported, or
-    /// every one on the first call.
-    fn reportEnvironment(self: *Host, hwnd: win32.HWND, first: bool) void {
-        const reported = &self.window.environment;
-        const theme = readTheme();
-        if (first or theme != reported.theme) {
-            reported.theme = theme;
-            self.deliver(.{ .environment = .{ .theme = theme } });
-            const dark: win32.BOOL = @intFromBool(theme == .dark);
-            _ = win32.DwmSetWindowAttribute(hwnd, win32.DWMWA_USE_IMMERSIVE_DARK_MODE, &dark, @sizeOf(win32.BOOL));
-        }
-        const contrast = readContrast();
-        if (first or contrast != reported.contrast) {
-            reported.contrast = contrast;
-            self.deliver(.{ .environment = .{ .contrast = contrast } });
-        }
-        const reduced_motion = readReducedMotion();
-        if (first or reduced_motion != reported.reduced_motion) {
-            reported.reduced_motion = reduced_motion;
-            self.deliver(.{ .environment = .{ .reduced_motion = reduced_motion } });
-        }
-        const power = readPower();
-        if (first or power != reported.power) {
-            reported.power = power;
-            self.deliver(.{ .environment = .{ .power = power } });
-        }
-        const reduced_transparency = !readTransparencyEnabled();
-        if (first or reduced_transparency != reported.reduced_transparency) {
-            reported.reduced_transparency = reduced_transparency;
-            self.deliver(.{ .environment = .{ .reduced_transparency = reduced_transparency } });
-        }
-        const system_material = self.window.backdrop_applied and !reduced_transparency;
-        if (first or system_material != reported.system_material) {
-            reported.system_material = system_material;
-            self.deliver(.{ .environment = .{ .system_material = system_material } });
-        }
-        if (first) {
-            reported.custom_title_bar = self.custom_title_bar;
-            self.deliver(.{ .environment = .{ .custom_title_bar = self.custom_title_bar } });
-            reported.window_maximized = win32.IsZoomed(hwnd) != 0;
-            self.deliver(.{ .environment = .{ .window_maximized = reported.window_maximized } });
-        }
-        self.reportDisplayColor(hwnd, first);
-    }
-
-    /// Picks the surface's format for the monitor the window is on, and
-    /// reports the headroom the window can show: 1 in `.sdr`. Read again
-    /// when the window moves to another monitor, the displays change, or a
-    /// setting does.
-    fn reportDisplayColor(self: *Host, hwnd: win32.HWND, first: bool) void {
-        const monitor = win32.MonitorFromWindow(hwnd, win32.MONITOR_DEFAULTTONEAREST);
-        self.window.monitor = monitor;
-        const color: display.DisplayColor = self.forced_display_color orelse if (monitor) |shown_on| .read(shown_on) else .sdr;
-        const format: zui.OutputFormat = if (color.hdr and self.window.options.output_formats.contains(.scrgb_fp16)) .scrgb_fp16 else .sdr;
-        win32.AcquireSRWLockExclusive(&self.lock);
-        const format_changed = format != self.inbox.output_format;
-        self.inbox.output_format = format;
-        win32.ReleaseSRWLockExclusive(&self.lock);
-
-        const reported = &self.window.environment;
-        const headroom = if (format == .scrgb_fp16) color.headroom() else 1;
-        if (first or headroom != reported.hdr_headroom) {
-            reported.hdr_headroom = headroom;
-            self.deliver(.{ .environment = .{ .hdr_headroom = headroom } });
-        } else if (format_changed) {
-            self.signalInput();
-        }
     }
 
     /// Settings > Personalization > Colors > Transparency effects.
@@ -1195,12 +1394,13 @@ pub const Host = struct {
 var console_host: std.atomic.Value(?*Host) = .init(null);
 
 /// Runs on a thread Windows starts for it. Ctrl+C, Ctrl+Break, closing the
-/// console, logging off and shutting down all ask the application to end.
+/// console, logging off and shutting down all ask the application to end,
+/// in every window.
 pub fn onConsoleControl(control: win32.DWORD) callconv(.winapi) win32.BOOL {
     const host = console_host.load(.acquire) orelse return 0;
     switch (control) {
         win32.CTRL_C_EVENT, win32.CTRL_BREAK_EVENT, win32.CTRL_CLOSE_EVENT, win32.CTRL_LOGOFF_EVENT, win32.CTRL_SHUTDOWN_EVENT => {
-            host.deliver(.{ .lifecycle = .terminate_requested });
+            host.deliverToEveryWindow(.{ .lifecycle = .terminate_requested });
             return 1;
         },
         else => return 0,

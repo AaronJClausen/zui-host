@@ -25,21 +25,10 @@ pub const Services = struct {
     /// two share the rule that one shows at a time.
     popup_menu_pending: ?PendingAnswer = null,
     popup_menu: menu.CopiedMenu = .{},
-    /// In the window's client pixels.
+    /// In the owning window's client pixels.
     popup_menu_position: win32.POINT = .{},
-    /// Claimed until the window thread has set the bar.
-    menu_bar_pending: ?PendingAnswer = null,
-    menu_bar: menu.CopiedMenu = .{},
     /// Only the window thread uses these.
     popup_menu_running: bool = false,
-    /// The bar shown and the one before it, which answers a choice made
-    /// from it that Windows reports after it was replaced.
-    shown_bars: [2]ShownBar = .{ .{}, .{} },
-    current_bar: u1 = 0,
-    /// While the user is in the bar's menus, which a new bar must not
-    /// destroy; it is set once they close.
-    tracking_menu_bar: bool = false,
-    menu_bar_deferred: bool = false,
     clipboard_text: [clipboard_text_capacity]u8 = undefined,
     /// The notification showing, answered when the user clicks it, it times
     /// out or is closed, or the next one replaces it.
@@ -49,7 +38,9 @@ pub const Services = struct {
     /// Null while the fake stands in for `Show`.
     file_dialog_shown: ?*file_dialog.IFileDialog = null,
     chosen_paths: [chosen_paths_capacity]u8 = undefined,
-    /// The window closes once the open dialog has; nothing is answered then.
+    /// The window a file dialog or a popup menu is open over.
+    dialog_or_menu_owner: ?win32.HWND = null,
+    /// The owner closes once the open dialog has; nothing is answered then.
     window_closing: bool = false,
     /// Hands nothing to the system when set.
     fake: ?*ServiceFake = null,
@@ -74,19 +65,6 @@ pub const Services = struct {
     /// apart so a command always names the menu it came from.
     pub const first_bar_command = [2]usize{ 1, 1 + menu.CopiedMenu.entry_capacity };
     pub const first_popup_menu_command = 1 + 2 * menu.CopiedMenu.entry_capacity;
-
-    const PendingAnswer = struct { request: zui.ServiceRequest, sink: zui.ServiceSink };
-
-    const ShownBar = struct {
-        answer_to: ?PendingAnswer = null,
-        item_ids: [menu.CopiedMenu.entry_capacity]?zui.MenuItemId = undefined,
-        command_count: usize = 0,
-
-        fn itemOfCommand(self: *const ShownBar, command: usize, first_command: usize) ?zui.MenuItemId {
-            if (command < first_command or command - first_command >= self.command_count) return null;
-            return self.item_ids[command - first_command];
-        }
-    };
 
     fn dialogOrMenuClaimed(self: *const Services) bool {
         return self.file_dialog_pending != null or self.popup_menu_pending != null;
@@ -143,14 +121,15 @@ pub const Services = struct {
         self.notification_pending = null;
     }
 
-    /// Copies the dialog's settings for the window thread to show, refusing
-    /// one while a dialog or a popup menu is still waiting or open.
-    pub fn claimFileDialog(self: *Services, request: zui.ServiceRequest, dialog: zui.FileDialog, sink: zui.ServiceSink) zui.ServiceError!void {
+    /// Copies the dialog's settings for the window thread to show over
+    /// `window`, refusing one while a dialog or a popup menu is still
+    /// waiting or open, over any window.
+    pub fn claimFileDialog(self: *Services, request: zui.ServiceRequest, window: zui.WindowId, dialog: zui.FileDialog, sink: zui.ServiceSink) zui.ServiceError!void {
         win32.AcquireSRWLockExclusive(&self.lock);
         defer win32.ReleaseSRWLockExclusive(&self.lock);
         if (self.dialogOrMenuClaimed()) return error.Busy;
         try self.file_dialog.copy(dialog);
-        self.file_dialog_pending = .{ .request = request, .sink = sink };
+        self.file_dialog_pending = .{ .request = request, .window = window, .sink = sink };
     }
 
     pub fn releaseFileDialog(self: *Services) void {
@@ -159,16 +138,16 @@ pub const Services = struct {
         self.file_dialog_pending = null;
     }
 
-    /// Copies the menu for the window thread to show at `position`, in the
-    /// window's client pixels, refusing one while a dialog or a popup menu
-    /// is still waiting or open.
-    pub fn claimPopupMenu(self: *Services, request: zui.ServiceRequest, items: []const zui.MenuItem, position: win32.POINT, sink: zui.ServiceSink) zui.ServiceError!void {
+    /// Copies the menu for the window thread to show over `window` at
+    /// `position`, in its client pixels, refusing one while a dialog or a
+    /// popup menu is still waiting or open, over any window.
+    pub fn claimPopupMenu(self: *Services, request: zui.ServiceRequest, window: zui.WindowId, items: []const zui.MenuItem, position: win32.POINT, sink: zui.ServiceSink) zui.ServiceError!void {
         win32.AcquireSRWLockExclusive(&self.lock);
         defer win32.ReleaseSRWLockExclusive(&self.lock);
         if (self.dialogOrMenuClaimed()) return error.Busy;
         try self.popup_menu.copy(items);
         self.popup_menu_position = position;
-        self.popup_menu_pending = .{ .request = request, .sink = sink };
+        self.popup_menu_pending = .{ .request = request, .window = window, .sink = sink };
     }
 
     pub fn releasePopupMenu(self: *Services) void {
@@ -177,28 +156,13 @@ pub const Services = struct {
         self.popup_menu_pending = null;
     }
 
-    /// Copies the bar for the window thread to set, refusing one while the
-    /// last is still waiting to be set.
-    pub fn claimMenuBar(self: *Services, request: zui.ServiceRequest, items: []const zui.MenuItem, sink: zui.ServiceSink) zui.ServiceError!void {
-        win32.AcquireSRWLockExclusive(&self.lock);
-        defer win32.ReleaseSRWLockExclusive(&self.lock);
-        if (self.menu_bar_pending != null) return error.Busy;
-        try self.menu_bar.copy(items);
-        self.menu_bar_pending = .{ .request = request, .sink = sink };
-    }
-
-    pub fn releaseMenuBar(self: *Services) void {
-        win32.AcquireSRWLockExclusive(&self.lock);
-        defer win32.ReleaseSRWLockExclusive(&self.lock);
-        self.menu_bar_pending = null;
-    }
-
     /// On the window thread, which owns the menu. `TrackPopupMenuEx` runs
     /// the menu's modal loop, which keeps dispatching the window's messages,
     /// and returns when the user has chosen or closed it. When the window
     /// was asked to close meanwhile, nothing is answered, and
-    /// `close_message` is posted again to close it.
-    pub fn showPopupMenu(self: *Services, hwnd: win32.HWND, close_message: win32.UINT, waker: zui.Waker) void {
+    /// `close_message` is posted again to close it. Windows shows one menu
+    /// at a time, so none shows while `bar_menus_open`.
+    pub fn showPopupMenu(self: *Services, hwnd: win32.HWND, close_message: win32.UINT, bar_menus_open: bool, waker: zui.Waker) void {
         win32.AcquireSRWLockExclusive(&self.lock);
         const pending = self.popup_menu_pending orelse {
             win32.ReleaseSRWLockExclusive(&self.lock);
@@ -207,11 +171,14 @@ pub const Services = struct {
         win32.ReleaseSRWLockExclusive(&self.lock);
 
         self.popup_menu_running = true;
-        const outcome = self.runPopupMenu(hwnd);
+        self.dialog_or_menu_owner = hwnd;
+        const outcome: zui.ServiceAnswer.Outcome = if (bar_menus_open) .{ .failed = .unavailable } else self.runPopupMenu(hwnd);
         self.popup_menu_running = false;
+        self.dialog_or_menu_owner = null;
         // Before the answer, so a menu shown as soon as it arrives is not busy.
         self.releasePopupMenu();
         if (self.window_closing) {
+            self.window_closing = false;
             _ = win32.PostMessageW(hwnd, close_message, 0, 0);
             return;
         }
@@ -219,8 +186,6 @@ pub const Services = struct {
     }
 
     fn runPopupMenu(self: *Services, hwnd: win32.HWND) zui.ServiceAnswer.Outcome {
-        // Windows shows one menu at a time, and the user is in the bar's.
-        if (self.tracking_menu_bar) return .{ .failed = .unavailable };
         const popup = menu.build(&self.popup_menu, .popup, first_popup_menu_command) orelse return .{ .failed = .unavailable };
         defer _ = win32.DestroyMenu(popup);
         var position = self.popup_menu_position;
@@ -231,72 +196,6 @@ pub const Services = struct {
             @intCast(@max(win32.TrackPopupMenuEx(popup, win32.TPM_RETURNCMD | win32.TPM_NONOTIFY | win32.TPM_RIGHTBUTTON, position.x, position.y, hwnd, null), 0));
         const chosen = self.popup_menu.itemOfCommand(command, first_popup_menu_command) orelse return .canceled;
         return .{ .menu_item_chosen = chosen };
-    }
-
-    /// On the window thread: replaces the window's bar with the claimed
-    /// one, or removes it for one without items. Deferred while the user
-    /// is in the bar's menus, until `endMenuLoop`.
-    pub fn setMenuBar(self: *Services, hwnd: win32.HWND, waker: zui.Waker) void {
-        if (self.tracking_menu_bar) {
-            self.menu_bar_deferred = true;
-            return;
-        }
-        win32.AcquireSRWLockExclusive(&self.lock);
-        const pending = self.menu_bar_pending orelse {
-            win32.ReleaseSRWLockExclusive(&self.lock);
-            return;
-        };
-        win32.ReleaseSRWLockExclusive(&self.lock);
-
-        const set = self.replaceMenuBar(hwnd, pending);
-        // Before any answer, so a bar set as soon as it arrives is not busy;
-        // the copy is not read again until the next bar is claimed.
-        self.releaseMenuBar();
-        if (!set) publish(pending, .{ .failed = .unavailable }, waker);
-    }
-
-    fn replaceMenuBar(self: *Services, hwnd: win32.HWND, pending: PendingAnswer) bool {
-        const next: u1 = self.current_bar +% 1;
-        const first_command = first_bar_command[next];
-        const bar: ?win32.HMENU = if (self.menu_bar.entry_count == 0) null else menu.build(&self.menu_bar, .bar, first_command) orelse return false;
-        const replaced = win32.GetMenu(hwnd);
-        if (win32.SetMenu(hwnd, bar) == 0) {
-            if (bar) |unset| _ = win32.DestroyMenu(unset);
-            return false;
-        }
-        if (replaced) |old| _ = win32.DestroyMenu(old);
-
-        const shown = &self.shown_bars[next];
-        shown.* = .{ .answer_to = if (bar == null) null else pending, .command_count = self.menu_bar.entry_count };
-        for (shown.item_ids[0..shown.command_count], 0..) |*id, index| id.* = self.menu_bar.itemOfCommand(first_command + index, first_command);
-        self.current_bar = next;
-        return true;
-    }
-
-    /// On the window thread, for `WM_COMMAND` from a menu: answers the bar
-    /// the command came from.
-    pub fn answerMenuBarCommand(self: *Services, command: usize, waker: zui.Waker) void {
-        for (&self.shown_bars, first_bar_command) |*shown, first_command| {
-            const chosen = shown.itemOfCommand(command, first_command) orelse continue;
-            const answer_to = shown.answer_to orelse return;
-            return publish(answer_to, .{ .menu_item_chosen = chosen }, waker);
-        }
-    }
-
-    /// On the window thread, for `WM_ENTERMENULOOP`: `popup` is false for
-    /// the bar's menus.
-    pub fn beginMenuLoop(self: *Services, popup: bool) void {
-        if (!popup) self.tracking_menu_bar = true;
-    }
-
-    /// On the window thread, for `WM_EXITMENULOOP`: a bar that arrived
-    /// while the user was in the old one's menus is set now, through
-    /// `set_menu_bar_message`, after any command they chose from the old.
-    pub fn endMenuLoop(self: *Services, hwnd: win32.HWND, set_menu_bar_message: win32.UINT) void {
-        self.tracking_menu_bar = false;
-        if (!self.menu_bar_deferred) return;
-        self.menu_bar_deferred = false;
-        _ = win32.PostMessageW(hwnd, set_menu_bar_message, 0, 0);
     }
 
     /// On the window thread, which owns the dialog. `Show` runs the dialog's
@@ -314,16 +213,19 @@ pub const Services = struct {
 
         var paths: file_dialog.ChosenPaths = .{ .buffer = &self.chosen_paths };
         self.file_dialog_running = true;
+        self.dialog_or_menu_owner = hwnd;
         const outcome = self.runFileDialog(hwnd, &paths);
         self.file_dialog_running = false;
+        self.dialog_or_menu_owner = null;
         // Before the answer, so a dialog shown as soon as it arrives is not
         // busy; the paths stay put, since only this thread writes them.
         self.releaseFileDialog();
         if (self.window_closing) {
+            self.window_closing = false;
             _ = win32.PostMessageW(hwnd, close_message, 0, 0);
             return;
         }
-        const answer: zui.ServiceAnswer = .{ .request = pending.request, .outcome = outcome, .left_out_bytes = paths.left_out_bytes };
+        const answer: zui.ServiceAnswer = .{ .request = pending.request, .window = pending.window, .outcome = outcome, .left_out_bytes = paths.left_out_bytes };
         waker.wakeIf(pending.sink.publish(&answer));
     }
 
@@ -337,11 +239,11 @@ pub const Services = struct {
         return file_dialog.collectAnswer(dialog, self.file_dialog.kind, shown, paths);
     }
 
-    /// On the window thread, when the window is to close: true when a file
-    /// dialog or a popup menu is open, which is closed first, and the window
-    /// closed after it.
-    pub fn closeDialogOrMenuFirst(self: *Services) bool {
-        if (!self.file_dialog_running and !self.popup_menu_running) return false;
+    /// On the window thread, when `hwnd` is to close: true when a file
+    /// dialog or a popup menu is open over it, which is closed first, and
+    /// the window closed after it.
+    pub fn closeDialogOrMenuFirst(self: *Services, hwnd: win32.HWND) bool {
+        if (self.dialog_or_menu_owner != hwnd) return false;
         self.window_closing = true;
         if (self.file_dialog_shown) |dialog| file_dialog.cancelShown(dialog);
         if (self.popup_menu_running and self.fake == null) _ = win32.EndMenu();
@@ -455,14 +357,127 @@ pub const Services = struct {
         publish(shown, outcome, waker);
     }
 
-    fn publish(pending: PendingAnswer, outcome: zui.ServiceAnswer.Outcome, waker: zui.Waker) void {
-        const answer: zui.ServiceAnswer = .{ .request = pending.request, .outcome = outcome };
-        waker.wakeIf(pending.sink.publish(&answer));
-    }
-
     fn notifyIcon(self: *Services, message: win32.DWORD, data: *const win32.NOTIFYICONDATAW) bool {
         if (self.fake) |fake| return fake.recordNotifyIcon(message, data);
         return win32.Shell_NotifyIconW(message, data) != 0;
+    }
+};
+
+const PendingAnswer = struct { request: zui.ServiceRequest, window: zui.WindowId = .main, sink: zui.ServiceSink };
+
+fn publish(pending: PendingAnswer, outcome: zui.ServiceAnswer.Outcome, waker: zui.Waker) void {
+    const answer: zui.ServiceAnswer = .{ .request = pending.request, .window = pending.window, .outcome = outcome };
+    waker.wakeIf(pending.sink.publish(&answer));
+}
+
+/// One window's menu bar: what a call claims for the window thread to set,
+/// and the bars shown, which answer each item chosen.
+pub const MenuBar = struct {
+    lock: win32.SRWLOCK = .{},
+    /// Claimed until the window thread has set the bar.
+    pending: ?PendingAnswer = null,
+    claimed: menu.CopiedMenu = .{},
+    /// Only the window thread uses these. The bar shown and the one before
+    /// it, which answers a choice made from it that Windows reports after
+    /// it was replaced.
+    shown_bars: [2]ShownBar = .{ .{}, .{} },
+    current_bar: u1 = 0,
+    /// While the user is in the bar's menus, which a new bar must not
+    /// destroy; it is set once they close.
+    menus_open: bool = false,
+    deferred: bool = false,
+
+    const ShownBar = struct {
+        answer_to: ?PendingAnswer = null,
+        item_ids: [menu.CopiedMenu.entry_capacity]?zui.MenuItemId = undefined,
+        command_count: usize = 0,
+
+        fn itemOfCommand(self: *const ShownBar, command: usize, first_command: usize) ?zui.MenuItemId {
+            if (command < first_command or command - first_command >= self.command_count) return null;
+            return self.item_ids[command - first_command];
+        }
+    };
+
+    /// Copies the bar for the window thread to set, refusing one while the
+    /// last is still waiting to be set.
+    pub fn claim(self: *MenuBar, request: zui.ServiceRequest, window: zui.WindowId, items: []const zui.MenuItem, sink: zui.ServiceSink) zui.ServiceError!void {
+        win32.AcquireSRWLockExclusive(&self.lock);
+        defer win32.ReleaseSRWLockExclusive(&self.lock);
+        if (self.pending != null) return error.Busy;
+        try self.claimed.copy(items);
+        self.pending = .{ .request = request, .window = window, .sink = sink };
+    }
+
+    pub fn release(self: *MenuBar) void {
+        win32.AcquireSRWLockExclusive(&self.lock);
+        defer win32.ReleaseSRWLockExclusive(&self.lock);
+        self.pending = null;
+    }
+
+    /// On the window thread: replaces the window's bar with the claimed
+    /// one, or removes it for one without items. Deferred while the user
+    /// is in the bar's menus, until `endMenuLoop`.
+    pub fn set(self: *MenuBar, hwnd: win32.HWND, waker: zui.Waker) void {
+        if (self.menus_open) {
+            self.deferred = true;
+            return;
+        }
+        win32.AcquireSRWLockExclusive(&self.lock);
+        const pending = self.pending orelse {
+            win32.ReleaseSRWLockExclusive(&self.lock);
+            return;
+        };
+        win32.ReleaseSRWLockExclusive(&self.lock);
+
+        const replaced = self.replace(hwnd, pending);
+        // Before any answer, so a bar set as soon as it arrives is not busy;
+        // the copy is not read again until the next bar is claimed.
+        self.release();
+        if (!replaced) publish(pending, .{ .failed = .unavailable }, waker);
+    }
+
+    fn replace(self: *MenuBar, hwnd: win32.HWND, pending: PendingAnswer) bool {
+        const next: u1 = self.current_bar +% 1;
+        const first_command = Services.first_bar_command[next];
+        const bar: ?win32.HMENU = if (self.claimed.entry_count == 0) null else menu.build(&self.claimed, .bar, first_command) orelse return false;
+        const replaced = win32.GetMenu(hwnd);
+        if (win32.SetMenu(hwnd, bar) == 0) {
+            if (bar) |unset| _ = win32.DestroyMenu(unset);
+            return false;
+        }
+        if (replaced) |old| _ = win32.DestroyMenu(old);
+
+        const shown = &self.shown_bars[next];
+        shown.* = .{ .answer_to = if (bar == null) null else pending, .command_count = self.claimed.entry_count };
+        for (shown.item_ids[0..shown.command_count], 0..) |*id, index| id.* = self.claimed.itemOfCommand(first_command + index, first_command);
+        self.current_bar = next;
+        return true;
+    }
+
+    /// On the window thread, for `WM_COMMAND` from a menu: answers the bar
+    /// the command came from.
+    pub fn answerCommand(self: *MenuBar, command: usize, waker: zui.Waker) void {
+        for (&self.shown_bars, Services.first_bar_command) |*shown, first_command| {
+            const chosen = shown.itemOfCommand(command, first_command) orelse continue;
+            const answer_to = shown.answer_to orelse return;
+            return publish(answer_to, .{ .menu_item_chosen = chosen }, waker);
+        }
+    }
+
+    /// On the window thread, for `WM_ENTERMENULOOP`: `popup` is false for
+    /// the bar's menus.
+    pub fn beginMenuLoop(self: *MenuBar, popup: bool) void {
+        if (!popup) self.menus_open = true;
+    }
+
+    /// On the window thread, for `WM_EXITMENULOOP`: a bar that arrived
+    /// while the user was in the old one's menus is set now, through
+    /// `set_menu_bar_message`, after any command they chose from the old.
+    pub fn endMenuLoop(self: *MenuBar, hwnd: win32.HWND, set_menu_bar_message: win32.UINT) void {
+        self.menus_open = false;
+        if (!self.deferred) return;
+        self.deferred = false;
+        _ = win32.PostMessageW(hwnd, set_menu_bar_message, 0, 0);
     }
 };
 
@@ -798,19 +813,22 @@ test "a file dialog and a popup menu share one claim, and a menu bar waits for t
     var nothing: u8 = 0;
     const sink: zui.ServiceSink = .{ .context = &nothing, .publishFn = NoSource.publish };
     const items = [_]zui.MenuItem{.{ .id = @enumFromInt(1), .label = "Copy" }};
-    try services.claimPopupMenu(.of("menu"), &items, .{}, sink);
-    try std.testing.expectError(error.Busy, services.claimFileDialog(.of("open"), .{}, sink));
-    try std.testing.expectError(error.Busy, services.claimPopupMenu(.of("menu"), &items, .{}, sink));
+    const second: zui.WindowId = @enumFromInt(1);
+    try services.claimPopupMenu(.of("menu"), .main, &items, .{}, sink);
+    try std.testing.expectError(error.Busy, services.claimFileDialog(.of("open"), second, .{}, sink));
+    try std.testing.expectError(error.Busy, services.claimPopupMenu(.of("menu"), second, &items, .{}, sink));
     services.releasePopupMenu();
-    try services.claimFileDialog(.of("open"), .{}, sink);
-    try std.testing.expectError(error.Busy, services.claimPopupMenu(.of("menu"), &items, .{}, sink));
+    try services.claimFileDialog(.of("open"), second, .{}, sink);
+    try std.testing.expectError(error.Busy, services.claimPopupMenu(.of("menu"), .main, &items, .{}, sink));
     services.releaseFileDialog();
 
-    try services.claimMenuBar(.of("bar"), &items, sink);
-    try services.claimPopupMenu(.of("menu"), &items, .{}, sink);
-    try std.testing.expectError(error.Busy, services.claimMenuBar(.of("bar"), &items, sink));
-    services.releaseMenuBar();
-    try services.claimMenuBar(.of("bar"), &items, sink);
+    var bars: [2]MenuBar = .{ .{}, .{} };
+    try bars[0].claim(.of("bar"), .main, &items, sink);
+    try bars[1].claim(.of("bar"), second, &items, sink);
+    try services.claimPopupMenu(.of("menu"), .main, &items, .{}, sink);
+    try std.testing.expectError(error.Busy, bars[0].claim(.of("bar"), .main, &items, sink));
+    bars[0].release();
+    try bars[0].claim(.of("bar"), .main, &items, sink);
 }
 
 test "the clipboard's text becomes UTF-8 with lone surrogates replaced, cut at a character when it does not fit" {

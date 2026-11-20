@@ -11,6 +11,8 @@ pub const LRESULT = isize;
 pub const ATOM = u16;
 pub const HANDLE = *anyopaque;
 pub const HWND = *opaque {};
+/// The parent of a message-only window, which is never shown and gets no broadcasts.
+pub const HWND_MESSAGE: HWND = @ptrFromInt(@as(usize, @bitCast(@as(isize, -3))));
 pub const HINSTANCE = *opaque {};
 pub const HCURSOR = *opaque {};
 pub const HICON = *opaque {};
@@ -104,6 +106,7 @@ pub const SRWLOCK = extern struct { ptr: ?*anyopaque = null };
 
 pub const WM_NULL = 0x0000;
 pub const WM_DESTROY = 0x0002;
+pub const WM_NCDESTROY = 0x0082;
 pub const WM_MOVE = 0x0003;
 pub const WM_SIZE = 0x0005;
 pub const WM_SETFOCUS = 0x0007;
