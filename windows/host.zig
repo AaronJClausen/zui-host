@@ -4,6 +4,8 @@ pub const win32 = @import("win32.zig");
 pub const keys = @import("keys.zig");
 pub const file_watch = @import("file_watch.zig");
 pub const display = @import("display.zig");
+pub const uia = @import("uia.zig");
+pub const accessibility = @import("accessibility.zig");
 
 const W = std.unicode.utf8ToUtf16LeStringLiteral;
 
@@ -15,8 +17,9 @@ const W = std.unicode.utf8ToUtf16LeStringLiteral;
 /// contrast, animations, power, HDR headroom), lifecycle events from console control
 /// events, the session ending and the system sleeping, and dropped files;
 /// it sets the cursor and places the IME window; it watches directories
-/// for changes; and it waits for `nextFrame` on its wake, its input and a
-/// high-resolution timer.
+/// for changes; it bridges `Frame.semantics()` to UI Automation, reporting
+/// what an assistive technology asks for as `action` events; and it waits
+/// for `nextFrame` on its wake, its input and a high-resolution timer.
 ///
 /// `init` opens the window and `deinit` closes it; the host must not move
 /// in between, since its window thread holds a pointer to it.
@@ -81,12 +84,15 @@ pub const Host = struct {
 
     file_watches: file_watch.Watches,
 
+    accessibility: accessibility.Bridge,
+
     const event_capacity = 512;
     const text_capacity = 1024;
     const path_capacity = 16 * 1024;
     const longest_path = 32 * 1024;
     const wm_apply_requests = win32.WM_APP + 1;
     const wm_close_window = win32.WM_APP + 2;
+    const wm_semantics_changed = win32.WM_APP + 3;
 
     const Inbox = struct {
         /// Positions are in physical pixels until a poll converts them.
@@ -181,7 +187,10 @@ pub const Host = struct {
             .requests = .{},
             .window = .{ .options = options },
             .file_watches = .{},
+            .accessibility = undefined,
         };
+        try self.accessibility.init(options.semantics, .{ .context = self, .deliverFn = deliverAction });
+        errdefer self.accessibility.deinit();
         _ = win32.SetProcessDpiAwarenessContext(win32.DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
         self.window_thread = try std.Thread.spawn(.{}, runWindowThread, .{self});
         if (win32.WaitForSingleObject(self.window_created, 10 * std.time.ms_per_s) != win32.WAIT_OBJECT_0) return error.WindowThreadDidNotStart;
@@ -198,6 +207,7 @@ pub const Host = struct {
         self.file_watches.stopAll();
         _ = win32.PostMessageW(self.hwnd, wm_close_window, 0, 0);
         self.window_thread.join();
+        self.accessibility.deinit();
         for ([_]?win32.HANDLE{ self.window_created, self.woken, self.input_arrived, self.timer, self.low_memory }) |handle| {
             if (handle) |open| _ = win32.CloseHandle(open);
         }
@@ -321,6 +331,15 @@ pub const Host = struct {
         if (changed) _ = win32.PostMessageW(self.hwnd, wm_apply_requests, 0, 0);
     }
 
+    /// Keeps what fits of the frame's semantics for UI Automation, and has
+    /// the window thread tell listening clients what changed.
+    pub fn zuiSemantics(self: *Host, window: zui.WindowId, nodes: []const zui.SemanticNode) zui.SemanticsDropped {
+        std.debug.assert(window == .main);
+        const dropped = self.accessibility.publish(nodes, self.pixels_per_unit);
+        if (self.accessibility.hasRoom() and uia.UiaClientsAreListening() != 0) _ = win32.PostMessageW(self.hwnd, wm_semantics_changed, 0, 0);
+        return dropped;
+    }
+
     /// Closes the window as its close button does: the next poll returns
     /// false.
     pub fn close(self: *Host) void {
@@ -348,6 +367,11 @@ pub const Host = struct {
         _ = win32.SetEvent(self.input_arrived);
     }
 
+    fn deliverAction(context: *anyopaque, action: zui.ActionEvent) void {
+        const self: *Host = @ptrCast(@alignCast(context));
+        self.deliver(.{ .action = action });
+    }
+
     /// Something changed that needs a frame but carries no event, such as
     /// the window's size.
     fn signalInput(self: *Host) void {
@@ -361,6 +385,9 @@ pub const Host = struct {
     const class_name = W("zui_host_window");
 
     fn runWindowThread(self: *Host) void {
+        // A single-threaded apartment, as the shell's modal dialogs need.
+        const com_initialized = win32.succeeded(win32.CoInitializeEx(null, win32.COINIT_APARTMENTTHREADED));
+        defer if (com_initialized) win32.CoUninitialize();
         const hwnd = self.createWindow() catch |err| {
             self.window.init_error = err;
             _ = win32.SetEvent(self.window_created);
@@ -396,6 +423,7 @@ pub const Host = struct {
         const style = windowStyle(options);
 
         const hwnd = win32.CreateWindowExW(0, class_name, &title, style, win32.CW_USEDEFAULT, win32.CW_USEDEFAULT, win32.CW_USEDEFAULT, win32.CW_USEDEFAULT, null, null, instance, null) orelse return error.WindowNotCreated;
+        self.accessibility.hwnd = hwnd;
         _ = win32.SetWindowLongPtrW(hwnd, win32.GWLP_USERDATA, @bitCast(@intFromPtr(self)));
 
         const dpi = win32.GetDpiForWindow(hwnd);
@@ -451,6 +479,7 @@ pub const Host = struct {
                 return 0;
             },
             win32.WM_DESTROY => {
+                self.accessibility.disconnect(hwnd);
                 win32.PostQuitMessage(0);
                 return 0;
             },
@@ -544,6 +573,11 @@ pub const Host = struct {
                 self.applyRequests(hwnd);
                 return 0;
             },
+            wm_semantics_changed => {
+                self.accessibility.announceChanges();
+                return 0;
+            },
+            win32.WM_GETOBJECT => if (self.accessibility.answerGetObject(hwnd, wparam, lparam)) |answered| return answered,
             win32.WM_DROPFILES => {
                 self.receiveDrop(@ptrFromInt(wparam), at);
                 return 0;
@@ -866,4 +900,5 @@ test {
     _ = keys;
     _ = file_watch;
     _ = display;
+    _ = accessibility;
 }

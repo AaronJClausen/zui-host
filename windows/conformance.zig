@@ -10,6 +10,8 @@ const zui_async = @import("zui_async");
 const Host = zui_host.Host;
 const win32 = zui_host.windows.win32;
 const keys = zui_host.windows.keys;
+const uia = zui_host.windows.uia;
+const uia_client = @import("uia_client.zig");
 
 const testing = std.testing;
 
@@ -18,8 +20,12 @@ const HiddenWindow = struct {
 
     /// With `forced_scale` set, a pixel is that many layout units at a zoom of 1.
     fn open(self: *HiddenWindow, forced_scale: ?f32) !void {
+        try self.openWithSemantics(forced_scale, .{});
+    }
+
+    fn openWithSemantics(self: *HiddenWindow, forced_scale: ?f32, semantics: zui.SemanticsCapacity) !void {
         self.window_host.forced_scale = forced_scale;
-        try self.window_host.init(testing.io, .{ .title = "zui host suite", .size = .{ 320, 240 }, .visible = false });
+        try self.window_host.init(testing.io, .{ .title = "zui host suite", .size = .{ 320, 240 }, .visible = false, .semantics = semantics });
     }
 
     fn close(self: *HiddenWindow) void {
@@ -54,6 +60,22 @@ const MessageHarness = struct {
         return true;
     }
 
+    /// Through UI Automation, from this thread, which owns no window.
+    pub fn invoke(self: *MessageHarness, label: []const u8) bool {
+        invokeByName(self.window.window_host.hwnd, label) catch |err| std.debug.print("invoking \"{s}\" through UI Automation failed: {t}\n", .{ label, err });
+        return true;
+    }
+
+    fn invokeByName(hwnd: win32.HWND, label: []const u8) !void {
+        var client: uia_client.Client = try .init();
+        defer client.deinit();
+        const window = try client.elementFromHandle(hwnd);
+        defer window.release();
+        const element = try client.findByName(window, label) orelse return error.ElementNotFound;
+        defer element.release();
+        if (!try element.invoke()) return error.NotInvokable;
+    }
+
     pub fn close(self: *MessageHarness) void {
         self.window.window_host.close();
     }
@@ -65,7 +87,7 @@ const MessageHarness = struct {
 
 test "the host passes zui's host suite" {
     var harness: MessageHarness = .{};
-    try harness.window.open(1);
+    try harness.window.openWithSemantics(1, .{ .nodes = 8, .text_bytes = 64 });
     defer harness.window.close();
     try zui_testing.expectHostConforms(Host, &harness, .{ .io = testing.io });
 }
@@ -396,4 +418,118 @@ test "watching a directory that does not exist fails, and so does watching more 
     try testing.expectError(error.DirectoryUnavailable, Host.zuiFileWatch.watch(host, ".zig-cache/no such directory", .of(&changes)));
     for (0..zui_host.windows.file_watch.Watches.capacity) |_| try Host.zuiFileWatch.watch(host, ".", .of(&changes));
     try testing.expectError(error.TooManyWatches, Host.zuiFileWatch.watch(host, ".", .of(&changes)));
+}
+
+const toolbar_id = 0x1111_2222_3333_4444;
+const save_id = 0x8000_0001_0000_0002;
+const open_id = 0x0000_0005_0000_0006;
+
+fn toolbar(open_state: zui.SemanticState, open_actions: zui.Actions) [3]zui.SemanticNode {
+    const save_actions: zui.Actions = .initMany(&.{ .invoke, .focus });
+    return .{
+        .{ .id = toolbar_id, .parent = null, .role = .group, .label = "Toolbar", .value = .none, .bounds = .{ .x = 10, .y = 20, .width = 200, .height = 40 }, .state = .{}, .actions = .initEmpty() },
+        .{ .id = save_id, .parent = 0, .role = .button, .label = "Save", .value = .none, .bounds = .{ .x = 12, .y = 24, .width = 60, .height = 30 }, .state = .{}, .actions = save_actions },
+        .{ .id = open_id, .parent = 0, .role = .button, .label = "Open", .value = .none, .bounds = .{ .x = 80, .y = 24, .width = 60, .height = 30 }, .state = open_state, .actions = open_actions },
+    };
+}
+
+fn openToolbarWindow(window: *HiddenWindow, polled: *Polled, open_state: zui.SemanticState, open_actions: zui.Actions) !void {
+    try window.openWithSemantics(2, .{ .nodes = 8, .text_bytes = 64 });
+    polled.init();
+    _ = polled.poll(&window.window_host);
+    const nodes = toolbar(open_state, open_actions);
+    try testing.expectEqual(zui.SemanticsDropped{}, window.window_host.zuiSemantics(.main, &nodes));
+}
+
+fn expectAction(host: *Host, polled: *Polled, expected: zui.ActionEvent) !void {
+    for (0..200) |_| {
+        _ = polled.poll(host);
+        for (polled.builder.events()) |event| if (event == .action and std.meta.eql(event.action, expected)) return;
+        try testing.io.sleep(.fromMilliseconds(5), .awake);
+    }
+    return error.ActionNotReported;
+}
+
+test "the semantics read back through UI Automation: names, roles, ids, the tree and bounds in screen pixels" {
+    var window: HiddenWindow = .{};
+    var polled: Polled = .{};
+    try openToolbarWindow(&window, &polled, .{}, .initOne(.invoke));
+    defer window.close();
+
+    var client: uia_client.Client = try .init();
+    defer client.deinit();
+    const window_element = try client.elementFromHandle(window.window_host.hwnd);
+    defer window_element.release();
+    const save = (try client.findByName(window_element, "Save")).?;
+    defer save.release();
+    var buffer: [64]u8 = undefined;
+    try testing.expectEqualStrings("Save", try save.name(&buffer));
+    try testing.expectEqualStrings("8000000100000002", try save.automationId(&buffer));
+    try testing.expectEqual(uia.UIA_ButtonControlTypeId, try save.controlType());
+
+    var origin: win32.POINT = .{};
+    _ = win32.ClientToScreen(window.window_host.hwnd, &origin);
+    try testing.expectEqual(win32.RECT{ .left = origin.x + 24, .top = origin.y + 48, .right = origin.x + 24 + 120, .bottom = origin.y + 48 + 60 }, try save.boundingRectangle());
+
+    const walker = try client.rawViewWalker();
+    defer walker.release();
+    const group = (try walker.parent(save)).?;
+    defer group.release();
+    try testing.expectEqualStrings("Toolbar", try group.name(&buffer));
+    try testing.expectEqual(uia.UIA_GroupControlTypeId, try group.controlType());
+    const first = (try walker.firstChild(group)).?;
+    defer first.release();
+    try testing.expectEqualStrings("Save", try first.name(&buffer));
+    const second = (try walker.nextSibling(first)).?;
+    defer second.release();
+    try testing.expectEqualStrings("Open", try second.name(&buffer));
+    try testing.expectEqual(@as(?uia_client.Element, null), try walker.nextSibling(second));
+    const window_again = (try walker.parent(group)).?;
+    defer window_again.release();
+    try testing.expectEqualStrings("zui host suite", try window_again.name(&buffer));
+}
+
+test "an assistive technology's focus arrives as a focus action, and a disabled element offers no invoke" {
+    var window: HiddenWindow = .{};
+    var polled: Polled = .{};
+    try openToolbarWindow(&window, &polled, .{ .disabled = true }, .initEmpty());
+    defer window.close();
+
+    var client: uia_client.Client = try .init();
+    defer client.deinit();
+    const window_element = try client.elementFromHandle(window.window_host.hwnd);
+    defer window_element.release();
+    const save = (try client.findByName(window_element, "Save")).?;
+    defer save.release();
+    try save.setFocus();
+    try expectAction(&window.window_host, &polled, .{ .target = save_id, .action = .focus });
+
+    const open = (try client.findByName(window_element, "Open")).?;
+    defer open.release();
+    try testing.expect(!try open.invoke());
+}
+
+test "a window opened without room for semantics leaves UI Automation to Windows, and keeps none" {
+    var window: HiddenWindow = .{};
+    try window.open(1);
+    defer window.close();
+    try testing.expectEqual(@as(win32.LRESULT, 0), win32.SendMessageW(window.window_host.hwnd, win32.WM_GETOBJECT, 0, uia.UiaRootObjectId));
+    const nodes = toolbar(.{}, .initEmpty());
+    try testing.expectEqual(zui.SemanticsDropped{ .nodes = 3, .text_bytes = 15 }, window.window_host.zuiSemantics(.main, &nodes));
+}
+
+test "semantics past the window's room are cut from the end and reported" {
+    var window: HiddenWindow = .{};
+    try window.openWithSemantics(1, .{ .nodes = 2, .text_bytes = 9 });
+    defer window.close();
+    const nodes = toolbar(.{}, .initEmpty());
+    try testing.expectEqual(zui.SemanticsDropped{ .nodes = 1, .text_bytes = 2 + 4 }, window.window_host.zuiSemantics(.main, &nodes));
+
+    var client: uia_client.Client = try .init();
+    defer client.deinit();
+    const window_element = try client.elementFromHandle(window.window_host.hwnd);
+    defer window_element.release();
+    const cut = (try client.findByName(window_element, "Sa")).?;
+    defer cut.release();
+    try testing.expectEqual(@as(?uia_client.Element, null), try client.findByName(window_element, "Open"));
 }

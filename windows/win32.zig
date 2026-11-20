@@ -114,6 +114,7 @@ pub const WM_ERASEBKGND = 0x0014;
 pub const WM_ENDSESSION = 0x0016;
 pub const WM_SETTINGCHANGE = 0x001A;
 pub const WM_SETCURSOR = 0x0020;
+pub const WM_GETOBJECT = 0x003D;
 pub const WM_DISPLAYCHANGE = 0x007E;
 pub const WM_THEMECHANGED = 0x031A;
 pub const WM_KEYDOWN = 0x0100;
@@ -282,6 +283,8 @@ pub extern "user32" fn SetCapture(hwnd: HWND) callconv(.winapi) ?HWND;
 pub extern "user32" fn ReleaseCapture() callconv(.winapi) BOOL;
 pub extern "user32" fn GetKeyState(virtual_key: c_int) callconv(.winapi) i16;
 pub extern "user32" fn ScreenToClient(hwnd: HWND, point: *POINT) callconv(.winapi) BOOL;
+pub extern "user32" fn ClientToScreen(hwnd: HWND, point: *POINT) callconv(.winapi) BOOL;
+pub extern "user32" fn GetFocus() callconv(.winapi) ?HWND;
 pub extern "user32" fn BeginPaint(hwnd: HWND, paint: *PAINTSTRUCT) callconv(.winapi) ?HDC;
 pub extern "user32" fn EndPaint(hwnd: HWND, paint: *const PAINTSTRUCT) callconv(.winapi) BOOL;
 pub extern "user32" fn FillRect(hdc: HDC, rect: *const RECT, brush: HBRUSH) callconv(.winapi) c_int;
@@ -314,6 +317,8 @@ pub extern "kernel32" fn QueryMemoryResourceNotification(notification: HANDLE, s
 pub extern "kernel32" fn GetSystemPowerStatus(status: *SYSTEM_POWER_STATUS) callconv(.winapi) BOOL;
 pub extern "kernel32" fn AcquireSRWLockExclusive(lock: *SRWLOCK) callconv(.winapi) void;
 pub extern "kernel32" fn ReleaseSRWLockExclusive(lock: *SRWLOCK) callconv(.winapi) void;
+pub extern "kernel32" fn AcquireSRWLockShared(lock: *SRWLOCK) callconv(.winapi) void;
+pub extern "kernel32" fn ReleaseSRWLockShared(lock: *SRWLOCK) callconv(.winapi) void;
 pub extern "kernel32" fn GetProcessTimes(process: HANDLE, creation: *u64, exit: *u64, kernel: *u64, user: *u64) callconv(.winapi) BOOL;
 pub extern "kernel32" fn GetCurrentProcess() callconv(.winapi) HANDLE;
 pub extern "kernel32" fn CreateFileW(name: [*:0]const u16, access: DWORD, share: DWORD, security: ?*anyopaque, disposition: DWORD, flags: DWORD, template: ?HANDLE) callconv(.winapi) HANDLE;
@@ -394,3 +399,74 @@ pub const FILE_ACTION_REMOVED = 2;
 pub const FILE_ACTION_MODIFIED = 3;
 pub const FILE_ACTION_RENAMED_OLD_NAME = 4;
 pub const FILE_ACTION_RENAMED_NEW_NAME = 5;
+
+pub const S_OK: HRESULT = 0;
+pub const S_FALSE: HRESULT = 1;
+pub const E_NOTIMPL: HRESULT = @bitCast(@as(u32, 0x80004001));
+pub const E_NOINTERFACE: HRESULT = @bitCast(@as(u32, 0x80004002));
+pub const E_POINTER: HRESULT = @bitCast(@as(u32, 0x80004003));
+pub const E_FAIL: HRESULT = @bitCast(@as(u32, 0x80004005));
+pub const E_OUTOFMEMORY: HRESULT = @bitCast(@as(u32, 0x8007000E));
+pub const E_INVALIDARG: HRESULT = @bitCast(@as(u32, 0x80070057));
+pub const RPC_E_CHANGED_MODE: HRESULT = @bitCast(@as(u32, 0x80010106));
+
+pub fn succeeded(result: HRESULT) bool {
+    return result >= 0;
+}
+
+pub const COINIT_MULTITHREADED = 0x0;
+pub const COINIT_APARTMENTTHREADED = 0x2;
+pub const CLSCTX_INPROC_SERVER = 0x1;
+
+pub const IID_IUnknown: GUID = .{ .data1 = 0x00000000, .data2 = 0x0000, .data3 = 0x0000, .data4 = .{ 0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46 } };
+
+/// The three methods every COM interface's table starts with.
+pub fn IUnknownMethods(comptime Interface: type) type {
+    return extern struct {
+        QueryInterface: *const fn (self: *Interface, iid: *const GUID, object: *?*anyopaque) callconv(.winapi) HRESULT,
+        AddRef: *const fn (self: *Interface) callconv(.winapi) u32,
+        Release: *const fn (self: *Interface) callconv(.winapi) u32,
+    };
+}
+
+/// A UTF-16 string that OLE allocates and its receiver frees.
+pub const BSTR = ?[*:0]u16;
+
+pub const VARTYPE = u16;
+pub const VT_EMPTY: VARTYPE = 0;
+pub const VT_I4: VARTYPE = 3;
+pub const VT_R8: VARTYPE = 5;
+pub const VT_BSTR: VARTYPE = 8;
+pub const VT_BOOL: VARTYPE = 11;
+pub const VT_UNKNOWN: VARTYPE = 13;
+pub const VARIANT_TRUE: i16 = -1;
+pub const VARIANT_FALSE: i16 = 0;
+
+pub const VARIANT = extern struct {
+    vt: VARTYPE = VT_EMPTY,
+    reserved: [3]u16 = .{ 0, 0, 0 },
+    value: extern union {
+        int: i32,
+        boolean: i16,
+        double: f64,
+        string: BSTR,
+        unknown: ?*anyopaque,
+        /// The largest member, a record's two pointers, which sets the size.
+        record: [2]?*anyopaque,
+    } = .{ .record = .{ null, null } },
+};
+
+pub const SAFEARRAY = opaque {};
+
+pub extern "ole32" fn CoInitializeEx(reserved: ?*anyopaque, flags: DWORD) callconv(.winapi) HRESULT;
+pub extern "ole32" fn CoUninitialize() callconv(.winapi) void;
+pub extern "ole32" fn CoCreateInstance(class: *const GUID, outer: ?*anyopaque, context: DWORD, iid: *const GUID, object: *?*anyopaque) callconv(.winapi) HRESULT;
+
+pub extern "oleaut32" fn SysAllocStringLen(units: ?[*]const u16, len: UINT) callconv(.winapi) BSTR;
+pub extern "oleaut32" fn SysFreeString(string: BSTR) callconv(.winapi) void;
+pub extern "oleaut32" fn VariantClear(variant: *VARIANT) callconv(.winapi) HRESULT;
+pub extern "oleaut32" fn SafeArrayCreateVector(vt: VARTYPE, lower_bound: LONG, count: u32) callconv(.winapi) ?*SAFEARRAY;
+pub extern "oleaut32" fn SafeArrayAccessData(array: *SAFEARRAY, data: *?*anyopaque) callconv(.winapi) HRESULT;
+pub extern "oleaut32" fn SafeArrayUnaccessData(array: *SAFEARRAY) callconv(.winapi) HRESULT;
+pub extern "oleaut32" fn SafeArrayDestroy(array: *SAFEARRAY) callconv(.winapi) HRESULT;
+pub extern "oleaut32" fn SafeArrayGetUBound(array: *SAFEARRAY, dimension: UINT, bound: *LONG) callconv(.winapi) HRESULT;

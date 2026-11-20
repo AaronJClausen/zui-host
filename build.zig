@@ -17,7 +17,7 @@ pub fn build(b: *std.Build) void {
         .imports = &.{.{ .name = "zui", .module = zui_module }},
     });
     if (windows) {
-        for ([_][]const u8{ "user32", "gdi32", "shell32", "imm32", "dwmapi", "advapi32", "dxgi" }) |library| host_module.linkSystemLibrary(library, .{});
+        for ([_][]const u8{ "user32", "gdi32", "shell32", "imm32", "dwmapi", "advapi32", "dxgi", "ole32", "oleaut32", "uiautomationcore" }) |library| host_module.linkSystemLibrary(library, .{});
     }
     if (linux) {
         host_module.link_libc = true;
@@ -93,8 +93,8 @@ fn addTour(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builti
     check_step.dependOn(&tour.step);
 }
 
-/// The remote, material, HDR and theme examples, which run only on the
-/// Windows host so far.
+/// The remote, material, HDR, theme and accessibility examples, which run
+/// only on the Windows host so far.
 fn addWindowsExamples(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, host_module: *std.Build.Module, zui_dependency: *std.Build.Dependency, check_step: *std.Build.Step) void {
     const app_module = zui_dependency.module("zui_app");
     const zui_sokol_dependency = b.lazyDependency("zui_sokol", .{ .target = target, .optimize = optimize }) orelse return;
@@ -174,4 +174,24 @@ fn addWindowsExamples(b: *std.Build, target: std.Build.ResolvedTarget, optimize:
     if (b.args) |arguments| run_theme.addArgs(arguments);
     b.step("theme", "Show a window styled by examples/theme.zon, restyled when the file changes (`-- --check` scripts it)").dependOn(&run_theme.step);
     check_step.dependOn(&theme.step);
+
+    const accessible = b.addExecutable(.{
+        .name = "zui-host-accessible",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("examples/accessible.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "zui_host", .module = host_module },
+                .{ .name = "zui_app", .module = app_module },
+                .{ .name = "zui_widgets", .module = zui_dependency.module("zui_widgets") },
+                .{ .name = "zui_sokol", .module = zui_sokol_dependency.module("zui_sokol") },
+            },
+        }),
+    });
+    b.installArtifact(accessible);
+    const run_accessible = b.addRunArtifact(accessible);
+    if (b.args) |arguments| run_accessible.addArgs(arguments);
+    b.step("accessible", "Show zui_widgets controls to UI Automation, for Narrator and Accessibility Insights (`-- --frames 30` quits)").dependOn(&run_accessible.step);
+    check_step.dependOn(&accessible.step);
 }

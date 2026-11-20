@@ -54,7 +54,11 @@ window keeps drawing while the user drags its edges or moves it. It:
   renderer declares it too), and in `.sdr` otherwise, and reports
   `Environment.hdr_headroom`: the monitor's peak over the SDR white that
   its SDR content brightness slider sets, or 1 in `.sdr`. Moving to
-  another monitor and turning HDR on or off change both.
+  another monitor and turning HDR on or off change both;
+- bridges `Frame.semantics()` to UI Automation, through `zuiSemantics`,
+  when the window was opened with room for it (`WindowOptions.semantics`,
+  which `zui_app` sizes from `Config.limits` when `features.semantics` is
+  on); see *Accessibility* below.
 
 It passes zui's host suite (`zui_testing.expectHostConforms`) against a
 hidden window, whose harness sends the messages Windows would.
@@ -122,6 +126,29 @@ another sender's do not.
 dbus-daemon --session --nofork --address=unix:abstract=/zui-host-test --print-address
 ZUI_HOST_TEST_SESSION_BUS=unix:abstract=/zui-host-test zig build test
 ```
+
+## Accessibility
+
+A window opened with `WindowOptions.semantics` answers UI Automation's
+`WM_GETOBJECT` with a fragment root, whose elements are the nodes of the
+last `Frame.semantics()` the host was handed: each with its label as its
+name, its role as a control type, its id in hex as its AutomationId, its
+bounds in screen pixels and its place in the tree. A client's `Invoke`
+and `SetFocus` arrive in the next record as `invoke` and `focus` actions,
+answered as a click and as Tab would be. Focus and structure changes are
+raised only while a client listens, from the window thread. The host
+copies each list into one of two snapshots it allocates in `init`, so a
+list past that room is cut from the end and reported, and nothing is
+allocated after `init`. Without room, the window is left to Windows'
+default accessibility. The Toggle, ExpandCollapse, RangeValue, Value,
+Selection and Scroll patterns, and property changes, are still to come.
+
+`zig build accessible` shows a button, a checkbox, a slider and a text
+field from `zui_widgets` for trying with Narrator or Accessibility
+Insights; `-- --frames 30` draws 30 frames and quits. The host's tests
+read their windows through UI Automation's own client, in-process, from
+a thread that owns no window: a window that was never shown is exposed
+too.
 
 ## The desktop through the window
 
@@ -238,6 +265,7 @@ under a second: the first frame arrives about 3 ms after connecting.
 | `zig build material` | show the system material, or its fallback |
 | `zig build remote` | run the tour in another process and draw it here, over `zui_wire` |
 | `zig build theme` | a window styled by a theme file, restyled when it changes |
+| `zig build accessible` | `zui_widgets` controls for Narrator and Accessibility Insights |
 | `zig build fmt` / `fmt-check` | format, or fail if a file is not formatted |
 
 CI checks the format, runs the tests on Windows, and on Linux under a
