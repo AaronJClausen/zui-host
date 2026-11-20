@@ -1440,15 +1440,25 @@ test "a press on the drawn close button reaches zui and its release cancels it, 
     const close_point = window.screenLparam(insideInPixels(titled.regions[4], 1));
     window.send(win32.WM_NCLBUTTONDOWN, win32.HTCLOSE, close_point);
     window.send(win32.WM_NCLBUTTONUP, win32.HTCLOSE, close_point);
-    try testing.expect(polled.poll(&window.window_host));
-    try testing.expect(polled.find(.pointer_down) != null);
-    try testing.expect(polled.find(.pointer_cancel) != null);
-    try testing.expect(polled.find(.pointer_up) == null);
+    // Read from the inbox, not a poll: the window thread may handle the
+    // close it posted itself before the next poll, which then reports the
+    // window closed without the events, as after the system's close button.
+    const host = &window.window_host;
+    try testing.expect(queuedEvent(host, .pointer_down));
+    try testing.expect(queuedEvent(host, .pointer_cancel));
+    try testing.expect(!queuedEvent(host, .pointer_up));
     for (0..200) |_| {
-        if (!polled.poll(&window.window_host)) return;
+        if (!polled.poll(host)) return;
         try testing.io.sleep(.fromMilliseconds(5), .awake);
     }
     return error.WindowNotClosed;
+}
+
+fn queuedEvent(host: *Host, comptime tag: std.meta.Tag(zui.Event)) bool {
+    win32.AcquireSRWLockExclusive(&host.lock);
+    defer win32.ReleaseSRWLockExclusive(&host.lock);
+    for (host.inbox.events[0..host.inbox.event_count]) |event| if (event == tag) return true;
+    return false;
 }
 
 test "a release on another caption button than the press works neither" {
