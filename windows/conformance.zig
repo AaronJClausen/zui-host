@@ -85,6 +85,7 @@ const MessageHarness = struct {
 
     pub fn scriptServices(self: *MessageHarness, script: zui_testing.ServiceScript) void {
         self.window.service_fake.scriptFileDialog(script.chosen_paths);
+        self.window.service_fake.scriptPopupMenu(script.chosen_menu_item);
         self.window.service_fake.scriptNotification(switch (script.notification) {
             .activated => .activated,
             .dismissed => .dismissed,
@@ -483,6 +484,200 @@ test "a file dialog still open when the host closes is closed first, and not ans
     replies.zuiSwap();
     var unanswered = replies.zuiView().items();
     try testing.expectEqual(null, unanswered.next());
+}
+
+const SeenMenu = zui_host.windows.services.ServiceFake.SeenMenu;
+const CopiedMenu = zui_host.windows.menu.CopiedMenu;
+
+/// Waits for at most two seconds until the window thread has shown a
+/// popup menu for the `count`th time.
+fn awaitPopupMenus(window: *HiddenWindow, count: u32) !void {
+    const deadline = window.window_host.now().addNanoseconds(2 * std.time.ns_per_s);
+    while (window.service_fake.popupMenusShown() < count) {
+        if (!window.window_host.now().isBefore(deadline)) return error.NotShown;
+        try testing.io.sleep(.fromMilliseconds(5), .awake);
+    }
+}
+
+/// Waits for at most two seconds until the window's menu bar is no longer
+/// `replaced`, and returns it.
+fn awaitMenuBarReplacing(window: *HiddenWindow, replaced: ?win32.HMENU) !?win32.HMENU {
+    const deadline = window.window_host.now().addNanoseconds(2 * std.time.ns_per_s);
+    while (win32.GetMenu(window.window_host.hwnd) == replaced) {
+        if (!window.window_host.now().isBefore(deadline)) return error.MenuBarNotSet;
+        try testing.io.sleep(.fromMilliseconds(5), .awake);
+    }
+    return win32.GetMenu(window.window_host.hwnd);
+}
+
+fn expectNoReply(replies: *Replies) !void {
+    replies.zuiSwap();
+    var unanswered = replies.zuiView().items();
+    try testing.expectEqual(null, unanswered.next());
+}
+
+fn chooseFromMenuBar(window: *HiddenWindow, command: u32) void {
+    window.send(win32.WM_COMMAND, command, 0);
+}
+
+test "a popup menu is built as asked, read back from Windows' menu, shown in screen pixels where it was asked, and answers the item chosen" {
+    var window: HiddenWindow = .{};
+    try window.open(2);
+    defer window.close();
+    const host = &window.window_host;
+    var polled: Polled = .{};
+    polled.init();
+    _ = polled.poll(host);
+
+    var replies: Replies = .{};
+    const edit: zui.ServiceRequest = .of("edit menu");
+    const dark: zui.MenuItemId = @enumFromInt(20);
+    window.service_fake.scriptPopupMenu(dark);
+    try Host.zuiMenus.popup(host, .main, edit, &.{
+        .{ .id = @enumFromInt(10), .label = "Cut", .shortcut = .{ .key = .x, .modifiers = .{ .control = true } } },
+        .separator,
+        .{ .label = "Recent", .submenu = &.{ .{ .id = dark, .label = "dark.zon" }, .{ .id = @enumFromInt(21), .label = "light.zon", .enabled = false, .checked = true } } },
+        .{ .id = @enumFromInt(30), .label = "Paste & go" },
+    }, .{ 10, 20 }, .of(&replies));
+    const reply = try awaitReply(host, &replies);
+    try testing.expectEqual(edit, reply.request);
+    try testing.expectEqual(zui.WindowId.main, reply.window);
+    try testing.expectEqual(.menu_item_chosen, reply.kind);
+    try testing.expectEqual(dark, reply.menu_item);
+
+    const seen = &window.service_fake.seen_popup_menu;
+    var expected_position: win32.POINT = .{ .x = 20, .y = 40 };
+    _ = win32.ClientToScreen(host.hwnd, &expected_position);
+    try testing.expectEqual(expected_position, seen.position);
+    try testing.expectEqual(@as(usize, 6), seen.item_count);
+    try testing.expectEqualSlices(u16, W("Cut\tCtrl+X"), seen.items[0].labelUnits());
+    try testing.expect(seen.items[1].state & win32.MF_SEPARATOR != 0);
+    try testing.expectEqualSlices(u16, W("Recent"), seen.items[2].labelUnits());
+    try testing.expect(seen.items[2].state & win32.MF_POPUP != 0);
+    try testing.expectEqual(@as(usize, 1), seen.items[3].depth);
+    try testing.expectEqualSlices(u16, W("light.zon"), seen.items[4].labelUnits());
+    try testing.expectEqual(@as(u32, win32.MF_GRAYED | win32.MF_CHECKED), seen.items[4].state & (win32.MF_GRAYED | win32.MF_CHECKED));
+    try testing.expectEqual(@as(u32, 0), seen.items[3].state & (win32.MF_GRAYED | win32.MF_CHECKED));
+    try testing.expectEqualSlices(u16, W("Paste && go"), seen.items[5].labelUnits());
+}
+
+test "one dialog or menu shows at a time: a popup menu or a file dialog while a popup menu is open is busy, and a menu closed answers canceled" {
+    var window: HiddenWindow = .{};
+    try window.open(1);
+    defer window.close();
+    const host = &window.window_host;
+    var replies: Replies = .{};
+    const items = [_]zui.MenuItem{.{ .id = @enumFromInt(1), .label = "Copy" }};
+    const first: zui.ServiceRequest = .of("first");
+    window.service_fake.scriptPopupMenu(null);
+    window.service_fake.hold_popup_menu_open.store(true, .release);
+    try Host.zuiMenus.popup(host, .main, first, &items, .{ 0, 0 }, .of(&replies));
+    try awaitPopupMenus(&window, 1);
+    try testing.expectError(error.Busy, Host.zuiMenus.popup(host, .main, .of("second"), &items, .{ 0, 0 }, .of(&replies)));
+    try testing.expectError(error.Busy, Host.zuiFileDialogs.show(host, .main, .of("open"), .{}, .of(&replies)));
+
+    window.service_fake.releaseHeldPopupMenu(host.hwnd);
+    const closed = try awaitReply(host, &replies);
+    try testing.expectEqual(first, closed.request);
+    try testing.expectEqual(.canceled, closed.kind);
+
+    window.service_fake.hold_file_dialog_open.store(true, .release);
+    window.service_fake.scriptFileDialog("");
+    try Host.zuiFileDialogs.show(host, .main, .of("open"), .{}, .of(&replies));
+    try awaitFileDialogs(&window, 1);
+    try testing.expectError(error.Busy, Host.zuiMenus.popup(host, .main, .of("second"), &items, .{ 0, 0 }, .of(&replies)));
+    window.service_fake.releaseHeldFileDialog(host.hwnd);
+    _ = try awaitReply(host, &replies);
+    try Host.zuiMenus.popup(host, .main, .of("second"), &items, .{ 0, 0 }, .of(&replies));
+    _ = try awaitReply(host, &replies);
+}
+
+test "a menu the host cannot hold, or whose labels are not UTF-8, is refused and shown neither as a popup nor as a bar" {
+    var window: HiddenWindow = .{};
+    try window.open(1);
+    defer window.close();
+    const host = &window.window_host;
+    var replies: Replies = .{};
+    const item: zui.MenuItem = .{ .id = @enumFromInt(1), .label = "Item" };
+    const too_many = [_]zui.MenuItem{item} ** (CopiedMenu.entry_capacity + 1);
+    try testing.expectError(error.TooLarge, Host.zuiMenus.popup(host, .main, .of("menu"), &too_many, .{ 0, 0 }, .of(&replies)));
+    try testing.expectError(error.TooLarge, Host.zuiMenus.setBar(host, .main, .of("bar"), &too_many, .of(&replies)));
+    try testing.expectError(error.InvalidUtf8, Host.zuiMenus.popup(host, .main, .of("menu"), &.{.{ .label = "\xff" }}, .{ 0, 0 }, .of(&replies)));
+    try testing.expectError(error.InvalidUtf8, Host.zuiMenus.setBar(host, .main, .of("bar"), &.{.{ .label = "File", .submenu = &.{.{ .label = "\xc3" }} }}, .of(&replies)));
+    try testing.io.sleep(.fromMilliseconds(50), .awake);
+    try testing.expectEqual(@as(u32, 0), window.service_fake.popupMenusShown());
+    try testing.expectEqual(@as(?win32.HMENU, null), win32.GetMenu(host.hwnd));
+    try expectNoReply(&replies);
+}
+
+test "a popup menu still open when the host closes is closed first, and not answered" {
+    var window: HiddenWindow = .{};
+    try window.open(1);
+    var replies: Replies = .{};
+    window.service_fake.hold_popup_menu_open.store(true, .release);
+    window.service_fake.scriptPopupMenu(@enumFromInt(1));
+    try Host.zuiMenus.popup(&window.window_host, .main, .of("menu"), &.{.{ .id = @enumFromInt(1), .label = "Copy" }}, .{ 0, 0 }, .of(&replies));
+    try awaitPopupMenus(&window, 1);
+    window.close();
+    try expectNoReply(&replies);
+}
+
+test "a menu bar is set on the window, answers each item chosen from it, and is replaced or removed" {
+    var window: HiddenWindow = .{};
+    try window.open(1);
+    defer window.close();
+    const host = &window.window_host;
+    var replies: Replies = .{};
+    const file_menu: zui.ServiceRequest = .of("file menu");
+    const open_item: zui.MenuItemId = @enumFromInt(1);
+    const quit_item: zui.MenuItemId = @enumFromInt(2);
+    try Host.zuiMenus.setBar(host, .main, file_menu, &.{
+        .{ .label = "File", .submenu = &.{ .{ .id = open_item, .label = "Open", .shortcut = .{ .key = .o, .modifiers = .{ .control = true } } }, .separator, .{ .id = quit_item, .label = "Quit" } } },
+        .{ .id = @enumFromInt(3), .label = "Help" },
+    }, .of(&replies));
+    const first_bar = (try awaitMenuBarReplacing(&window, null)).?;
+    var seen: SeenMenu = .{};
+    seen.read(first_bar, 0);
+    try testing.expectEqual(@as(usize, 5), seen.item_count);
+    try testing.expectEqualSlices(u16, W("File"), seen.items[0].labelUnits());
+    try testing.expectEqualSlices(u16, W("Open\tCtrl+O"), seen.items[1].labelUnits());
+    try testing.expectEqualSlices(u16, W("Help"), seen.items[4].labelUnits());
+
+    const quit_command = seen.items[3].command;
+    for ([_]struct { command: u32, item: zui.MenuItemId }{ .{ .command = quit_command, .item = quit_item }, .{ .command = seen.items[1].command, .item = open_item } }) |choice| {
+        chooseFromMenuBar(&window, choice.command);
+        const reply = try awaitReply(host, &replies);
+        try testing.expectEqual(file_menu, reply.request);
+        try testing.expectEqual(.menu_item_chosen, reply.kind);
+        try testing.expectEqual(choice.item, reply.menu_item);
+    }
+
+    // While the user is in the bar's menus, a new bar waits for them to close.
+    const edit_menu: zui.ServiceRequest = .of("edit menu");
+    window.send(win32.WM_ENTERMENULOOP, 0, 0);
+    try Host.zuiMenus.setBar(host, .main, edit_menu, &.{.{ .id = @enumFromInt(4), .label = "Undo" }}, .of(&replies));
+    try testing.io.sleep(.fromMilliseconds(50), .awake);
+    try testing.expectEqual(@as(?win32.HMENU, first_bar), win32.GetMenu(host.hwnd));
+    window.send(win32.WM_EXITMENULOOP, 0, 0);
+    const second_bar = (try awaitMenuBarReplacing(&window, first_bar)).?;
+    seen = .{};
+    seen.read(second_bar, 0);
+    try testing.expectEqualSlices(u16, W("Undo"), seen.items[0].labelUnits());
+
+    chooseFromMenuBar(&window, seen.items[0].command);
+    const undo = try awaitReply(host, &replies);
+    try testing.expectEqual(edit_menu, undo.request);
+    try testing.expectEqual(@as(zui.MenuItemId, @enumFromInt(4)), undo.menu_item);
+
+    // Windows may report a choice from the old bar after it was replaced.
+    chooseFromMenuBar(&window, quit_command);
+    const late_quit = try awaitReply(host, &replies);
+    try testing.expectEqual(file_menu, late_quit.request);
+    try testing.expectEqual(quit_item, late_quit.menu_item);
+
+    try Host.zuiMenus.setBar(host, .main, .of("no menu"), &.{}, .of(&replies));
+    try testing.expectEqual(@as(?win32.HMENU, null), try awaitMenuBarReplacing(&window, second_bar));
+    try expectNoReply(&replies);
 }
 
 test "requests reach the window: the cursor it shows, and an IME only while text input is asked for" {

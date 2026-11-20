@@ -132,6 +132,9 @@ pub const WM_MBUTTONDOWN = 0x0207;
 pub const WM_MBUTTONUP = 0x0208;
 pub const WM_MOUSEWHEEL = 0x020A;
 pub const WM_MOUSEHWHEEL = 0x020E;
+pub const WM_COMMAND = 0x0111;
+pub const WM_ENTERMENULOOP = 0x0211;
+pub const WM_EXITMENULOOP = 0x0212;
 pub const WM_POWERBROADCAST = 0x0218;
 pub const WM_DROPFILES = 0x0233;
 pub const WM_MOUSELEAVE = 0x02A3;
@@ -337,6 +340,31 @@ pub extern "user32" fn EmptyClipboard() callconv(.winapi) BOOL;
 pub extern "user32" fn GetClipboardData(format: UINT) callconv(.winapi) ?HANDLE;
 pub extern "user32" fn SetClipboardData(format: UINT, memory: ?HANDLE) callconv(.winapi) ?HANDLE;
 pub extern "user32" fn SystemParametersInfoW(action: UINT, param: UINT, value: ?*anyopaque, win_ini: UINT) callconv(.winapi) BOOL;
+
+pub const MF_STRING = 0x0000;
+pub const MF_GRAYED = 0x0001;
+pub const MF_CHECKED = 0x0008;
+pub const MF_POPUP = 0x0010;
+pub const MF_BYPOSITION = 0x0400;
+pub const MF_SEPARATOR = 0x0800;
+pub const TPM_RIGHTBUTTON = 0x0002;
+pub const TPM_NONOTIFY = 0x0080;
+pub const TPM_RETURNCMD = 0x0100;
+
+pub extern "user32" fn CreateMenu() callconv(.winapi) ?HMENU;
+pub extern "user32" fn CreatePopupMenu() callconv(.winapi) ?HMENU;
+pub extern "user32" fn DestroyMenu(menu: HMENU) callconv(.winapi) BOOL;
+pub extern "user32" fn AppendMenuW(menu: HMENU, flags: UINT, id: usize, item: ?[*:0]const u16) callconv(.winapi) BOOL;
+/// With `TPM_RETURNCMD`, the chosen item's id, or 0 when none was.
+pub extern "user32" fn TrackPopupMenuEx(menu: HMENU, flags: UINT, x: c_int, y: c_int, hwnd: HWND, params: ?*const anyopaque) callconv(.winapi) BOOL;
+pub extern "user32" fn EndMenu() callconv(.winapi) BOOL;
+pub extern "user32" fn SetMenu(hwnd: HWND, menu: ?HMENU) callconv(.winapi) BOOL;
+pub extern "user32" fn GetMenu(hwnd: HWND) callconv(.winapi) ?HMENU;
+pub extern "user32" fn GetMenuItemCount(menu: HMENU) callconv(.winapi) c_int;
+pub extern "user32" fn GetMenuItemID(menu: HMENU, position: c_int) callconv(.winapi) UINT;
+pub extern "user32" fn GetMenuStringW(menu: HMENU, item: UINT, buffer: [*]u16, max_units: c_int, flags: UINT) callconv(.winapi) c_int;
+pub extern "user32" fn GetMenuState(menu: HMENU, item: UINT, flags: UINT) callconv(.winapi) UINT;
+pub extern "user32" fn GetSubMenu(menu: HMENU, position: c_int) callconv(.winapi) ?HMENU;
 
 pub extern "kernel32" fn GetModuleHandleW(name: ?[*:0]const u16) callconv(.winapi) ?HINSTANCE;
 pub extern "kernel32" fn CreateEventW(attributes: ?*anyopaque, manual_reset: BOOL, initial_state: BOOL, name: ?[*:0]const u16) callconv(.winapi) ?HANDLE;

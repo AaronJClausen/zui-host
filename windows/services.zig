@@ -2,6 +2,7 @@ const std = @import("std");
 const zui = @import("zui");
 const win32 = @import("win32.zig");
 const file_dialog = @import("file_dialog.zig");
+const menu = @import("menu.zig");
 
 const W = std.unicode.utf8ToUtf16LeStringLiteral;
 
@@ -20,7 +21,25 @@ pub const Services = struct {
     /// while it shows.
     file_dialog_pending: ?PendingAnswer = null,
     file_dialog: file_dialog.CopiedDialog = .{},
+    /// Claimed until the menu has been answered, as a file dialog is; the
+    /// two share the rule that one shows at a time.
+    popup_menu_pending: ?PendingAnswer = null,
+    popup_menu: menu.CopiedMenu = .{},
+    /// In the window's client pixels.
+    popup_menu_position: win32.POINT = .{},
+    /// Claimed until the window thread has set the bar.
+    menu_bar_pending: ?PendingAnswer = null,
+    menu_bar: menu.CopiedMenu = .{},
     /// Only the window thread uses these.
+    popup_menu_running: bool = false,
+    /// The bar shown and the one before it, which answers a choice made
+    /// from it that Windows reports after it was replaced.
+    shown_bars: [2]ShownBar = .{ .{}, .{} },
+    current_bar: u1 = 0,
+    /// While the user is in the bar's menus, which a new bar must not
+    /// destroy; it is set once they close.
+    tracking_menu_bar: bool = false,
+    menu_bar_deferred: bool = false,
     clipboard_text: [clipboard_text_capacity]u8 = undefined,
     /// The notification showing, answered when the user clicks it, it times
     /// out or is closed, or the next one replaces it.
@@ -51,7 +70,27 @@ pub const Services = struct {
     pub const NotificationTitle = @FieldType(win32.NOTIFYICONDATAW, "szInfoTitle");
     pub const NotificationBody = @FieldType(win32.NOTIFYICONDATAW, "szInfo");
 
+    /// The commands Windows reports for each bar and for a popup, kept
+    /// apart so a command always names the menu it came from.
+    pub const first_bar_command = [2]usize{ 1, 1 + menu.CopiedMenu.entry_capacity };
+    pub const first_popup_menu_command = 1 + 2 * menu.CopiedMenu.entry_capacity;
+
     const PendingAnswer = struct { request: zui.ServiceRequest, sink: zui.ServiceSink };
+
+    const ShownBar = struct {
+        answer_to: ?PendingAnswer = null,
+        item_ids: [menu.CopiedMenu.entry_capacity]?zui.MenuItemId = undefined,
+        command_count: usize = 0,
+
+        fn itemOfCommand(self: *const ShownBar, command: usize, first_command: usize) ?zui.MenuItemId {
+            if (command < first_command or command - first_command >= self.command_count) return null;
+            return self.item_ids[command - first_command];
+        }
+    };
+
+    fn dialogOrMenuClaimed(self: *const Services) bool {
+        return self.file_dialog_pending != null or self.popup_menu_pending != null;
+    }
 
     pub fn claimClipboardRead(self: *Services, request: zui.ServiceRequest, sink: zui.ServiceSink) zui.ServiceError!void {
         win32.AcquireSRWLockExclusive(&self.lock);
@@ -105,11 +144,11 @@ pub const Services = struct {
     }
 
     /// Copies the dialog's settings for the window thread to show, refusing
-    /// one while the last is still waiting or open.
+    /// one while a dialog or a popup menu is still waiting or open.
     pub fn claimFileDialog(self: *Services, request: zui.ServiceRequest, dialog: zui.FileDialog, sink: zui.ServiceSink) zui.ServiceError!void {
         win32.AcquireSRWLockExclusive(&self.lock);
         defer win32.ReleaseSRWLockExclusive(&self.lock);
-        if (self.file_dialog_pending != null) return error.Busy;
+        if (self.dialogOrMenuClaimed()) return error.Busy;
         try self.file_dialog.copy(dialog);
         self.file_dialog_pending = .{ .request = request, .sink = sink };
     }
@@ -118,6 +157,146 @@ pub const Services = struct {
         win32.AcquireSRWLockExclusive(&self.lock);
         defer win32.ReleaseSRWLockExclusive(&self.lock);
         self.file_dialog_pending = null;
+    }
+
+    /// Copies the menu for the window thread to show at `position`, in the
+    /// window's client pixels, refusing one while a dialog or a popup menu
+    /// is still waiting or open.
+    pub fn claimPopupMenu(self: *Services, request: zui.ServiceRequest, items: []const zui.MenuItem, position: win32.POINT, sink: zui.ServiceSink) zui.ServiceError!void {
+        win32.AcquireSRWLockExclusive(&self.lock);
+        defer win32.ReleaseSRWLockExclusive(&self.lock);
+        if (self.dialogOrMenuClaimed()) return error.Busy;
+        try self.popup_menu.copy(items);
+        self.popup_menu_position = position;
+        self.popup_menu_pending = .{ .request = request, .sink = sink };
+    }
+
+    pub fn releasePopupMenu(self: *Services) void {
+        win32.AcquireSRWLockExclusive(&self.lock);
+        defer win32.ReleaseSRWLockExclusive(&self.lock);
+        self.popup_menu_pending = null;
+    }
+
+    /// Copies the bar for the window thread to set, refusing one while the
+    /// last is still waiting to be set.
+    pub fn claimMenuBar(self: *Services, request: zui.ServiceRequest, items: []const zui.MenuItem, sink: zui.ServiceSink) zui.ServiceError!void {
+        win32.AcquireSRWLockExclusive(&self.lock);
+        defer win32.ReleaseSRWLockExclusive(&self.lock);
+        if (self.menu_bar_pending != null) return error.Busy;
+        try self.menu_bar.copy(items);
+        self.menu_bar_pending = .{ .request = request, .sink = sink };
+    }
+
+    pub fn releaseMenuBar(self: *Services) void {
+        win32.AcquireSRWLockExclusive(&self.lock);
+        defer win32.ReleaseSRWLockExclusive(&self.lock);
+        self.menu_bar_pending = null;
+    }
+
+    /// On the window thread, which owns the menu. `TrackPopupMenuEx` runs
+    /// the menu's modal loop, which keeps dispatching the window's messages,
+    /// and returns when the user has chosen or closed it. When the window
+    /// was asked to close meanwhile, nothing is answered, and
+    /// `close_message` is posted again to close it.
+    pub fn showPopupMenu(self: *Services, hwnd: win32.HWND, close_message: win32.UINT, waker: zui.Waker) void {
+        win32.AcquireSRWLockExclusive(&self.lock);
+        const pending = self.popup_menu_pending orelse {
+            win32.ReleaseSRWLockExclusive(&self.lock);
+            return;
+        };
+        win32.ReleaseSRWLockExclusive(&self.lock);
+
+        self.popup_menu_running = true;
+        const outcome = self.runPopupMenu(hwnd);
+        self.popup_menu_running = false;
+        // Before the answer, so a menu shown as soon as it arrives is not busy.
+        self.releasePopupMenu();
+        if (self.window_closing) {
+            _ = win32.PostMessageW(hwnd, close_message, 0, 0);
+            return;
+        }
+        publish(pending, outcome, waker);
+    }
+
+    fn runPopupMenu(self: *Services, hwnd: win32.HWND) zui.ServiceAnswer.Outcome {
+        // Windows shows one menu at a time, and the user is in the bar's.
+        if (self.tracking_menu_bar) return .{ .failed = .unavailable };
+        const popup = menu.build(&self.popup_menu, .popup, first_popup_menu_command) orelse return .{ .failed = .unavailable };
+        defer _ = win32.DestroyMenu(popup);
+        var position = self.popup_menu_position;
+        _ = win32.ClientToScreen(hwnd, &position);
+        const command: usize = if (self.fake) |fake|
+            fake.standInForTrackPopupMenu(popup, &self.popup_menu, position, self)
+        else
+            @intCast(@max(win32.TrackPopupMenuEx(popup, win32.TPM_RETURNCMD | win32.TPM_NONOTIFY | win32.TPM_RIGHTBUTTON, position.x, position.y, hwnd, null), 0));
+        const chosen = self.popup_menu.itemOfCommand(command, first_popup_menu_command) orelse return .canceled;
+        return .{ .menu_item_chosen = chosen };
+    }
+
+    /// On the window thread: replaces the window's bar with the claimed
+    /// one, or removes it for one without items. Deferred while the user
+    /// is in the bar's menus, until `endMenuLoop`.
+    pub fn setMenuBar(self: *Services, hwnd: win32.HWND, waker: zui.Waker) void {
+        if (self.tracking_menu_bar) {
+            self.menu_bar_deferred = true;
+            return;
+        }
+        win32.AcquireSRWLockExclusive(&self.lock);
+        const pending = self.menu_bar_pending orelse {
+            win32.ReleaseSRWLockExclusive(&self.lock);
+            return;
+        };
+        win32.ReleaseSRWLockExclusive(&self.lock);
+
+        const set = self.replaceMenuBar(hwnd, pending);
+        // Before any answer, so a bar set as soon as it arrives is not busy;
+        // the copy is not read again until the next bar is claimed.
+        self.releaseMenuBar();
+        if (!set) publish(pending, .{ .failed = .unavailable }, waker);
+    }
+
+    fn replaceMenuBar(self: *Services, hwnd: win32.HWND, pending: PendingAnswer) bool {
+        const next: u1 = self.current_bar +% 1;
+        const first_command = first_bar_command[next];
+        const bar: ?win32.HMENU = if (self.menu_bar.entry_count == 0) null else menu.build(&self.menu_bar, .bar, first_command) orelse return false;
+        const replaced = win32.GetMenu(hwnd);
+        if (win32.SetMenu(hwnd, bar) == 0) {
+            if (bar) |unset| _ = win32.DestroyMenu(unset);
+            return false;
+        }
+        if (replaced) |old| _ = win32.DestroyMenu(old);
+
+        const shown = &self.shown_bars[next];
+        shown.* = .{ .answer_to = if (bar == null) null else pending, .command_count = self.menu_bar.entry_count };
+        for (shown.item_ids[0..shown.command_count], 0..) |*id, index| id.* = self.menu_bar.itemOfCommand(first_command + index, first_command);
+        self.current_bar = next;
+        return true;
+    }
+
+    /// On the window thread, for `WM_COMMAND` from a menu: answers the bar
+    /// the command came from.
+    pub fn answerMenuBarCommand(self: *Services, command: usize, waker: zui.Waker) void {
+        for (&self.shown_bars, first_bar_command) |*shown, first_command| {
+            const chosen = shown.itemOfCommand(command, first_command) orelse continue;
+            const answer_to = shown.answer_to orelse return;
+            return publish(answer_to, .{ .menu_item_chosen = chosen }, waker);
+        }
+    }
+
+    /// On the window thread, for `WM_ENTERMENULOOP`: `popup` is false for
+    /// the bar's menus.
+    pub fn beginMenuLoop(self: *Services, popup: bool) void {
+        if (!popup) self.tracking_menu_bar = true;
+    }
+
+    /// On the window thread, for `WM_EXITMENULOOP`: a bar that arrived
+    /// while the user was in the old one's menus is set now, through
+    /// `set_menu_bar_message`, after any command they chose from the old.
+    pub fn endMenuLoop(self: *Services, hwnd: win32.HWND, set_menu_bar_message: win32.UINT) void {
+        self.tracking_menu_bar = false;
+        if (!self.menu_bar_deferred) return;
+        self.menu_bar_deferred = false;
+        _ = win32.PostMessageW(hwnd, set_menu_bar_message, 0, 0);
     }
 
     /// On the window thread, which owns the dialog. `Show` runs the dialog's
@@ -159,11 +338,13 @@ pub const Services = struct {
     }
 
     /// On the window thread, when the window is to close: true when a file
-    /// dialog is open, which is canceled first, and the window closed after it.
-    pub fn closeFileDialogFirst(self: *Services) bool {
-        if (!self.file_dialog_running) return false;
+    /// dialog or a popup menu is open, which is closed first, and the window
+    /// closed after it.
+    pub fn closeDialogOrMenuFirst(self: *Services) bool {
+        if (!self.file_dialog_running and !self.popup_menu_running) return false;
         self.window_closing = true;
         if (self.file_dialog_shown) |dialog| file_dialog.cancelShown(dialog);
+        if (self.popup_menu_running and self.fake == null) _ = win32.EndMenu();
         return true;
     }
 
@@ -316,8 +497,105 @@ pub const ServiceFake = struct {
     /// The last dialog as the shell holds it, read back from the dialog
     /// itself where it has a getter; valid once `file_dialogs_shown` counts it.
     seen_dialog: SeenDialog = .{},
+    /// The item the next popup menu answers, as though the user had chosen
+    /// it; `no_menu_item` closes it.
+    scripted_menu_item: std.atomic.Value(u64) = .init(no_menu_item),
+    /// Keeps the next popup menu open, dispatching the window's messages as
+    /// the menu's own loop would, until `releaseHeldPopupMenu`.
+    hold_popup_menu_open: std.atomic.Value(bool) = .init(false),
+    popup_menus_shown: std.atomic.Value(u32) = .init(0),
+    /// The last popup menu as Windows holds it, read back from its `HMENU`;
+    /// valid once `popup_menus_shown` counts it.
+    seen_popup_menu: SeenMenu = .{},
 
     const notify_icon_messages = win32.NIM_SETVERSION + 1;
+    const no_menu_item = std.math.maxInt(u64);
+
+    /// A menu read back item by item, depth first, each submenu's items
+    /// after it.
+    pub const SeenMenu = struct {
+        /// In screen pixels.
+        position: win32.POINT = .{},
+        items: [item_capacity]Item = undefined,
+        item_count: usize = 0,
+
+        pub const item_capacity = 32;
+
+        pub const Item = struct {
+            /// 0 for the menu's own items.
+            depth: usize,
+            label: [64]u16,
+            label_len: usize,
+            /// `GetMenuState`'s flags: `MF_GRAYED`, `MF_CHECKED`, `MF_SEPARATOR`, `MF_POPUP`.
+            state: u32,
+            /// What choosing it reports; 0 for a separator or a submenu.
+            command: u32,
+
+            pub fn labelUnits(self: *const Item) []const u16 {
+                return self.label[0..self.label_len];
+            }
+        };
+
+        /// Reads `handle` and its submenus, up to `item_capacity` items.
+        pub fn read(self: *SeenMenu, handle: win32.HMENU, depth: usize) void {
+            const count = win32.GetMenuItemCount(handle);
+            var position: c_int = 0;
+            while (position < count and self.item_count < item_capacity) : (position += 1) {
+                const item = &self.items[self.item_count];
+                self.item_count += 1;
+                const by_position: win32.UINT = @intCast(position);
+                item.depth = depth;
+                item.label_len = @intCast(@max(win32.GetMenuStringW(handle, by_position, &item.label, item.label.len, win32.MF_BYPOSITION), 0));
+                item.state = win32.GetMenuState(handle, by_position, win32.MF_BYPOSITION);
+                item.command = 0;
+                if (win32.GetSubMenu(handle, position)) |submenu| {
+                    self.read(submenu, depth + 1);
+                } else if (item.state & win32.MF_SEPARATOR == 0) {
+                    item.command = win32.GetMenuItemID(handle, position);
+                }
+            }
+        }
+    };
+
+    /// Answers the next popup menu with `item`, as though the user had
+    /// chosen it; null closes it.
+    pub fn scriptPopupMenu(self: *ServiceFake, item: ?zui.MenuItemId) void {
+        self.scripted_menu_item.store(if (item) |chosen| @intFromEnum(chosen) else no_menu_item, .release);
+    }
+
+    pub fn popupMenusShown(self: *const ServiceFake) u32 {
+        return self.popup_menus_shown.load(.acquire);
+    }
+
+    pub fn releaseHeldPopupMenu(self: *ServiceFake, hwnd: win32.HWND) void {
+        self.hold_popup_menu_open.store(false, .release);
+        _ = win32.PostMessageW(hwnd, win32.WM_NULL, 0, 0);
+    }
+
+    /// What `TrackPopupMenuEx` would have returned had the user chosen the
+    /// scripted item.
+    fn standInForTrackPopupMenu(self: *ServiceFake, popup: win32.HMENU, copied: *const menu.CopiedMenu, position: win32.POINT, services: *const Services) usize {
+        self.seen_popup_menu = .{ .position = position };
+        self.seen_popup_menu.read(popup, 0);
+        _ = self.popup_menus_shown.fetchAdd(1, .release);
+        self.dispatchWhileHeld(&self.hold_popup_menu_open, services);
+        if (services.window_closing) return 0;
+        const scripted = self.scripted_menu_item.load(.acquire);
+        if (scripted == no_menu_item) return 0;
+        return copied.commandOfItem(@enumFromInt(scripted), Services.first_popup_menu_command) orelse 0;
+    }
+
+    fn dispatchWhileHeld(_: *ServiceFake, held: *const std.atomic.Value(bool), services: *const Services) void {
+        while (held.load(.acquire) and !services.window_closing) {
+            var message: win32.MSG = undefined;
+            if (win32.GetMessageW(&message, null, 0, 0) <= 0) {
+                win32.PostQuitMessage(0);
+                break;
+            }
+            _ = win32.TranslateMessage(&message);
+            _ = win32.DispatchMessageW(&message);
+        }
+    }
 
     pub const SeenDialog = struct {
         options: u32 = 0,
@@ -373,15 +651,7 @@ pub const ServiceFake = struct {
 
     fn standInForShow(self: *ServiceFake, dialog: *file_dialog.IFileDialog, services: *const Services, paths: *file_dialog.ChosenPaths) zui.ServiceAnswer.Outcome {
         self.recordDialog(dialog, &services.file_dialog);
-        while (self.hold_file_dialog_open.load(.acquire) and !services.window_closing) {
-            var message: win32.MSG = undefined;
-            if (win32.GetMessageW(&message, null, 0, 0) <= 0) {
-                win32.PostQuitMessage(0);
-                break;
-            }
-            _ = win32.TranslateMessage(&message);
-            _ = win32.DispatchMessageW(&message);
-        }
+        self.dispatchWhileHeld(&self.hold_file_dialog_open, services);
         if (services.window_closing) return .canceled;
         const scripted = self.scripted_paths[0..self.scripted_paths_len.load(.acquire)];
         if (scripted.len == 0) return .canceled;
@@ -521,6 +791,26 @@ test "a call made while the window thread has not answered the last of its kind 
     services.releaseUrl();
     try services.claimUrl("https://example.com/");
     try std.testing.expectEqualSlices(u16, W("https://example.com/"), std.mem.sliceTo(&services.url, 0));
+}
+
+test "a file dialog and a popup menu share one claim, and a menu bar waits for the last to be set" {
+    var services: Services = .{};
+    var nothing: u8 = 0;
+    const sink: zui.ServiceSink = .{ .context = &nothing, .publishFn = NoSource.publish };
+    const items = [_]zui.MenuItem{.{ .id = @enumFromInt(1), .label = "Copy" }};
+    try services.claimPopupMenu(.of("menu"), &items, .{}, sink);
+    try std.testing.expectError(error.Busy, services.claimFileDialog(.of("open"), .{}, sink));
+    try std.testing.expectError(error.Busy, services.claimPopupMenu(.of("menu"), &items, .{}, sink));
+    services.releasePopupMenu();
+    try services.claimFileDialog(.of("open"), .{}, sink);
+    try std.testing.expectError(error.Busy, services.claimPopupMenu(.of("menu"), &items, .{}, sink));
+    services.releaseFileDialog();
+
+    try services.claimMenuBar(.of("bar"), &items, sink);
+    try services.claimPopupMenu(.of("menu"), &items, .{}, sink);
+    try std.testing.expectError(error.Busy, services.claimMenuBar(.of("bar"), &items, sink));
+    services.releaseMenuBar();
+    try services.claimMenuBar(.of("bar"), &items, sink);
 }
 
 test "the clipboard's text becomes UTF-8 with lone surrogates replaced, cut at a character when it does not fit" {

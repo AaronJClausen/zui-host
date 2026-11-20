@@ -48,10 +48,16 @@ window keeps drawing while the user drags its edges or moves it. It:
   replaced by the next; and `Host.zuiFileDialogs.show(host, window,
   request, dialog, sink)`, the shell's open, save and folder dialogs,
   owned by the window and one at a time, answering `.files_chosen` with
-  the paths chosen or `.canceled`. Each call returns at once; the window
-  thread does the work and publishes every answer, a `zui.ServiceReply`,
-  into a source of the application's, so answers never come from two
-  threads. Menus come next;
+  the paths chosen or `.canceled`; and `Host.zuiMenus`, Windows' own
+  menus: `popup(host, window, request, items, position, sink)`, a context
+  menu at a position in layout units, one at a time with a file dialog,
+  answering the item chosen or `.canceled`, and `setBar(host, window,
+  request, items, sink)`, which replaces the window's menu bar, or
+  removes it given no items, and answers each item chosen from it. Labels
+  show as written, with shortcuts after them (`Ctrl+Shift+S`). Each call
+  returns at once; the window thread does the work and publishes every
+  answer, a `zui.ServiceReply`, into a source of the application's, so
+  answers never come from two threads;
 - watches up to four directories, each with its subdirectories, through
   `Host.zuiFileWatch.watch(host, directory, sink)`: a thread per
   directory waits on `ReadDirectoryChangesW` and publishes each change, a

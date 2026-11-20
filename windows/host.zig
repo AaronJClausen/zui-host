@@ -8,6 +8,7 @@ pub const uia = @import("uia.zig");
 pub const accessibility = @import("accessibility.zig");
 pub const services = @import("services.zig");
 pub const file_dialog = @import("file_dialog.zig");
+pub const menu = @import("menu.zig");
 
 const W = std.unicode.utf8ToUtf16LeStringLiteral;
 
@@ -19,7 +20,7 @@ const W = std.unicode.utf8ToUtf16LeStringLiteral;
 /// contrast, animations, power, HDR headroom), lifecycle events from console control
 /// events, the session ending and the system sleeping, and dropped files;
 /// it sets the cursor and places the IME window; it reads and writes the
-/// clipboard, opens URLs, shows notifications and file dialogs; it watches directories
+/// clipboard, opens URLs, shows notifications, file dialogs and menus; it watches directories
 /// for changes; it bridges `Frame.semantics()` to UI Automation, reporting
 /// what an assistive technology asks for as `action` events; and it waits
 /// for `nextFrame` on its wake, its input and a high-resolution timer.
@@ -124,6 +125,38 @@ pub const Host = struct {
         }
     };
 
+    /// Windows' own menus, built on the window thread from up to
+    /// `menu.CopiedMenu.entry_capacity` items with labels shown as written
+    /// and shortcuts after them. `popup` shows a context menu at a position
+    /// in layout units with `TrackPopupMenuEx`, one at a time with a file
+    /// dialog, and answers the item chosen or `.canceled`; one still open at
+    /// `deinit` is closed and not answered. `setBar` replaces the window's
+    /// menu bar, or removes it given no items, and answers each item chosen
+    /// from it; the client area shrinks by the bar's height.
+    pub const zuiMenus = struct {
+        pub fn popup(host: *Host, window: zui.WindowId, request: zui.ServiceRequest, items: []const zui.MenuItem, position: [2]f32, sink: zui.ServiceSink) zui.ServiceError!void {
+            std.debug.assert(window == .main);
+            const in_client_pixels: win32.POINT = .{
+                .x = std.math.lossyCast(i32, @round(position[0] * host.pixels_per_unit)),
+                .y = std.math.lossyCast(i32, @round(position[1] * host.pixels_per_unit)),
+            };
+            try host.services.claimPopupMenu(request, items, in_client_pixels, sink);
+            if (win32.PostMessageW(host.hwnd, wm_show_popup_menu, 0, 0) == 0) {
+                host.services.releasePopupMenu();
+                return error.Unavailable;
+            }
+        }
+
+        pub fn setBar(host: *Host, window: zui.WindowId, request: zui.ServiceRequest, items: []const zui.MenuItem, sink: zui.ServiceSink) zui.ServiceError!void {
+            std.debug.assert(window == .main);
+            try host.services.claimMenuBar(request, items, sink);
+            if (win32.PostMessageW(host.hwnd, wm_set_menu_bar, 0, 0) == 0) {
+                host.services.releaseMenuBar();
+                return error.Unavailable;
+            }
+        }
+    };
+
     /// Watches up to `file_watch.Watches.capacity` directories, each with
     /// its subdirectories, until `deinit`.
     pub const zuiFileWatch = struct {
@@ -190,6 +223,8 @@ pub const Host = struct {
     /// is shown, clicked, timed out or closed.
     pub const wm_notify_icon = win32.WM_APP + 7;
     const wm_show_file_dialog = win32.WM_APP + 8;
+    const wm_show_popup_menu = win32.WM_APP + 9;
+    const wm_set_menu_bar = win32.WM_APP + 10;
 
     const Inbox = struct {
         /// Positions are in physical pixels until a poll converts them.
@@ -577,7 +612,7 @@ pub const Host = struct {
                 return 0;
             },
             wm_close_window => {
-                if (self.services.closeFileDialogFirst()) return 0;
+                if (self.services.closeDialogOrMenuFirst()) return 0;
                 _ = win32.DestroyWindow(hwnd);
                 return 0;
             },
@@ -701,6 +736,21 @@ pub const Host = struct {
                 self.services.showFileDialog(hwnd, wm_close_window, self.zuiWaker());
                 return 0;
             },
+            wm_show_popup_menu => {
+                self.services.showPopupMenu(hwnd, wm_close_window, self.zuiWaker());
+                return 0;
+            },
+            wm_set_menu_bar => {
+                self.services.setMenuBar(hwnd, self.zuiWaker());
+                return 0;
+            },
+            win32.WM_COMMAND => {
+                const from_a_menu = win32.hiword(wparam) == 0 and lparam == 0;
+                if (from_a_menu) self.services.answerMenuBarCommand(win32.loword(wparam), self.zuiWaker());
+                return 0;
+            },
+            win32.WM_ENTERMENULOOP => self.services.beginMenuLoop(wparam != 0),
+            win32.WM_EXITMENULOOP => self.services.endMenuLoop(hwnd, wm_set_menu_bar),
             win32.WM_GETOBJECT => if (self.accessibility.answerGetObject(hwnd, wparam, lparam)) |answered| return answered,
             win32.WM_DROPFILES => {
                 self.receiveDrop(@ptrFromInt(wparam), at);
@@ -983,4 +1033,5 @@ test {
     _ = accessibility;
     _ = services;
     _ = file_dialog;
+    _ = menu;
 }
