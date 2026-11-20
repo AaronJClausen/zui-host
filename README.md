@@ -40,15 +40,18 @@ window keeps drawing while the user drags its edges or moves it. It:
 - offers zui's host services: the clipboard as text,
   `Host.zuiClipboard.write(host, text)` and `read(host, request, sink)`;
   `Host.zuiOpenUrl.open(host, url)`, which hands a URL to the system's
-  handler for its scheme and refuses paths and `file:` URLs; and
+  handler for its scheme and refuses paths and `file:` URLs;
   `Host.zuiNotifications.show(host, request, notification, sink)`, a
   balloon of the window's notification-area icon, which Windows 10 and
   11 show as a toast, answering `.notification_activated` when clicked
   and `.notification_dismissed` when it times out, is closed or is
-  replaced by the next. Each call returns at once; the window thread
-  does the work and publishes every answer, a `zui.ServiceReply`, into a
-  source of the application's, so answers never come from two threads.
-  File dialogs and menus come next;
+  replaced by the next; and `Host.zuiFileDialogs.show(host, window,
+  request, dialog, sink)`, the shell's open, save and folder dialogs,
+  owned by the window and one at a time, answering `.files_chosen` with
+  the paths chosen or `.canceled`. Each call returns at once; the window
+  thread does the work and publishes every answer, a `zui.ServiceReply`,
+  into a source of the application's, so answers never come from two
+  threads. Menus come next;
 - watches up to four directories, each with its subdirectories, through
   `Host.zuiFileWatch.watch(host, directory, sink)`: a thread per
   directory waits on `ReadDirectoryChangesW` and publishes each change, a

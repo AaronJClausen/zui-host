@@ -1,6 +1,7 @@
 const std = @import("std");
 const zui = @import("zui");
 const win32 = @import("win32.zig");
+const file_dialog = @import("file_dialog.zig");
 
 const W = std.unicode.utf8ToUtf16LeStringLiteral;
 
@@ -15,12 +16,22 @@ pub const Services = struct {
     notification_pending: ?PendingAnswer = null,
     notification_title: NotificationTitle = @splat(0),
     notification_body: NotificationBody = @splat(0),
+    /// Claimed until the dialog has been answered, so its strings stay put
+    /// while it shows.
+    file_dialog_pending: ?PendingAnswer = null,
+    file_dialog: file_dialog.CopiedDialog = .{},
     /// Only the window thread uses these.
     clipboard_text: [clipboard_text_capacity]u8 = undefined,
     /// The notification showing, answered when the user clicks it, it times
     /// out or is closed, or the next one replaces it.
     notification_shown: ?PendingAnswer = null,
     notify_icon_added: bool = false,
+    file_dialog_running: bool = false,
+    /// Null while the fake stands in for `Show`.
+    file_dialog_shown: ?*file_dialog.IFileDialog = null,
+    chosen_paths: [chosen_paths_capacity]u8 = undefined,
+    /// The window closes once the open dialog has; nothing is answered then.
+    window_closing: bool = false,
     /// Hands nothing to the system when set.
     fake: ?*ServiceFake = null,
 
@@ -32,6 +43,9 @@ pub const Services = struct {
     /// The window's icon in the notification area, which shows its
     /// notifications.
     pub const notify_icon_id = 1;
+    /// UTF-8 bytes of the paths a file dialog answers with; paths past it
+    /// are counted as left out.
+    pub const chosen_paths_capacity = 32 * 1024;
 
     /// As `NOTIFYICONDATAW` holds them, each ending in a 0.
     pub const NotificationTitle = @FieldType(win32.NOTIFYICONDATAW, "szInfoTitle");
@@ -90,6 +104,69 @@ pub const Services = struct {
         self.notification_pending = null;
     }
 
+    /// Copies the dialog's settings for the window thread to show, refusing
+    /// one while the last is still waiting or open.
+    pub fn claimFileDialog(self: *Services, request: zui.ServiceRequest, dialog: zui.FileDialog, sink: zui.ServiceSink) zui.ServiceError!void {
+        win32.AcquireSRWLockExclusive(&self.lock);
+        defer win32.ReleaseSRWLockExclusive(&self.lock);
+        if (self.file_dialog_pending != null) return error.Busy;
+        try self.file_dialog.copy(dialog);
+        self.file_dialog_pending = .{ .request = request, .sink = sink };
+    }
+
+    pub fn releaseFileDialog(self: *Services) void {
+        win32.AcquireSRWLockExclusive(&self.lock);
+        defer win32.ReleaseSRWLockExclusive(&self.lock);
+        self.file_dialog_pending = null;
+    }
+
+    /// On the window thread, which owns the dialog. `Show` runs the dialog's
+    /// modal loop, which keeps dispatching the window's messages, and
+    /// returns when the user has chosen or canceled. When the window was
+    /// asked to close meanwhile, nothing is answered, and `close_message` is
+    /// posted again to close it.
+    pub fn showFileDialog(self: *Services, hwnd: win32.HWND, close_message: win32.UINT, waker: zui.Waker) void {
+        win32.AcquireSRWLockExclusive(&self.lock);
+        const pending = self.file_dialog_pending orelse {
+            win32.ReleaseSRWLockExclusive(&self.lock);
+            return;
+        };
+        win32.ReleaseSRWLockExclusive(&self.lock);
+
+        var paths: file_dialog.ChosenPaths = .{ .buffer = &self.chosen_paths };
+        self.file_dialog_running = true;
+        const outcome = self.runFileDialog(hwnd, &paths);
+        self.file_dialog_running = false;
+        // Before the answer, so a dialog shown as soon as it arrives is not
+        // busy; the paths stay put, since only this thread writes them.
+        self.releaseFileDialog();
+        if (self.window_closing) {
+            _ = win32.PostMessageW(hwnd, close_message, 0, 0);
+            return;
+        }
+        const answer: zui.ServiceAnswer = .{ .request = pending.request, .outcome = outcome, .left_out_bytes = paths.left_out_bytes };
+        waker.wakeIf(pending.sink.publish(&answer));
+    }
+
+    fn runFileDialog(self: *Services, hwnd: win32.HWND, paths: *file_dialog.ChosenPaths) zui.ServiceAnswer.Outcome {
+        const dialog = file_dialog.create(&self.file_dialog) orelse return .{ .failed = .unavailable };
+        defer dialog.release();
+        if (self.fake) |fake| return fake.standInForShow(dialog, self, paths);
+        self.file_dialog_shown = dialog;
+        const shown = dialog.vtable.Show(dialog, hwnd);
+        self.file_dialog_shown = null;
+        return file_dialog.collectAnswer(dialog, self.file_dialog.kind, shown, paths);
+    }
+
+    /// On the window thread, when the window is to close: true when a file
+    /// dialog is open, which is canceled first, and the window closed after it.
+    pub fn closeFileDialogFirst(self: *Services) bool {
+        if (!self.file_dialog_running) return false;
+        self.window_closing = true;
+        if (self.file_dialog_shown) |dialog| file_dialog.cancelShown(dialog);
+        return true;
+    }
+
     /// On the window thread, which owns `hwnd`, as the clipboard asks of
     /// whoever opens it.
     pub fn answerClipboardRead(self: *Services, hwnd: win32.HWND, waker: zui.Waker) void {
@@ -99,7 +176,6 @@ pub const Services = struct {
             return;
         };
         win32.ReleaseSRWLockExclusive(&self.lock);
-        defer self.releaseClipboardRead();
 
         var answer: zui.ServiceAnswer = .{ .request = pending.request, .outcome = .{ .failed = .unavailable } };
         if (win32.OpenClipboard(hwnd) != 0) {
@@ -115,6 +191,9 @@ pub const Services = struct {
                 answer.left_out_bytes = converted.left_out_bytes;
             };
         }
+        // Before the answer, so a read made as soon as it arrives is not
+        // busy; the text stays put, since only this thread writes it.
+        self.releaseClipboardRead();
         waker.wakeIf(pending.sink.publish(&answer));
     }
 
@@ -226,8 +305,116 @@ pub const ServiceFake = struct {
     /// `NIM_MODIFY`.
     balloon_title: Services.NotificationTitle = @splat(0),
     balloon_body: Services.NotificationBody = @splat(0),
+    /// The paths the next file dialog answers, each followed by a 0 byte;
+    /// none cancels it.
+    scripted_paths: [1024]u8 = undefined,
+    scripted_paths_len: std.atomic.Value(usize) = .init(0),
+    /// Keeps the next file dialog open, dispatching the window's messages as
+    /// the dialog's own loop would, until `releaseHeldFileDialog`.
+    hold_file_dialog_open: std.atomic.Value(bool) = .init(false),
+    file_dialogs_shown: std.atomic.Value(u32) = .init(0),
+    /// The last dialog as the shell holds it, read back from the dialog
+    /// itself where it has a getter; valid once `file_dialogs_shown` counts it.
+    seen_dialog: SeenDialog = .{},
 
     const notify_icon_messages = win32.NIM_SETVERSION + 1;
+
+    pub const SeenDialog = struct {
+        options: u32 = 0,
+        file_name: [260]u16 = undefined,
+        file_name_len: usize = 0,
+        folder: [1024]u16 = undefined,
+        folder_len: usize = 0,
+        filter_count: usize = 0,
+        first_filter_name: [64]u16 = undefined,
+        first_filter_name_len: usize = 0,
+        first_filter_pattern: [64]u16 = undefined,
+        first_filter_pattern_len: usize = 0,
+
+        pub fn fileName(self: *const SeenDialog) []const u16 {
+            return self.file_name[0..self.file_name_len];
+        }
+
+        pub fn folderPath(self: *const SeenDialog) []const u16 {
+            return self.folder[0..self.folder_len];
+        }
+
+        pub fn firstFilterName(self: *const SeenDialog) []const u16 {
+            return self.first_filter_name[0..self.first_filter_name_len];
+        }
+
+        pub fn firstFilterPattern(self: *const SeenDialog) []const u16 {
+            return self.first_filter_pattern[0..self.first_filter_pattern_len];
+        }
+
+        fn copyInto(buffer: []u16, units: []const u16) usize {
+            const len = @min(units.len, buffer.len);
+            @memcpy(buffer[0..len], units[0..len]);
+            return len;
+        }
+    };
+
+    /// Answers the next file dialog with `paths`, each followed by a 0
+    /// byte, as though the user had chosen them; empty cancels it.
+    pub fn scriptFileDialog(self: *ServiceFake, paths: []const u8) void {
+        const len = @min(paths.len, self.scripted_paths.len);
+        @memcpy(self.scripted_paths[0..len], paths[0..len]);
+        self.scripted_paths_len.store(len, .release);
+    }
+
+    pub fn fileDialogsShown(self: *const ServiceFake) u32 {
+        return self.file_dialogs_shown.load(.acquire);
+    }
+
+    pub fn releaseHeldFileDialog(self: *ServiceFake, hwnd: win32.HWND) void {
+        self.hold_file_dialog_open.store(false, .release);
+        _ = win32.PostMessageW(hwnd, win32.WM_NULL, 0, 0);
+    }
+
+    fn standInForShow(self: *ServiceFake, dialog: *file_dialog.IFileDialog, services: *const Services, paths: *file_dialog.ChosenPaths) zui.ServiceAnswer.Outcome {
+        self.recordDialog(dialog, &services.file_dialog);
+        while (self.hold_file_dialog_open.load(.acquire) and !services.window_closing) {
+            var message: win32.MSG = undefined;
+            if (win32.GetMessageW(&message, null, 0, 0) <= 0) {
+                win32.PostQuitMessage(0);
+                break;
+            }
+            _ = win32.TranslateMessage(&message);
+            _ = win32.DispatchMessageW(&message);
+        }
+        if (services.window_closing) return .canceled;
+        const scripted = self.scripted_paths[0..self.scripted_paths_len.load(.acquire)];
+        if (scripted.len == 0) return .canceled;
+        var chosen = std.mem.tokenizeScalar(u8, scripted, 0);
+        while (chosen.next()) |path| paths.addUtf8(path);
+        return .{ .files_chosen = paths.list() };
+    }
+
+    fn recordDialog(self: *ServiceFake, dialog: *file_dialog.IFileDialog, copied: *const file_dialog.CopiedDialog) void {
+        const seen = &self.seen_dialog;
+        seen.* = .{};
+        _ = dialog.vtable.GetOptions(dialog, &seen.options);
+        var name: ?[*:0]u16 = null;
+        if (win32.succeeded(dialog.vtable.GetFileName(dialog, &name))) if (name) |given| {
+            defer file_dialog.CoTaskMemFree(@ptrCast(given));
+            seen.file_name_len = SeenDialog.copyInto(&seen.file_name, std.mem.span(given));
+        };
+        var folder: ?*file_dialog.IShellItem = null;
+        if (win32.succeeded(dialog.vtable.GetFolder(dialog, &folder))) if (folder) |item| {
+            defer item.release();
+            if (item.fileSystemPath()) |path| {
+                defer file_dialog.CoTaskMemFree(@ptrCast(path));
+                seen.folder_len = SeenDialog.copyInto(&seen.folder, std.mem.span(path));
+            }
+        };
+        const filters = copied.filterSpecs();
+        seen.filter_count = filters.len;
+        if (filters.len > 0) {
+            seen.first_filter_name_len = SeenDialog.copyInto(&seen.first_filter_name, std.mem.span(filters[0].pszName));
+            seen.first_filter_pattern_len = SeenDialog.copyInto(&seen.first_filter_pattern, std.mem.span(filters[0].pszSpec));
+        }
+        _ = self.file_dialogs_shown.fetchAdd(1, .release);
+    }
 
     /// The last URL the host would have opened.
     pub fn openedUrl(self: *const ServiceFake) ?[]const u8 {

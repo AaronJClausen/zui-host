@@ -7,6 +7,7 @@ pub const display = @import("display.zig");
 pub const uia = @import("uia.zig");
 pub const accessibility = @import("accessibility.zig");
 pub const services = @import("services.zig");
+pub const file_dialog = @import("file_dialog.zig");
 
 const W = std.unicode.utf8ToUtf16LeStringLiteral;
 
@@ -18,7 +19,7 @@ const W = std.unicode.utf8ToUtf16LeStringLiteral;
 /// contrast, animations, power, HDR headroom), lifecycle events from console control
 /// events, the session ending and the system sleeping, and dropped files;
 /// it sets the cursor and places the IME window; it reads and writes the
-/// clipboard, opens URLs and shows notifications; it watches directories
+/// clipboard, opens URLs, shows notifications and file dialogs; it watches directories
 /// for changes; it bridges `Frame.semantics()` to UI Automation, reporting
 /// what an assistive technology asks for as `action` events; and it waits
 /// for `nextFrame` on its wake, its input and a high-resolution timer.
@@ -107,6 +108,22 @@ pub const Host = struct {
         }
     };
 
+    /// The shell's dialogs, `IFileOpenDialog` and `IFileSaveDialog`, shown
+    /// on the window thread and owned by the window, one at a time. They
+    /// answer `.files_chosen` with file-system paths, up to
+    /// `services.Services.chosen_paths_capacity` bytes of them, or
+    /// `.canceled`. One still open at `deinit` is closed and not answered.
+    pub const zuiFileDialogs = struct {
+        pub fn show(host: *Host, window: zui.WindowId, request: zui.ServiceRequest, dialog: zui.FileDialog, sink: zui.ServiceSink) zui.ServiceError!void {
+            std.debug.assert(window == .main);
+            try host.services.claimFileDialog(request, dialog, sink);
+            if (win32.PostMessageW(host.hwnd, wm_show_file_dialog, 0, 0) == 0) {
+                host.services.releaseFileDialog();
+                return error.Unavailable;
+            }
+        }
+    };
+
     /// Watches up to `file_watch.Watches.capacity` directories, each with
     /// its subdirectories, until `deinit`.
     pub const zuiFileWatch = struct {
@@ -172,6 +189,7 @@ pub const Host = struct {
     /// What the notification-area icon sends the window when its balloon
     /// is shown, clicked, timed out or closed.
     pub const wm_notify_icon = win32.WM_APP + 7;
+    const wm_show_file_dialog = win32.WM_APP + 8;
 
     const Inbox = struct {
         /// Positions are in physical pixels until a poll converts them.
@@ -559,6 +577,7 @@ pub const Host = struct {
                 return 0;
             },
             wm_close_window => {
+                if (self.services.closeFileDialogFirst()) return 0;
                 _ = win32.DestroyWindow(hwnd);
                 return 0;
             },
@@ -676,6 +695,10 @@ pub const Host = struct {
             },
             wm_notify_icon => {
                 self.services.answerNotifyIconEvent(hwnd, lparam, self.zuiWaker());
+                return 0;
+            },
+            wm_show_file_dialog => {
+                self.services.showFileDialog(hwnd, wm_close_window, self.zuiWaker());
                 return 0;
             },
             win32.WM_GETOBJECT => if (self.accessibility.answerGetObject(hwnd, wparam, lparam)) |answered| return answered,
@@ -959,4 +982,5 @@ test {
     _ = display;
     _ = accessibility;
     _ = services;
+    _ = file_dialog;
 }

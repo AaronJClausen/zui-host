@@ -84,6 +84,7 @@ const MessageHarness = struct {
     }
 
     pub fn scriptServices(self: *MessageHarness, script: zui_testing.ServiceScript) void {
+        self.window.service_fake.scriptFileDialog(script.chosen_paths);
         self.window.service_fake.scriptNotification(switch (script.notification) {
             .activated => .activated,
             .dismissed => .dismissed,
@@ -355,6 +356,130 @@ test "a notification replaced by the next is dismissed, so is one that times out
     try testing.expectEqual(@as(u32, 1), window.service_fake.notifyIconCalls(win32.NIM_DELETE));
 
     sendNotifyIconEvent(&window, win32.NIN_BALLOONHIDE);
+    replies.zuiSwap();
+    var unanswered = replies.zuiView().items();
+    try testing.expectEqual(null, unanswered.next());
+}
+
+const file_dialog = zui_host.windows.file_dialog;
+const W = std.unicode.utf8ToUtf16LeStringLiteral;
+
+/// Waits for at most two seconds until the window thread has made the
+/// shell's dialog for the `count`th time.
+fn awaitFileDialogs(window: *HiddenWindow, count: u32) !void {
+    const deadline = window.window_host.now().addNanoseconds(2 * std.time.ns_per_s);
+    while (window.service_fake.fileDialogsShown() < count) {
+        if (!window.window_host.now().isBefore(deadline)) return error.NotShown;
+        try testing.io.sleep(.fromMilliseconds(5), .awake);
+    }
+}
+
+test "an open dialog is made as asked, read back from the shell's dialog, and answers the paths chosen" {
+    var window: HiddenWindow = .{};
+    try window.open(1);
+    defer window.close();
+    const host = &window.window_host;
+    var replies: Replies = .{};
+    const open: zui.ServiceRequest = .of("open themes");
+    window.service_fake.scriptFileDialog("C:\\a.zon\x00C:\\b.zon\x00");
+    try Host.zuiFileDialogs.show(host, .main, open, .{
+        .kind = .open_files,
+        .title = "Open themes",
+        .directory = "C:\\Windows",
+        .filters = &.{ .{ .name = "Themes", .extensions = &.{ "zon", "json" } }, .{ .name = "All files", .extensions = &.{} } },
+    }, .of(&replies));
+    const reply = try awaitReply(host, &replies);
+    try testing.expectEqual(open, reply.request);
+    try testing.expectEqual(zui.WindowId.main, reply.window);
+    try testing.expectEqual(.files_chosen, reply.kind);
+    var chosen = reply.paths();
+    try testing.expectEqualStrings("C:\\a.zon", chosen.next().?);
+    try testing.expectEqualStrings("C:\\b.zon", chosen.next().?);
+    try testing.expectEqual(null, chosen.next());
+
+    const seen = &window.service_fake.seen_dialog;
+    const asked = file_dialog.FOS_ALLOWMULTISELECT | file_dialog.FOS_FILEMUSTEXIST | file_dialog.FOS_FORCEFILESYSTEM | file_dialog.FOS_NOCHANGEDIR;
+    try testing.expectEqual(asked, seen.options & asked);
+    try testing.expectEqual(@as(u32, 0), seen.options & file_dialog.FOS_PICKFOLDERS);
+    try testing.expectEqualSlices(u16, W("C:\\Windows"), seen.folderPath());
+    try testing.expectEqual(@as(usize, 2), seen.filter_count);
+    try testing.expectEqualSlices(u16, W("Themes"), seen.firstFilterName());
+    try testing.expectEqualSlices(u16, W("*.zon;*.json"), seen.firstFilterPattern());
+}
+
+test "a save dialog suggests its name and asks before overwriting, a folder dialog picks folders, and either canceled answers canceled" {
+    var window: HiddenWindow = .{};
+    try window.open(1);
+    defer window.close();
+    const host = &window.window_host;
+    var replies: Replies = .{};
+    const save: zui.ServiceRequest = .of("save theme");
+    window.service_fake.scriptFileDialog("");
+    try Host.zuiFileDialogs.show(host, .main, save, .{ .kind = .save_file, .file_name = "dark.zon", .filters = &.{.{ .name = "Themes", .extensions = &.{"zon"} }} }, .of(&replies));
+    const canceled = try awaitReply(host, &replies);
+    try testing.expectEqual(save, canceled.request);
+    try testing.expectEqual(.canceled, canceled.kind);
+    const seen = &window.service_fake.seen_dialog;
+    try testing.expect(seen.options & file_dialog.FOS_OVERWRITEPROMPT != 0);
+    try testing.expectEqual(@as(u32, 0), seen.options & file_dialog.FOS_ALLOWMULTISELECT);
+    try testing.expectEqualSlices(u16, W("dark.zon"), seen.fileName());
+
+    const folder: zui.ServiceRequest = .of("choose folder");
+    window.service_fake.scriptFileDialog("C:\\themes\x00");
+    try Host.zuiFileDialogs.show(host, .main, folder, .{ .kind = .choose_folder }, .of(&replies));
+    const chosen = try awaitReply(host, &replies);
+    try testing.expectEqual(folder, chosen.request);
+    var chosen_folders = chosen.paths();
+    try testing.expectEqualStrings("C:\\themes", chosen_folders.next().?);
+    try testing.expect(seen.options & file_dialog.FOS_PICKFOLDERS != 0);
+}
+
+test "a second file dialog while one is open is busy, and paths past the reply's room are counted" {
+    var window: HiddenWindow = .{};
+    try window.open(1);
+    defer window.close();
+    const host = &window.window_host;
+    var replies: Replies = .{};
+    const first: zui.ServiceRequest = .of("first");
+    window.service_fake.hold_file_dialog_open.store(true, .release);
+    window.service_fake.scriptFileDialog("C:\\" ++ "a" ** 40 ++ ".zon\x00C:\\" ++ "b" ** 40 ++ ".zon\x00");
+    try Host.zuiFileDialogs.show(host, .main, first, .{}, .of(&replies));
+    try awaitFileDialogs(&window, 1);
+    try testing.expectError(error.Busy, Host.zuiFileDialogs.show(host, .main, .of("second"), .{}, .of(&replies)));
+
+    window.service_fake.releaseHeldFileDialog(host.hwnd);
+    const reply = try awaitReply(host, &replies);
+    try testing.expectEqual(first, reply.request);
+    var chosen = reply.paths();
+    try testing.expectEqualStrings("C:\\" ++ "a" ** 40 ++ ".zon", chosen.next().?);
+    try testing.expectEqual(null, chosen.next());
+    try testing.expectEqual(@as(u32, 3 + 40 + 4 + 1), reply.left_out_bytes);
+    try Host.zuiFileDialogs.show(host, .main, .of("second"), .{}, .of(&replies));
+}
+
+test "a file dialog the host cannot hold, or whose text is not UTF-8, is refused and shown neither" {
+    var window: HiddenWindow = .{};
+    try window.open(1);
+    defer window.close();
+    const host = &window.window_host;
+    var replies: Replies = .{};
+    const filter: zui.FileFilter = .{ .name = "Themes", .extensions = &.{"zon"} };
+    try testing.expectError(error.TooLarge, Host.zuiFileDialogs.show(host, .main, .of("open"), .{ .filters = &([_]zui.FileFilter{filter} ** (file_dialog.CopiedDialog.filter_capacity + 1)) }, .of(&replies)));
+    try testing.expectError(error.TooLarge, Host.zuiFileDialogs.show(host, .main, .of("open"), .{ .title = "t" ** file_dialog.CopiedDialog.unit_capacity }, .of(&replies)));
+    try testing.expectError(error.InvalidUtf8, Host.zuiFileDialogs.show(host, .main, .of("open"), .{ .file_name = "\xff.zon" }, .of(&replies)));
+    try testing.io.sleep(.fromMilliseconds(50), .awake);
+    try testing.expectEqual(@as(u32, 0), window.service_fake.fileDialogsShown());
+}
+
+test "a file dialog still open when the host closes is closed first, and not answered" {
+    var window: HiddenWindow = .{};
+    try window.open(1);
+    var replies: Replies = .{};
+    window.service_fake.hold_file_dialog_open.store(true, .release);
+    window.service_fake.scriptFileDialog("C:\\a.zon\x00");
+    try Host.zuiFileDialogs.show(&window.window_host, .main, .of("open"), .{}, .of(&replies));
+    try awaitFileDialogs(&window, 1);
+    window.close();
     replies.zuiSwap();
     var unanswered = replies.zuiView().items();
     try testing.expectEqual(null, unanswered.next());
