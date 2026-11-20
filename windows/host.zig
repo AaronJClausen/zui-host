@@ -189,7 +189,7 @@ pub const Host = struct {
             .file_watches = .{},
             .accessibility = undefined,
         };
-        try self.accessibility.init(options.semantics, .{ .context = self, .deliverFn = deliverAction });
+        try self.accessibility.init(options.semantics, .{ .context = self, .deliverFn = deliverAction }, wheel_step);
         errdefer self.accessibility.deinit();
         _ = win32.SetProcessDpiAwarenessContext(win32.DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
         self.window_thread = try std.Thread.spawn(.{}, runWindowThread, .{self});

@@ -15,9 +15,11 @@ const zui = zui_host.zui;
 
 const Ui = zui.Context(zui_sokol.config(.{ .features = .{ .semantics = true } }));
 const Widgets = zui_widgets.Widgets(Ui);
+const qualities = [_][]const u8{ "Low", "Medium", "High" };
+const log_lines = [_][]const u8{ "Opened settings", "Loaded the theme", "Found 3 displays", "Autosave is on", "Volume at half", "Ready" };
 
 pub fn main(init: std.process.Init) !void {
-    try zui_app.run(AccessibleApp, init, .{ .title = "zui: accessibility", .size = .{ 560, 360 } });
+    try zui_app.run(AccessibleApp, init, .{ .title = "zui: accessibility", .size = .{ 560, 560 } });
 }
 
 const AccessibleApp = struct {
@@ -30,6 +32,7 @@ const AccessibleApp = struct {
     saves: u32 = 0,
     autosave: bool = true,
     volume: f32 = 0.5,
+    quality: usize = 0,
     name_bytes: [64]u8 = undefined,
     name: zui_widgets.EditableText = undefined,
     frame_limit: ?u32 = null,
@@ -56,6 +59,9 @@ const AccessibleApp = struct {
             .decoration = .{ .background = .rgb(0x1c1c26) },
         });
         defer ui.close();
+        ui.open(.{ .id = .of("heading"), .semantics = .{ .role = .heading, .label = "Settings", .level = 1 } });
+        ui.text("Settings", .{ .size = 24, .color = .rgb(0xf3f3f3) });
+        ui.close();
         if (app.widgets.button(ui, .of("save"), "Save", .{})) app.saves += 1;
         var saved_bytes: [32]u8 = undefined;
         const saved = std.fmt.bufPrint(&saved_bytes, "Saved {d} times", .{app.saves}) catch unreachable;
@@ -65,6 +71,15 @@ const AccessibleApp = struct {
         _ = app.widgets.checkbox(ui, .of("autosave"), "Autosave", &app.autosave, .{});
         _ = app.widgets.slider(ui, .of("volume"), &app.volume, .{ .label = "Volume" });
         _ = app.widgets.textField(ui, .of("name"), &app.name, .{ .label = "Name" });
+        _ = app.widgets.dropdown(ui, .of("quality"), &app.quality, &qualities, .{ .label = "Quality" });
+        ui.open(.{
+            .id = .of("log"),
+            .scroll = .{ .vertical = true },
+            .layout = .{ .direction = .top_to_bottom, .sizing = .{ .width = .grow, .height = .fixed(60) } },
+            .semantics = .{ .role = .scroll_area, .label = "Log" },
+        });
+        for (log_lines) |line| app.widgets.label(ui, line);
+        ui.close();
     }
 
     pub fn zuiLoader(app: *AccessibleApp, _: *const Ui, _: std.Io) void {

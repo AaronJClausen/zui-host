@@ -19,6 +19,9 @@ const IID_IUIAutomationValuePattern: win32.GUID = .{ .data1 = 0xa94cd8b1, .data2
 const IID_IUIAutomationSelectionItemPattern: win32.GUID = .{ .data1 = 0xa8efa66a, .data2 = 0x0fda, .data3 = 0x421a, .data4 = .{ 0x91, 0x94, 0x38, 0x02, 0x1f, 0x35, 0x78, 0xea } };
 const IID_IUIAutomationSelectionPattern: win32.GUID = .{ .data1 = 0x5ed5202e, .data2 = 0xb2ac, .data3 = 0x47a6, .data4 = .{ 0xb6, 0x38, 0x4b, 0x0b, 0xf1, 0x40, 0xd7, 0x8e } };
 const IID_IUIAutomationPropertyChangedEventHandler: win32.GUID = .{ .data1 = 0x40cd37d4, .data2 = 0xc756, .data3 = 0x4b0c, .data4 = .{ 0x8c, 0x6f, 0xbd, 0xdf, 0xee, 0xb1, 0x3b, 0x50 } };
+const IID_IUIAutomationElement3: win32.GUID = .{ .data1 = 0x8471df34, .data2 = 0xaee0, .data3 = 0x4a01, .data4 = .{ 0xa7, 0xde, 0x7d, 0xb9, 0xaf, 0x12, 0xc2, 0x96 } };
+const IID_IUIAutomationWindowPattern: win32.GUID = .{ .data1 = 0x0faef453, .data2 = 0x9208, .data3 = 0x43ef, .data4 = .{ 0xbb, 0xb2, 0x3b, 0x48, 0x51, 0x77, 0x86, 0x4f } };
+const IID_IUIAutomationScrollPattern: win32.GUID = .{ .data1 = 0x88f4d42a, .data2 = 0xe881, .data3 = 0x459d, .data4 = .{ 0xa7, 0x7c, 0x73, 0xbb, 0xbb, 0x7e, 0x02, 0xdc } };
 
 const TreeScope_Descendants = 0x4;
 const TreeScope_Subtree = 0x7;
@@ -226,6 +229,54 @@ pub const Element = struct {
         var first: ?*Object = null;
         try check(array.?.method(4, fn (*Object, i32, *?*Object) callconv(.winapi) HRESULT)(array.?, 0, &first));
         return .{ .count = count, .first = .{ .object = first.? } };
+    }
+
+    pub fn scrollBy(self: Element, horizontal: uia.ScrollAmount, vertical: uia.ScrollAmount) !bool {
+        const pattern = try self.patternObject(uia.UIA_ScrollPatternId, &IID_IUIAutomationScrollPattern) orelse return false;
+        defer pattern.release();
+        try check(pattern.method(3, fn (*Object, uia.ScrollAmount, uia.ScrollAmount) callconv(.winapi) HRESULT)(pattern, horizontal, vertical));
+        return true;
+    }
+
+    pub fn setScrollPercent(self: Element, horizontal: f64, vertical: f64) !bool {
+        const pattern = try self.patternObject(uia.UIA_ScrollPatternId, &IID_IUIAutomationScrollPattern) orelse return false;
+        defer pattern.release();
+        try check(pattern.method(4, fn (*Object, f64, f64) callconv(.winapi) HRESULT)(pattern, horizontal, vertical));
+        return true;
+    }
+
+    /// Its scroll position, and how much of its content it shows, from 0
+    /// to 100, horizontally then vertically.
+    pub const Scrolled = struct { percent: [2]f64, view_size: [2]f64 };
+
+    pub fn scrolled(self: Element) !?Scrolled {
+        const pattern = try self.patternObject(uia.UIA_ScrollPatternId, &IID_IUIAutomationScrollPattern) orelse return null;
+        defer pattern.release();
+        return .{
+            .percent = .{ try readNumber(pattern, 5), try readNumber(pattern, 6) },
+            .view_size = .{ try readNumber(pattern, 7), try readNumber(pattern, 8) },
+        };
+    }
+
+    /// Closes it through its Window pattern, or returns false when it has
+    /// none.
+    pub fn closeWindow(self: Element) !bool {
+        return self.callPattern(uia.UIA_WindowPatternId, &IID_IUIAutomationWindowPattern, 3);
+    }
+
+    pub fn showContextMenu(self: Element) !void {
+        var element3: ?*Object = null;
+        try check(self.object.method(0, fn (*Object, *const win32.GUID, *?*Object) callconv(.winapi) HRESULT)(self.object, &IID_IUIAutomationElement3, &element3));
+        defer element3.?.release();
+        try check(element3.?.method(91, fn (*Object) callconv(.winapi) HRESULT)(element3.?));
+    }
+
+    /// The integer value of `property`, or null when it is not one.
+    pub fn integerProperty(self: Element, property: uia.PROPERTYID) !?i32 {
+        var value: win32.VARIANT = .{};
+        try check(self.object.method(10, fn (*Object, uia.PROPERTYID, *win32.VARIANT) callconv(.winapi) HRESULT)(self.object, property, &value));
+        defer _ = win32.VariantClear(&value);
+        return if (value.vt == win32.VT_I4) value.value.int else null;
     }
 
     pub fn hasPattern(self: Element, pattern_id: uia.PATTERNID) !bool {

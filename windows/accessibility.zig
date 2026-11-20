@@ -28,6 +28,8 @@ pub const ActionSink = struct {
 pub const Bridge = struct {
     hwnd: ?win32.HWND = null,
     sink: ActionSink,
+    /// Layout units a small scroll moves, as a notch of the wheel does.
+    scroll_step: f32,
     lock: win32.SRWLOCK = .{},
     snapshots: [2]Snapshot = .{ .{}, .{} },
     /// Written only by `publish`, under `lock`.
@@ -51,8 +53,8 @@ pub const Bridge = struct {
     };
 
     /// With no nodes of room, the bridge stays off and allocates nothing.
-    pub fn init(self: *Bridge, capacity: zui.SemanticsCapacity, sink: ActionSink) !void {
-        self.* = .{ .sink = sink };
+    pub fn init(self: *Bridge, capacity: zui.SemanticsCapacity, sink: ActionSink, scroll_step: f32) !void {
+        self.* = .{ .sink = sink, .scroll_step = scroll_step };
         if (capacity.nodes == 0) return;
         errdefer self.deinit();
         for (&self.snapshots) |*snapshot| try snapshot.allocate(capacity);
@@ -94,6 +96,8 @@ pub const Bridge = struct {
                 .state = source.state,
                 .actions = source.actions,
                 .bounds = source.bounds,
+                .level = source.level,
+                .scroll = source.scroll,
                 .label = back.keepText(source.label, &dropped),
                 .value = switch (source.value) {
                     .none => .none,
@@ -186,6 +190,12 @@ pub const Bridge = struct {
             if (now.selected) _ = uia.UiaRaiseAutomationEvent(&element.simple, uia.UIA_SelectionItem_ElementSelectedEventId);
         }
         if (before.disabled != now.disabled) raiseChange(element, uia.UIA_IsEnabledPropertyId, boolean(!now.disabled));
+        if (before.scroll_offset_bits[0] != now.scroll_offset_bits[0]) {
+            raiseChange(element, uia.UIA_ScrollHorizontalScrollPercentPropertyId, double(now.scroll_percent[0]));
+        }
+        if (before.scroll_offset_bits[1] != now.scroll_offset_bits[1]) {
+            raiseChange(element, uia.UIA_ScrollVerticalScrollPercentPropertyId, double(now.scroll_percent[1]));
+        }
     }
 
     /// Reads the text again, since summaries keep only its hash: from the
@@ -291,6 +301,8 @@ const Node = struct {
     state: zui.SemanticState,
     actions: zui.Actions,
     bounds: zui.Rect,
+    level: u8 = 0,
+    scroll: ?zui.SemanticScroll = null,
     label: TextSpan,
     value: Value,
 
@@ -315,9 +327,14 @@ const Node = struct {
     }
 
     /// Only when no other pattern stands for the click, so a client toggles
-    /// a checkbox or opens a combo box by its own pattern.
+    /// a checkbox or opens a combo box by its own pattern; a slider or a
+    /// text field takes a click to focus it, which is no command.
     fn offersInvoke(self: *const Node) bool {
-        return self.actions.contains(.invoke) and !self.offersToggle() and !self.offersSelectionItem() and self.role != .combo_box;
+        const clicks_for_another_pattern = switch (self.role) {
+            .combo_box, .slider, .text_field, .progress_bar => true,
+            else => false,
+        };
+        return self.actions.contains(.invoke) and !self.offersToggle() and !self.offersSelectionItem() and !clicks_for_another_pattern;
     }
 
     fn offersExpandCollapse(self: *const Node) bool {
@@ -334,6 +351,35 @@ const Node = struct {
 
     fn offersSelection(self: *const Node) bool {
         return self.role == .list_box;
+    }
+
+    fn offersScroll(self: *const Node) bool {
+        return self.scroll != null;
+    }
+
+    fn offersWindow(self: *const Node) bool {
+        return self.role == .dialog;
+    }
+
+    /// The axis moves: it scrolls, and its content is larger than its view.
+    fn scrollsAlong(self: *const Node, axis: usize) bool {
+        const scroll = self.scroll orelse return false;
+        return scroll.axes[axis] and scroll.content[axis] > scroll.viewport[axis];
+    }
+
+    /// How far along its content the view is on `axis`, from 0 to 100, or
+    /// `UIA_ScrollPatternNoScroll`.
+    fn scrollPercent(self: *const Node, axis: usize) f64 {
+        if (!self.scrollsAlong(axis)) return uia.UIA_ScrollPatternNoScroll;
+        const scroll = self.scroll.?;
+        return std.math.clamp(scroll.offset[axis] / (scroll.content[axis] - scroll.viewport[axis]) * 100, 0, 100);
+    }
+
+    /// How much of its content the view shows on `axis`, from 0 to 100.
+    fn scrollViewSize(self: *const Node, axis: usize) f64 {
+        const scroll = self.scroll orelse return 100;
+        if (scroll.content[axis] <= 0) return 100;
+        return std.math.clamp(scroll.viewport[axis] / scroll.content[axis] * 100, 0, 100);
     }
 
     fn isExpanded(self: *const Node) bool {
@@ -507,6 +553,8 @@ const Summary = struct {
     expanded: ?bool,
     selected: bool,
     disabled: bool,
+    scroll_offset_bits: [2]u32,
+    scroll_percent: [2]f64,
 };
 
 const Summaries = struct {
@@ -537,6 +585,8 @@ const Summaries = struct {
                 .expanded = node.state.expanded,
                 .selected = node.state.selected,
                 .disabled = node.state.disabled,
+                .scroll_offset_bits = if (node.scroll) |scroll| .{ @bitCast(scroll.offset[0]), @bitCast(scroll.offset[1]) } else .{ 0, 0 },
+                .scroll_percent = .{ node.scrollPercent(0), node.scrollPercent(1) },
             };
             self.index.insert(node.id, @intCast(index));
         }
@@ -554,6 +604,28 @@ fn boolean(value: bool) win32.VARIANT {
 
 fn integer(value: i32) win32.VARIANT {
     return .{ .vt = win32.VT_I4, .value = .{ .int = value } };
+}
+
+fn double(value: f64) win32.VARIANT {
+    return .{ .vt = win32.VT_R8, .value = .{ .double = value } };
+}
+
+fn headingLevel(node: *const Node) i32 {
+    if (node.role != .heading or node.level == 0 or node.level > 9) return uia.HeadingLevel_None;
+    return uia.HeadingLevel1 + node.level - 1;
+}
+
+/// Layout units a scroll request moves `axis` by: a wheel notch for a small
+/// step, the view's size for a large one.
+fn scrollDistance(amount: uia.ScrollAmount, scroll: zui.SemanticScroll, axis: usize, step: f32) ?f32 {
+    return switch (amount) {
+        .no_amount => 0,
+        .small_increment => step,
+        .small_decrement => -step,
+        .large_increment => scroll.viewport[axis],
+        .large_decrement => -scroll.viewport[axis],
+        _ => null,
+    };
 }
 
 /// A `VT_BSTR` holding `utf8`, which OLE allocates for the caller to free.
@@ -642,7 +714,9 @@ fn UnknownOf(comptime Object: type, comptime Interface: type, comptime field: []
 /// One node, found by its id in the front snapshot on every call, so it
 /// reads as the latest frame declared it, and as gone once no frame does.
 const Element = struct {
-    simple: uia.IRawElementProviderSimple = .{ .vtable = &simple_vtable },
+    /// Its table goes on with `ShowContextMenu`, so it is also an
+    /// `IRawElementProviderSimple2`.
+    simple: uia.IRawElementProviderSimple = .{ .vtable = &simple_vtable.simple },
     fragment: uia.IRawElementProviderFragment = .{ .vtable = &fragment_vtable },
     invoke: uia.IInvokeProvider = .{ .vtable = &invoke_vtable },
     toggle: uia.IToggleProvider = .{ .vtable = &toggle_vtable },
@@ -651,6 +725,8 @@ const Element = struct {
     value: uia.IValueProvider = .{ .vtable = &value_vtable },
     selection_item: uia.ISelectionItemProvider = .{ .vtable = &selection_item_vtable },
     selection: uia.ISelectionProvider = .{ .vtable = &selection_vtable },
+    scroll: uia.IScrollProvider = .{ .vtable = &scroll_vtable },
+    window: uia.IWindowProvider = .{ .vtable = &window_vtable },
     references: std.atomic.Value(u32) = .init(0),
     id: u64 = 0,
     bridge: *Bridge,
@@ -664,13 +740,18 @@ const Element = struct {
     const Value = UnknownOf(Element, uia.IValueProvider, "value");
     const SelectionItem = UnknownOf(Element, uia.ISelectionItemProvider, "selection_item");
     const Selection = UnknownOf(Element, uia.ISelectionProvider, "selection");
+    const Scroll = UnknownOf(Element, uia.IScrollProvider, "scroll");
+    const Window = UnknownOf(Element, uia.IWindowProvider, "window");
 
-    const simple_vtable: uia.IRawElementProviderSimple.VTable = .{
-        .unknown = Simple.methods,
-        .get_ProviderOptions = providerOptions,
-        .GetPatternProvider = patternProvider,
-        .GetPropertyValue = propertyValue,
-        .get_HostRawElementProvider = hostProvider,
+    const simple_vtable: uia.IRawElementProviderSimple2VTable = .{
+        .simple = .{
+            .unknown = Simple.methods,
+            .get_ProviderOptions = providerOptions,
+            .GetPatternProvider = patternProvider,
+            .GetPropertyValue = propertyValue,
+            .get_HostRawElementProvider = hostProvider,
+        },
+        .ShowContextMenu = showContextMenu,
     };
     const fragment_vtable: uia.IRawElementProviderFragment.VTable = .{
         .unknown = Fragment.methods,
@@ -726,9 +807,32 @@ const Element = struct {
         .get_CanSelectMultiple = selectsOne,
         .get_IsSelectionRequired = selectsOne,
     };
+    const scroll_vtable: uia.IScrollProvider.VTable = .{
+        .unknown = Scroll.methods,
+        .Scroll = scrollBy,
+        .SetScrollPercent = setScrollPercent,
+        .get_HorizontalScrollPercent = scrollAnswer(.percent, 0),
+        .get_VerticalScrollPercent = scrollAnswer(.percent, 1),
+        .get_HorizontalViewSize = scrollAnswer(.view_size, 0),
+        .get_VerticalViewSize = scrollAnswer(.view_size, 1),
+        .get_HorizontallyScrollable = scrollsAlong(0),
+        .get_VerticallyScrollable = scrollsAlong(1),
+    };
+    const window_vtable: uia.IWindowProvider.VTable = .{
+        .unknown = Window.methods,
+        .SetVisualState = keepVisualState,
+        .Close = closeWindow,
+        .WaitForInputIdle = alreadyIdle,
+        .get_CanMaximize = windowAnswersNo,
+        .get_CanMinimize = windowAnswersNo,
+        .get_IsModal = windowAnswersNo,
+        .get_WindowVisualState = normalVisualState,
+        .get_WindowInteractionState = readyForInteraction,
+        .get_IsTopmost = windowAnswersNo,
+    };
 
     fn queryInterface(self: *Element, iid: *const GUID, found: *?*anyopaque) HRESULT {
-        found.* = if (sameGuid(iid, win32.IID_IUnknown) or sameGuid(iid, uia.IID_IRawElementProviderSimple))
+        found.* = if (sameGuid(iid, win32.IID_IUnknown) or sameGuid(iid, uia.IID_IRawElementProviderSimple) or sameGuid(iid, uia.IID_IRawElementProviderSimple2))
             &self.simple
         else if (sameGuid(iid, uia.IID_IRawElementProviderFragment))
             &self.fragment
@@ -746,6 +850,10 @@ const Element = struct {
             &self.selection_item
         else if (sameGuid(iid, uia.IID_ISelectionProvider))
             &self.selection
+        else if (sameGuid(iid, uia.IID_IScrollProvider))
+            &self.scroll
+        else if (sameGuid(iid, uia.IID_IWindowProvider))
+            &self.window
         else
             return noInterface(found);
         _ = self.addRef();
@@ -821,6 +929,8 @@ const Element = struct {
             uia.UIA_ValuePatternId => if (node.offersValue()) &self.value else null,
             uia.UIA_SelectionItemPatternId => if (node.offersSelectionItem()) &self.selection_item else null,
             uia.UIA_SelectionPatternId => if (node.offersSelection()) &self.selection else null,
+            uia.UIA_ScrollPatternId => if (node.offersScroll()) &self.scroll else null,
+            uia.UIA_WindowPatternId => if (node.offersWindow()) &self.window else null,
             else => null,
         };
         self.bridge.doneReading();
@@ -847,9 +957,14 @@ const Element = struct {
             uia.UIA_IsKeyboardFocusablePropertyId => boolean(node.actions.contains(.focus)),
             uia.UIA_HasKeyboardFocusPropertyId => boolean(node.state.focused),
             uia.UIA_IsDialogPropertyId => boolean(node.role == .dialog),
+            uia.UIA_HeadingLevelPropertyId => integer(headingLevel(node)),
             else => .{},
         };
         return win32.S_OK;
+    }
+
+    fn showContextMenu(simple: *uia.IRawElementProviderSimple) callconv(.winapi) HRESULT {
+        return Simple.object(simple).request(.show_menu, .show_menu, null);
     }
 
     fn hostProvider(_: *uia.IRawElementProviderSimple, found: *?*uia.IRawElementProviderSimple) callconv(.winapi) HRESULT {
@@ -1109,6 +1224,124 @@ const Element = struct {
         answer.* = 0;
         return win32.S_OK;
     }
+
+    /// Delivers the `scroll` that `scroll_request.distance` works out from the
+    /// node, or fails as it says: on an axis that cannot move, or past the
+    /// content.
+    fn requestScroll(self: *Element, scroll_request: anytype) HRESULT {
+        const reading = self.read() orelse return uia.UIA_E_ELEMENTNOTAVAILABLE;
+        const node = reading.node();
+        const takes = node.takes(.scroll) and node.scroll != null;
+        const requested = if (takes) scroll_request.distance(node, self.bridge.scroll_step) else ScrollRequest{ .delta = .{ 0, 0 } };
+        self.bridge.doneReading();
+        if (!takes) return uia.UIA_E_ELEMENTNOTENABLED;
+        const delta = switch (requested) {
+            .delta => |delta| delta,
+            .fails => |result| return result,
+        };
+        if (delta[0] != 0 or delta[1] != 0) self.bridge.sink.deliver(.{ .target = self.id, .action = .{ .scroll = delta } });
+        return win32.S_OK;
+    }
+
+    const ScrollRequest = union(enum) {
+        delta: [2]f32,
+        fails: HRESULT,
+    };
+
+    const ScrollByAmounts = struct {
+        amounts: [2]uia.ScrollAmount,
+
+        fn distance(self: ScrollByAmounts, node: *const Node, step: f32) ScrollRequest {
+            var delta: [2]f32 = .{ 0, 0 };
+            for (self.amounts, 0..) |amount, axis| {
+                if (amount == .no_amount) continue;
+                if (!node.scrollsAlong(axis)) return .{ .fails = uia.UIA_E_INVALIDOPERATION };
+                delta[axis] = scrollDistance(amount, node.scroll.?, axis, step) orelse return .{ .fails = win32.E_INVALIDARG };
+            }
+            return .{ .delta = delta };
+        }
+    };
+
+    const ScrollToPercents = struct {
+        percents: [2]f64,
+
+        fn distance(self: ScrollToPercents, node: *const Node, _: f32) ScrollRequest {
+            const extents = node.scroll.?;
+            var delta: [2]f32 = .{ 0, 0 };
+            for (self.percents, 0..) |percent, axis| {
+                if (percent == uia.UIA_ScrollPatternNoScroll) continue;
+                if (!node.scrollsAlong(axis)) return .{ .fails = uia.UIA_E_INVALIDOPERATION };
+                if (!(percent >= 0 and percent <= 100)) return .{ .fails = win32.E_INVALIDARG };
+                const target: f32 = @floatCast(percent / 100 * (extents.content[axis] - extents.viewport[axis]));
+                delta[axis] = target - extents.offset[axis];
+            }
+            return .{ .delta = delta };
+        }
+    };
+
+    fn scrollBy(scroll: *uia.IScrollProvider, horizontal: uia.ScrollAmount, vertical: uia.ScrollAmount) callconv(.winapi) HRESULT {
+        return Scroll.object(scroll).requestScroll(ScrollByAmounts{ .amounts = .{ horizontal, vertical } });
+    }
+
+    fn setScrollPercent(scroll: *uia.IScrollProvider, horizontal: f64, vertical: f64) callconv(.winapi) HRESULT {
+        return Scroll.object(scroll).requestScroll(ScrollToPercents{ .percents = .{ horizontal, vertical } });
+    }
+
+    fn scrollAnswer(comptime measure: enum { percent, view_size }, comptime axis: usize) fn (*uia.IScrollProvider, *f64) callconv(.winapi) HRESULT {
+        return struct {
+            fn answer(node: *const Node) f64 {
+                return switch (measure) {
+                    .percent => node.scrollPercent(axis),
+                    .view_size => node.scrollViewSize(axis),
+                };
+            }
+
+            fn method(scroll: *uia.IScrollProvider, result: *f64) callconv(.winapi) HRESULT {
+                return Scroll.object(scroll).answerFromNode(f64, result, answer);
+            }
+        }.method;
+    }
+
+    fn scrollsAlong(comptime axis: usize) fn (*uia.IScrollProvider, *win32.BOOL) callconv(.winapi) HRESULT {
+        return struct {
+            fn answer(node: *const Node) win32.BOOL {
+                return winBool(node.scrollsAlong(axis));
+            }
+
+            fn method(scroll: *uia.IScrollProvider, result: *win32.BOOL) callconv(.winapi) HRESULT {
+                return Scroll.object(scroll).answerFromNode(win32.BOOL, result, answer);
+            }
+        }.method;
+    }
+
+    fn closeWindow(window: *uia.IWindowProvider) callconv(.winapi) HRESULT {
+        return Window.object(window).request(.dismiss, .dismiss, null);
+    }
+
+    /// A dialog drawn inside the window is neither maximized nor minimized.
+    fn keepVisualState(_: *uia.IWindowProvider, _: uia.WindowVisualState) callconv(.winapi) HRESULT {
+        return uia.UIA_E_INVALIDOPERATION;
+    }
+
+    fn alreadyIdle(_: *uia.IWindowProvider, _: i32, idle: *win32.BOOL) callconv(.winapi) HRESULT {
+        idle.* = 1;
+        return win32.S_OK;
+    }
+
+    fn windowAnswersNo(_: *uia.IWindowProvider, answer: *win32.BOOL) callconv(.winapi) HRESULT {
+        answer.* = 0;
+        return win32.S_OK;
+    }
+
+    fn normalVisualState(_: *uia.IWindowProvider, state: *uia.WindowVisualState) callconv(.winapi) HRESULT {
+        state.* = .normal;
+        return win32.S_OK;
+    }
+
+    fn readyForInteraction(_: *uia.IWindowProvider, state: *uia.WindowInteractionState) callconv(.winapi) HRESULT {
+        state.* = .ready_for_user_interaction;
+        return win32.S_OK;
+    }
 };
 
 /// The window's fragment root: Windows' own provider for the window names
@@ -1250,7 +1483,7 @@ fn noInterface(found: *?*anyopaque) HRESULT {
 
 test "a snapshot links each node to its parent and siblings, and finds it by id" {
     var bridge: Bridge = undefined;
-    try bridge.init(.{ .nodes = 4, .text_bytes = 32 }, undefined);
+    try bridge.init(.{ .nodes = 4, .text_bytes = 32 }, undefined, 40);
     defer bridge.deinit();
     const group: zui.SemanticNode = .{ .id = 1, .parent = null, .role = .group, .label = "Tools", .value = .none, .bounds = .{}, .state = .{}, .actions = .initEmpty() };
     var save = group;
@@ -1283,7 +1516,7 @@ test "a snapshot links each node to its parent and siblings, and finds it by id"
 
 test "a list longer than the room keeps its start, and text that does not fit is cut at a character" {
     var bridge: Bridge = undefined;
-    try bridge.init(.{ .nodes = 2, .text_bytes = 6 }, undefined);
+    try bridge.init(.{ .nodes = 2, .text_bytes = 6 }, undefined, 40);
     defer bridge.deinit();
     const node: zui.SemanticNode = .{ .id = 1, .parent = null, .role = .button, .label = "Save", .value = .none, .bounds = .{}, .state = .{}, .actions = .initEmpty() };
     var accented = node;
@@ -1301,7 +1534,7 @@ test "a list longer than the room keeps its start, and text that does not fit is
 
 test "a bridge without room keeps nothing and allocates nothing" {
     var bridge: Bridge = undefined;
-    try bridge.init(.{}, undefined);
+    try bridge.init(.{}, undefined, 40);
     defer bridge.deinit();
     const node: zui.SemanticNode = .{ .id = 1, .parent = null, .role = .button, .label = "Save", .value = .none, .bounds = .{}, .state = .{}, .actions = .initEmpty() };
     try std.testing.expect(!bridge.hasRoom());
@@ -1326,6 +1559,9 @@ test "each role offers the patterns that stand for what it does" {
     var disclosure = node;
     disclosure.state.expanded = true;
     try std.testing.expect(disclosure.offersExpandCollapse() and disclosure.offersInvoke());
+    var slider = node;
+    slider.role = .slider;
+    try std.testing.expect(!slider.offersInvoke());
 }
 
 test "setting a range moves it by whole steps, or by one toward the target when it has none" {
@@ -1334,4 +1570,34 @@ test "setting a range moves it by whole steps, or by one toward the target when 
     try std.testing.expectEqual(@as(i32, 1), stepsToward(.{ .value = 0.5 }, 0.9));
     try std.testing.expectEqual(@as(i32, -1), stepsToward(.{ .value = 0.5 }, 0.1));
     try std.testing.expectEqual(@as(i32, 0), stepsToward(.{ .value = 0.5 }, 0.5));
+}
+
+test "a scroll request moves by a wheel notch or a view, and a percentage is a place in the content" {
+    const node: Node = .{
+        .id = 1,
+        .parent = no_node,
+        .role = .scroll_area,
+        .state = .{},
+        .actions = .initOne(.scroll),
+        .bounds = .{},
+        .label = .{},
+        .value = .none,
+        .scroll = .{ .offset = .{ 0, 50 }, .content = .{ 100, 300 }, .viewport = .{ 100, 100 }, .axes = .{ false, true } },
+    };
+    try std.testing.expect(!node.scrollsAlong(0) and node.scrollsAlong(1));
+    try std.testing.expectEqual(uia.UIA_ScrollPatternNoScroll, node.scrollPercent(0));
+    try std.testing.expectEqual(@as(f64, 25), node.scrollPercent(1));
+    try std.testing.expectApproxEqAbs(@as(f64, 100.0 / 3.0), node.scrollViewSize(1), 1e-4);
+    try std.testing.expectEqual(@as(?f32, 40), scrollDistance(.small_increment, node.scroll.?, 1, 40));
+    try std.testing.expectEqual(@as(?f32, -100), scrollDistance(.large_decrement, node.scroll.?, 1, 40));
+}
+
+test "a heading's level reads as UI Automation's, and anything else as none" {
+    var node: Node = .{ .id = 1, .parent = no_node, .role = .heading, .state = .{}, .actions = .initEmpty(), .bounds = .{}, .label = .{}, .value = .none, .level = 2 };
+    try std.testing.expectEqual(uia.HeadingLevel1 + 1, headingLevel(&node));
+    node.level = 0;
+    try std.testing.expectEqual(uia.HeadingLevel_None, headingLevel(&node));
+    node.role = .label;
+    node.level = 1;
+    try std.testing.expectEqual(uia.HeadingLevel_None, headingLevel(&node));
 }

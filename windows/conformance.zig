@@ -564,6 +564,8 @@ const ControlsWindow = struct {
     name: zui_widgets.EditableText = undefined,
     /// The last frame listed the dropdown's options.
     options_shown: bool = false,
+    /// How far the log is scrolled, as the last frame listed it.
+    log_offset: f32 = 0,
 
     fn open(self: *ControlsWindow) !void {
         try self.window.openWithSemantics(1, .{ .nodes = 256, .text_bytes = 4096 });
@@ -586,7 +588,10 @@ const ControlsWindow = struct {
         const drawn = self.ui.endFrame();
         _ = self.window.window_host.zuiSemantics(.main, drawn.semantics());
         self.options_shown = false;
-        for (drawn.semantics()) |node| self.options_shown = self.options_shown or node.role == .option;
+        for (drawn.semantics()) |node| {
+            self.options_shown = self.options_shown or node.role == .option;
+            if (node.role == .scroll_area) self.log_offset = node.scroll.?.offset[1];
+        }
         self.ui.release(drawn);
     }
 
@@ -600,6 +605,9 @@ const ControlsWindow = struct {
         _ = self.widgets.textField(ui, .of("name"), &self.name, .{ .label = "Name" });
         _ = self.widgets.dropdown(ui, .of("quality"), &self.quality, &qualities, .{ .label = "Quality" });
         _ = self.widgets.disclosure(ui, .of("details"), "Details", &self.details_open);
+        ui.open(.{ .id = .of("log"), .scroll = .{ .vertical = true }, .layout = .{ .direction = .top_to_bottom, .sizing = .{ .width = .fixed(100), .height = .fixed(40) } }, .semantics = .{ .role = .scroll_area, .label = "Log" } });
+        for (0..5) |_| ui.box(.{ .layout = .{ .sizing = .{ .width = .fixed(100), .height = .fixed(20) } } });
+        ui.close();
     }
 
     /// Runs frames until `reached` holds, for at most two seconds.
@@ -748,4 +756,74 @@ test "a client listening for a property hears it change when a frame changes it"
     }
     try testing.expect(changes.seen.load(.acquire) != 0);
     try testing.expectEqual(@as(i32, @intFromEnum(uia.ToggleState.off)), changes.last_integer.load(.acquire));
+}
+
+test "a scroll container scrolls through UI Automation by a notch, and to a place in its content" {
+    var controls: ControlsWindow = .{};
+    try controls.open();
+    defer controls.close();
+    var client: uia_client.Client = try .init();
+    defer client.deinit();
+    const window_element = try client.elementFromHandle(controls.window.window_host.hwnd);
+    defer window_element.release();
+
+    const log = try findNamed(&client, window_element, "Log");
+    defer log.release();
+    var scrolled = (try log.scrolled()).?;
+    try testing.expectEqual([2]f64{ uia.UIA_ScrollPatternNoScroll, 0 }, scrolled.percent);
+    try testing.expectEqual(@as(f64, 40), scrolled.view_size[1]);
+
+    try testing.expect(try log.scrollBy(.no_amount, .small_increment));
+    try controls.frameUntil(struct {
+        fn reached(window: *const ControlsWindow) bool {
+            return window.log_offset == Host.wheel_step;
+        }
+    }.reached);
+    scrolled = (try log.scrolled()).?;
+    try testing.expectApproxEqAbs(@as(f64, 100.0 * 40.0 / 60.0), scrolled.percent[1], 1e-4);
+
+    try testing.expect(try log.setScrollPercent(uia.UIA_ScrollPatternNoScroll, 100));
+    try controls.frameUntil(struct {
+        fn reached(window: *const ControlsWindow) bool {
+            return window.log_offset == 60;
+        }
+    }.reached);
+    try testing.expectError(error.AutomationFailed, log.scrollBy(.small_increment, .no_amount));
+}
+
+test "through UI Automation a dialog closes, an element shows its menu, and a heading tells its level" {
+    var window: HiddenWindow = .{};
+    try window.openWithSemantics(1, .{ .nodes = 8, .text_bytes = 64 });
+    defer window.close();
+    var polled: Polled = .{};
+    polled.init();
+    _ = polled.poll(&window.window_host);
+    const dialog_id = 0x0102_0304_0506_0708;
+    const reset_id = 0x1112_1314_1516_1718;
+    const nodes = [_]zui.SemanticNode{
+        .{ .id = dialog_id, .parent = null, .role = .dialog, .label = "Settings", .value = .none, .bounds = .{ .x = 0, .y = 0, .width = 300, .height = 200 }, .state = .{}, .actions = .initOne(.dismiss) },
+        .{ .id = 0x2122_2324_2526_2728, .parent = 0, .role = .heading, .label = "General", .value = .none, .bounds = .{ .x = 10, .y = 10, .width = 100, .height = 20 }, .state = .{}, .actions = .initEmpty(), .level = 2 },
+        .{ .id = reset_id, .parent = 0, .role = .button, .label = "Reset", .value = .none, .bounds = .{ .x = 10, .y = 40, .width = 60, .height = 30 }, .state = .{}, .actions = .initMany(&.{ .invoke, .show_menu }) },
+    };
+    try testing.expectEqual(zui.SemanticsDropped{}, window.window_host.zuiSemantics(.main, &nodes));
+
+    var client: uia_client.Client = try .init();
+    defer client.deinit();
+    const window_element = try client.elementFromHandle(window.window_host.hwnd);
+    defer window_element.release();
+
+    const heading = try findNamed(&client, window_element, "General");
+    defer heading.release();
+    try testing.expectEqual(@as(?i32, uia.HeadingLevel1 + 1), try heading.integerProperty(uia.UIA_HeadingLevelPropertyId));
+
+    const reset = try findNamed(&client, window_element, "Reset");
+    defer reset.release();
+    try reset.showContextMenu();
+    try expectAction(&window.window_host, &polled, .{ .target = reset_id, .action = .show_menu });
+
+    const dialog = try findNamed(&client, window_element, "Settings");
+    defer dialog.release();
+    try testing.expect(try dialog.closeWindow());
+    try expectAction(&window.window_host, &polled, .{ .target = dialog_id, .action = .dismiss });
+    try testing.expect(!try reset.closeWindow());
 }

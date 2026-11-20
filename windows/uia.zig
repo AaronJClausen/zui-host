@@ -128,6 +128,52 @@ pub const ISelectionProvider = extern struct {
     };
 };
 
+/// `IRawElementProviderSimple`'s table followed by `ShowContextMenu`, so a
+/// provider whose table is this one is both.
+pub const IRawElementProviderSimple2VTable = extern struct {
+    simple: IRawElementProviderSimple.VTable,
+    ShowContextMenu: *const fn (self: *IRawElementProviderSimple) callconv(.winapi) HRESULT,
+};
+
+pub const IScrollProvider = extern struct {
+    vtable: *const VTable,
+
+    pub const VTable = extern struct {
+        unknown: win32.IUnknownMethods(IScrollProvider),
+        Scroll: *const fn (self: *IScrollProvider, horizontal: ScrollAmount, vertical: ScrollAmount) callconv(.winapi) HRESULT,
+        SetScrollPercent: *const fn (self: *IScrollProvider, horizontal: f64, vertical: f64) callconv(.winapi) HRESULT,
+        get_HorizontalScrollPercent: *const fn (self: *IScrollProvider, percent: *f64) callconv(.winapi) HRESULT,
+        get_VerticalScrollPercent: *const fn (self: *IScrollProvider, percent: *f64) callconv(.winapi) HRESULT,
+        get_HorizontalViewSize: *const fn (self: *IScrollProvider, percent: *f64) callconv(.winapi) HRESULT,
+        get_VerticalViewSize: *const fn (self: *IScrollProvider, percent: *f64) callconv(.winapi) HRESULT,
+        get_HorizontallyScrollable: *const fn (self: *IScrollProvider, scrollable: *win32.BOOL) callconv(.winapi) HRESULT,
+        get_VerticallyScrollable: *const fn (self: *IScrollProvider, scrollable: *win32.BOOL) callconv(.winapi) HRESULT,
+    };
+};
+
+pub const IWindowProvider = extern struct {
+    vtable: *const VTable,
+
+    pub const VTable = extern struct {
+        unknown: win32.IUnknownMethods(IWindowProvider),
+        SetVisualState: *const fn (self: *IWindowProvider, state: WindowVisualState) callconv(.winapi) HRESULT,
+        Close: *const fn (self: *IWindowProvider) callconv(.winapi) HRESULT,
+        WaitForInputIdle: *const fn (self: *IWindowProvider, milliseconds: i32, idle: *win32.BOOL) callconv(.winapi) HRESULT,
+        get_CanMaximize: *const fn (self: *IWindowProvider, answer: *win32.BOOL) callconv(.winapi) HRESULT,
+        get_CanMinimize: *const fn (self: *IWindowProvider, answer: *win32.BOOL) callconv(.winapi) HRESULT,
+        get_IsModal: *const fn (self: *IWindowProvider, answer: *win32.BOOL) callconv(.winapi) HRESULT,
+        get_WindowVisualState: *const fn (self: *IWindowProvider, state: *WindowVisualState) callconv(.winapi) HRESULT,
+        get_WindowInteractionState: *const fn (self: *IWindowProvider, state: *WindowInteractionState) callconv(.winapi) HRESULT,
+        get_IsTopmost: *const fn (self: *IWindowProvider, answer: *win32.BOOL) callconv(.winapi) HRESULT,
+    };
+};
+
+pub const ScrollAmount = enum(i32) { large_decrement = 0, small_decrement = 1, no_amount = 2, large_increment = 3, small_increment = 4, _ };
+pub const WindowVisualState = enum(i32) { normal = 0, maximized = 1, minimized = 2, _ };
+pub const WindowInteractionState = enum(i32) { running = 0, closing = 1, ready_for_user_interaction = 2, blocked_by_modal_window = 3, not_responding = 4 };
+/// What a scroll percentage reads on an axis that does not scroll.
+pub const UIA_ScrollPatternNoScroll: f64 = -1;
+
 pub const ToggleState = enum(i32) { off = 0, on = 1, indeterminate = 2 };
 pub const ExpandCollapseState = enum(i32) { collapsed = 0, expanded = 1, partially_expanded = 2, leaf_node = 3 };
 
@@ -140,6 +186,9 @@ pub const IID_IExpandCollapseProvider: GUID = .{ .data1 = 0xd847d3a5, .data2 = 0
 pub const IID_IRangeValueProvider: GUID = .{ .data1 = 0x36dc7aef, .data2 = 0x33e6, .data3 = 0x4691, .data4 = .{ 0xaf, 0xe1, 0x2b, 0xe7, 0x27, 0x4b, 0x3d, 0x33 } };
 pub const IID_IValueProvider: GUID = .{ .data1 = 0xc7935180, .data2 = 0x6fb3, .data3 = 0x4201, .data4 = .{ 0xb1, 0x74, 0x7d, 0xf7, 0x3a, 0xdb, 0xf6, 0x4a } };
 pub const IID_ISelectionItemProvider: GUID = .{ .data1 = 0x2acad808, .data2 = 0xb2d4, .data3 = 0x452d, .data4 = .{ 0xa4, 0x07, 0x91, 0xff, 0x1a, 0xd1, 0x67, 0xb2 } };
+pub const IID_IRawElementProviderSimple2: GUID = .{ .data1 = 0xa0a839a9, .data2 = 0x8da1, .data3 = 0x4a82, .data4 = .{ 0x80, 0x6a, 0x8e, 0x0d, 0x44, 0xe7, 0x9f, 0x56 } };
+pub const IID_IScrollProvider: GUID = .{ .data1 = 0xb38b8077, .data2 = 0x1fc3, .data3 = 0x42a5, .data4 = .{ 0x8c, 0xae, 0xd4, 0x0c, 0x22, 0x15, 0x05, 0x5a } };
+pub const IID_IWindowProvider: GUID = .{ .data1 = 0x987df77b, .data2 = 0xdb06, .data3 = 0x4d77, .data4 = .{ 0x8f, 0x8a, 0x86, 0xa9, 0xc3, 0xbb, 0x90, 0xb9 } };
 pub const IID_ISelectionProvider: GUID = .{ .data1 = 0xfb8b03af, .data2 = 0x3bdf, .data3 = 0x48d4, .data4 = .{ 0xbd, 0x36, 0x1a, 0x65, 0x79, 0x3b, 0xe1, 0x68 } };
 
 pub const NavigateDirection = enum(i32) {
@@ -165,7 +214,9 @@ pub const UIA_InvokePatternId: PATTERNID = 10000;
 pub const UIA_SelectionPatternId: PATTERNID = 10001;
 pub const UIA_ValuePatternId: PATTERNID = 10002;
 pub const UIA_RangeValuePatternId: PATTERNID = 10003;
+pub const UIA_ScrollPatternId: PATTERNID = 10004;
 pub const UIA_ExpandCollapsePatternId: PATTERNID = 10005;
+pub const UIA_WindowPatternId: PATTERNID = 10009;
 pub const UIA_SelectionItemPatternId: PATTERNID = 10010;
 pub const UIA_TogglePatternId: PATTERNID = 10015;
 
@@ -182,10 +233,17 @@ pub const UIA_AutomationIdPropertyId: PROPERTYID = 30011;
 pub const UIA_FrameworkIdPropertyId: PROPERTYID = 30024;
 pub const UIA_ValueValuePropertyId: PROPERTYID = 30045;
 pub const UIA_RangeValueValuePropertyId: PROPERTYID = 30047;
+pub const UIA_ScrollHorizontalScrollPercentPropertyId: PROPERTYID = 30053;
+pub const UIA_ScrollVerticalScrollPercentPropertyId: PROPERTYID = 30055;
 pub const UIA_ExpandCollapseExpandCollapseStatePropertyId: PROPERTYID = 30070;
 pub const UIA_SelectionItemIsSelectedPropertyId: PROPERTYID = 30079;
 pub const UIA_ToggleToggleStatePropertyId: PROPERTYID = 30086;
+pub const UIA_HeadingLevelPropertyId: PROPERTYID = 30173;
 pub const UIA_IsDialogPropertyId: PROPERTYID = 30174;
+
+pub const HeadingLevel_None: i32 = 80050;
+/// `HeadingLevel1` to `HeadingLevel9` follow it.
+pub const HeadingLevel1: i32 = 80051;
 
 pub const UIA_ButtonControlTypeId: CONTROLTYPEID = 50000;
 pub const UIA_CheckBoxControlTypeId: CONTROLTYPEID = 50002;

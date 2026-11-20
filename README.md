@@ -133,29 +133,36 @@ A window opened with `WindowOptions.semantics` answers UI Automation's
 `WM_GETOBJECT` with a fragment root, whose elements are the nodes of the
 last `Frame.semantics()` the host was handed: each with its label as its
 name, its role as a control type, its id in hex as its AutomationId, its
-bounds in screen pixels and its place in the tree. Each offers the pattern that
-stands for what it does: Toggle on a checkbox, ExpandCollapse on a
-dropdown or disclosure, RangeValue on a slider, Value on a text field or
-dropdown, SelectionItem on an option or radio, Selection on a list, and
-Invoke on what is left that clicks. A client's Invoke, Toggle, Expand,
-Collapse and Select arrive in the next record as `invoke` actions,
-answered as a click; a range's SetValue as `adjust` by whole steps; and
+bounds in screen pixels and its place in the tree, and a heading with its
+level. Each offers the pattern that stands for what it does: Toggle on a
+checkbox, ExpandCollapse on a dropdown or disclosure, RangeValue on a
+slider, Value on a text field or dropdown, SelectionItem on an option or
+radio, Selection on a list, Scroll on a scroll container, Window on a
+dialog, and Invoke on what is left that clicks.
+
+A client's requests arrive in the next record as the actions that answer
+them: Invoke, Toggle, Expand, Collapse and Select as `invoke`, answered
+as a click; a range's SetValue as `adjust` by whole steps; a scroll by a
+notch (a wheel step), a page or to a percentage as `scroll`;
+ShowContextMenu as `show_menu`; a dialog's Close as `dismiss`; and
 SetFocus as `focus`, answered as Tab would be. A text field's text is
 read through its Value pattern and typed from the keyboard, since zui has
 no action that replaces it. Focus, structure and property changes (name,
-value, toggle, expand, selection, enabled) are raised only while a client
-listens, from the window thread. The host
-copies each list into one of two snapshots it allocates in `init`, so a
-list past that room is cut from the end and reported, and nothing is
-allocated after `init`. Without room, the window is left to Windows'
-default accessibility. The Scroll pattern, the context menu and dismissal
-are still to come.
+value, toggle, expand, selection, enabled, scroll position) are raised
+only while a client listens, from the window thread.
 
-`zig build accessible` shows a button, a checkbox, a slider and a text
-field from `zui_widgets` for trying with Narrator or Accessibility
-Insights; `-- --frames 30` draws 30 frames and quits. The host's tests
-read their windows through UI Automation's own client, in-process, from
-a thread that owns no window: a window that was never shown is exposed
+The host copies each list into one of two snapshots it allocates in
+`init`, so a list past that room is cut from the end and reported, and
+nothing is allocated after `init`. Without room, the window is left to
+Windows' default accessibility.
+
+`zig build accessible` shows a heading, a button, a checkbox, a slider, a
+text field, a dropdown and a scrolling log, from `zui_widgets` and zui,
+for trying with Narrator or Accessibility Insights; `-- --frames 30`
+draws 30 frames and quits. zui-sokol's tour declares its semantics too,
+so the tour on this host can be read the same way. The host's tests read
+their windows through UI Automation's own client, in-process, from a
+thread that owns no window: a window that was never shown is exposed
 too.
 
 ## The desktop through the window
